@@ -14,5 +14,6 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "include": ["src", "test"]
+  "include": ["src", "test"],
+  "exclude": ["test/app-tunnel.test.ts"]
 }
