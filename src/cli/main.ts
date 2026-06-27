@@ -53,7 +53,10 @@ async function main(): Promise<void> {
   const { baseUrl, token, stop } = await resolveJupyter()
   if (stop) process.on('SIGINT', stop)
 
-  // 1. 连中继、注册会话
+  // 1. 连中继、注册会话(--insecure:容忍自签证书,跨机器连自签 wss 时用)
+  //    注:bun 下 ws 的 rejectUnauthorized 选项不生效,改设环境变量(实测有效)。
+  const insecure = process.argv.includes('--insecure')
+  if (insecure) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
   const ws = new WebSocket(`${relayUrl}/`)
   const reg = await new Promise<{ sid: string; token: string }>((resolve, reject) => {
     ws.on('message', function h(raw) {

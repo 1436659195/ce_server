@@ -1,4 +1,6 @@
 import { createServer, type Server, type IncomingMessage } from 'node:http'
+import { createServer as createHttpsServer } from 'node:https'
+import { readFileSync } from 'node:fs'
 import type { Socket } from 'node:net'
 import { WebSocketServer, WebSocket } from 'ws'
 import { Hub, type RelayWS } from './hub'
@@ -11,9 +13,16 @@ import { Hub, type RelayWS } from './hub'
  *   - phone: `wss://relay/{sid}?token=xxx` → token 校验通过则加入,回 `{type:'joined'}`;否则 `{type:'error'}` 后断开
  *
  * 之后 cli/phone 互发的消息都经 Hub 透传(零信任,不解析负载)。
+ * 传 opts.cert+key 则上 TLS(wss);否则明文 ws(本地/开发)。
  */
-export function createRelayServer(hub: Hub): { server: Server; close: () => Promise<void> } {
-  const server = createServer()
+export function createRelayServer(
+  hub: Hub,
+  opts?: { cert?: string; key?: string }
+): { server: Server; close: () => Promise<void> } {
+  const server =
+    opts?.cert && opts?.key
+      ? createHttpsServer({ cert: readFileSync(opts.cert), key: readFileSync(opts.key) })
+      : createServer()
   const wss = new WebSocketServer({ server })
 
   // 跟踪所有原始 socket:服务端拒掉/关掉的连接,客户端未必回 close ack —— ws 层虽已移除,
