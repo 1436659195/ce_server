@@ -77,7 +77,9 @@ async function main(): Promise<void> {
   const cliKp = generateKeyPair()
   const qrPayload = JSON.stringify({ r: relayUrl, s: sid, k: b64(cliKp.publicKey), t: relayToken })
   console.log('\n' + (await qrcode.toString(qrPayload, { type: 'terminal' })))
-  console.log('用 App 扫码连接\n')
+  console.log('用 App 扫码连接')
+  // 手动连接码兜底(App 摄像头扫码未就绪时,在「扫码连接」里粘贴这串 JSON)
+  console.log('连接码(手动粘贴): ' + qrPayload + '\n')
 
   // 3. 桥接状态
   const jupyter = makeJupyterClient(baseUrl, token)
