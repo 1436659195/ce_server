@@ -164,6 +164,22 @@ async function main(): Promise<void> {
         if (tws.readyState === WebSocket.OPEN) tws.send(JSON.stringify(['stdin', dec.decode(plaintext)]))
         break
       }
+      case FrameType.Control: {
+        // resize:plaintext = {op:'resize', rows, cols};sid = terminal name → terminado set_size
+        const msg = JSON.parse(dec.decode(plaintext)) as { op?: string; rows?: number; cols?: number }
+        if (
+          msg.op === 'resize' &&
+          frame.sid &&
+          typeof msg.rows === 'number' &&
+          typeof msg.cols === 'number'
+        ) {
+          const tws = ensureTerm(frame.sid)
+          if (tws.readyState === WebSocket.OPEN) {
+            tws.send(JSON.stringify(['set_size', msg.rows, msg.cols]))
+          }
+        }
+        break
+      }
       default:
         break
     }
