@@ -22,7 +22,7 @@ const dec = new TextDecoder()
 // Node ws → Tunnel 的 WSFactory 适配(测试用;App 里用 browserWS)
 const nodeWS: WSFactory = (url, h) => {
   const ws = new WebSocket(url)
-  ws.on('error', () => {}) // 吞 close() 触发的 error
+  ws.on('error', (e) => h.onerror(e)) // WSHandlers 需 onerror
   ws.on('open', () => h.onopen())
   ws.on('message', (data) => h.onmessage(data.toString()))
   ws.on('close', () => h.onclose())
@@ -99,6 +99,7 @@ test('App Tunnel ↔ 中继 ↔ ce:握手 + RPC + 终端流 全链路', async ()
 
   // ── App 侧 Tunnel(phone)──
   const tunnel = new Tunnel(qr, nodeWS)
+  tunnel.connect()
   await tunnel.readyPromise
 
   // 1) RPC:phone(app crypto)发 → ce(ce crypto)解密+回 → phone 解密
