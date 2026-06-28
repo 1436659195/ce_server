@@ -154,6 +154,16 @@ async function main(): Promise<void> {
       case FrameType.RPCReq: {
         const req = JSON.parse(dec.decode(plaintext)) as RpcRequest
         const resp = await handleRpc(jupyter, req)
+        // createTerminal 成功后立即开本地 terminado WS,让 shell 初始输出(prompt/banner)
+        // 立即流向手机。ensureTerm 本是懒开(只在收到首条 stdin/resize 才开),若不在建终端时
+        // 先开,手机端会"标签已绿、却停在'正在连接',要等用户点一下输入才蹦出内容"。
+        if (
+          req.op === 'createTerminal' &&
+          resp.ok &&
+          (resp.data as { name?: string } | undefined)?.name
+        ) {
+          ensureTerm((resp.data as { name: string }).name)
+        }
         encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), { reqId: frame.reqId })
         break
       }
