@@ -16,6 +16,7 @@ test('listDir 路由到 client.listDir 且透传 path', async () => {
     async createTerminal() {
       return { name: 'x' }
     },
+    async createDir() {},
   }
   const res = await handleRpc(client, { op: 'listDir', path: '/x' })
   expect(res).toEqual({ ok: true, data: { entries: ['a', 'b'] } })
@@ -35,10 +36,32 @@ test('createTerminal 路由且透传 cwd', async () => {
       got = cwd
       return { name: 'term-7' }
     },
+    async createDir() {},
   }
   const res = await handleRpc(client, { op: 'createTerminal', cwd: '/proj' })
   expect(res).toEqual({ ok: true, data: { name: 'term-7' } })
   expect(got).toBe('/proj')
+})
+
+test('createDir 路由且透传 path,响应 ok:true(无 data)', async () => {
+  let got = ''
+  const client: JupyterClient = {
+    async listDir() {
+      return null
+    },
+    async readFile() {
+      return null
+    },
+    async createTerminal() {
+      return { name: 'x' }
+    },
+    async createDir(path) {
+      got = path
+    },
+  }
+  const res = await handleRpc(client, { op: 'createDir', path: '/sub/new' })
+  expect(res).toEqual({ ok: true })
+  expect(got).toBe('/sub/new')
 })
 
 test('未知 op → ok:false', async () => {
@@ -52,6 +75,7 @@ test('未知 op → ok:false', async () => {
     async createTerminal() {
       return { name: 'x' }
     },
+    async createDir() {},
   }
   const res = await handleRpc(client, { op: '删除' })
   expect(res.ok).toBe(false)
@@ -69,6 +93,7 @@ test('client 抛错 → ok:false + 错误信息(不向上抛)', async () => {
     async createTerminal() {
       return { name: 'x' }
     },
+    async createDir() {},
   }
   const res = await handleRpc(client, { op: 'listDir', path: '/' })
   expect(res).toEqual({ ok: false, error: 'token 无效' })

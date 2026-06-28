@@ -10,6 +10,7 @@ export interface JupyterClient {
   createTerminal(cwd: string): Promise<{ name: string }> // POST /api/terminals {cwd}
   listDir(path: string): Promise<unknown> // GET /api/contents/{path}(目录)
   readFile(path: string): Promise<unknown> // GET /api/contents/{path}(文件)
+  createDir(path: string): Promise<void> // PUT /api/contents/{path} {type:directory}
 }
 
 /** 手机发来的 RPC 请求(明文 JSON,解密后)。op 为 string 以兜住未知操作。 */
@@ -36,6 +37,9 @@ export async function handleRpc(client: JupyterClient, req: RpcRequest): Promise
         return { ok: true, data: await client.readFile(req.path ?? '/') }
       case 'createTerminal':
         return { ok: true, data: await client.createTerminal(req.cwd ?? '/') }
+      case 'createDir':
+        await client.createDir(req.path ?? '/')
+        return { ok: true }
       default:
         return { ok: false, error: `未知操作: ${req.op}` }
     }
@@ -73,6 +77,15 @@ export function makeJupyterClient(baseUrl: string, token: string): JupyterClient
       const res = await fetch(`${baseUrl}/api/contents/${encodePath(path)}`, { headers })
       if (!res.ok) throw new Error(`读文件失败:${res.status} ${res.statusText}`)
       return res.json()
+    },
+    async createDir(path) {
+      // PUT 一步建命名目录(同 useFiles.createDir:POST 会建 untitled、PATCH 又被 CORS 挡)
+      const res = await fetch(`${baseUrl}/api/contents/${encodePath(path)}`, {
+        method: 'PUT',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'directory' }),
+      })
+      if (!res.ok) throw new Error(`创建文件夹失败:${res.status} ${res.statusText}`)
     },
   }
 }
