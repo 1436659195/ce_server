@@ -50,7 +50,8 @@ export async function detectServers(): Promise<JupyterServer[]> {
   // 优先 `server list`,回退老版 `notebook list`
   for (const sub of [['server', 'list'], ['notebook', 'list']]) {
     try {
-      const { stdout } = await pExecFile('jupyter', sub)
+      // shell:true —— Windows 上 jupyter 是 jupyter.cmd,不加 shell 会 ENOENT(其它平台无影响)
+      const { stdout } = await pExecFile('jupyter', sub, { shell: true })
       const servers = parseServerList(stdout)
       if (servers.length > 0) return servers
     } catch {

@@ -29,6 +29,7 @@ export async function launchJupyter(
   return new Promise((resolve, reject) => {
     const proc = spawn('jupyter', ['lab', '--no-browser', '--port=0'], {
       stdio: ['ignore', 'pipe', 'pipe'],
+      shell: true, // Windows 上 jupyter 是 .cmd,不加 shell 会 ENOENT(其它平台无影响)
     })
     let buf = ''
     const timer = setTimeout(() => {
