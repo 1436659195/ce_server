@@ -91,11 +91,27 @@ async function main(): Promise<void> {
     sendFrame({ type, sid: opts.sid, reqId: opts.reqId, payload: seal(sharedKey, plaintext) })
   }
 
-  // 按 terminal name 懒开 terminado WS(路径无 /api 前缀);输出加密回传
+  // 按 terminal name 懒开/重连 terminado WS(路径无 /api 前缀);输出加密回传。
+  // 健壮性:① cached 断开(CLOSING/CLOSED)则重连,不复用死连接;② WS 还在 CONNECTING 时
+  // 缓冲 set_size/stdin,open 后补发。否则恢复终端时第一条 resize 落在 CONNECTING 上被
+  // "readyState===OPEN" 检查静默丢弃 → bash 收不到 SIGWINCH 不重绘 → 手机卡"正在连接"
+  // (直连因 ws.onopen 里 syncSize,连接好了才发,不丢)。
   function ensureTerm(name: string): WebSocket {
     const cached = terms.get(name)
-    if (cached) return cached
+    if (cached && cached.readyState === WebSocket.OPEN) return cached
     const tws = new WebSocket(`${wsBase}/terminals/websocket/${name}?token=${token}`)
+    const pending: string[] = [] // CONNECTING 期间缓冲,防 set_size/stdin 丢失
+    const origSend = tws.send.bind(tws)
+    tws.send = ((data: string) => {
+      const s = tws.readyState
+      if (s === WebSocket.OPEN) origSend(data)
+      else if (s === WebSocket.CONNECTING) pending.push(data)
+      // CLOSING/CLOSED 丢弃(下次 ensureTerm 会重连)
+    }) as typeof tws.send
+    tws.on('open', () => {
+      for (const d of pending) origSend(d)
+      pending.length = 0
+    })
     tws.on('message', (data) => {
       try {
         const msg = JSON.parse(dec.decode(data as Uint8Array))
@@ -160,9 +176,7 @@ async function main(): Promise<void> {
               typeof msg.cols === 'number'
             ) {
               const tws = ensureTerm(frame.sid)
-              if (tws.readyState === WebSocket.OPEN) {
-                tws.send(JSON.stringify(['set_size', msg.rows, msg.cols]))
-              }
+              tws.send(JSON.stringify(['set_size', msg.rows, msg.cols])) // ensureTerm 自缓冲(CONNECTING 时)
             }
             return
           } catch {
@@ -236,8 +250,7 @@ async function main(): Promise<void> {
           const name = frame.sid
           if (!name) break
           const tws = ensureTerm(name)
-          if (tws.readyState === WebSocket.OPEN)
-            tws.send(JSON.stringify(['stdin', dec.decode(plaintext)]))
+          tws.send(JSON.stringify(['stdin', dec.decode(plaintext)])) // ensureTerm 自缓冲(CONNECTING 时)
           break
         }
         default:
