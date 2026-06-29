@@ -1,6 +1,6 @@
 # Coding Everywhere —— Windows 一行命令安装器。
 # 用户用法:  irm http://<中继>:8606/install.ps1 | iex
-# __RELAY_URL__ 由中继 serve 本脚本时按请求 Host 注入(如 ws://101.132.161.59:8606)。
+# 下方 $relay 变量由中继 serve 本脚本时按请求 Host 注入(如 ws://101.132.161.59:8606)。
 $ErrorActionPreference = 'Stop'
 $relay = '__RELAY_URL__'
 
