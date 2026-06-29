@@ -13,7 +13,9 @@
  */
 import WebSocket from 'ws'
 import qrcode from 'qrcode'
-import { hostname } from 'node:os'
+import { hostname, homedir } from 'node:os'
+import { writeFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
 import { detectServers } from './jupyter-detect'
@@ -191,6 +193,14 @@ async function main(): Promise<void> {
       n: hostname(),
       p: process.platform,
     })
+    // 落盘连接码:install.ps1 检测到 ce 已在跑时读此文件复用打印(不必重启 ce)
+    try {
+      const ceDir = join(homedir(), '.ce')
+      mkdirSync(ceDir, { recursive: true })
+      writeFileSync(join(ceDir, 'connection-code.json'), qrPayload)
+    } catch {
+      /* 写失败→忽略(install.ps1 退化为提示原窗口) */
+    }
     void qrcode.toString(qrPayload, { type: 'terminal' }).then((qr) => {
       console.log('\n' + qr)
       console.log('用 App 扫码连接')
