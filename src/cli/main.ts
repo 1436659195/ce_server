@@ -201,11 +201,26 @@ async function main(): Promise<void> {
     } catch {
       /* 写失败→忽略(install.ps1 退化为提示原窗口) */
     }
-    void qrcode.toString(qrPayload, { type: 'terminal' }).then((qr) => {
-      console.log('\n' + qr)
-      console.log('用 App 扫码连接')
-      console.log('连接码(手动粘贴): ' + qrPayload + '\n')
-    })
+    // 半块字符紧凑渲染(2 module 行合并成 1 行、1 字符/module;比 qrcode terminal 的 ANSI 2空格/module 小一半多)
+    try {
+      const qr = qrcode.create(qrPayload)
+      const size = qr.modules.size
+      let out = ''
+      for (let y = 0; y < size; y += 2) {
+        let line = ''
+        for (let x = 0; x < size; x++) {
+          const top = qr.modules.get(x, y)
+          const bot = y + 1 < size && qr.modules.get(x, y + 1)
+          line += top && bot ? '█' : top ? '▀' : bot ? '▄' : ' '
+        }
+        out += line + '\n'
+      }
+      console.log('\n' + out)
+      console.log('用 App 扫码连接(或下方连接码粘码)')
+    } catch {
+      /* 渲染失败→只给连接码 */
+    }
+    console.log('连接码(手动粘贴): ' + qrPayload + '\n')
   }
 
   // 在已注册的 ws 上接主消息循环(握手 + rpc + stdin + resize)
