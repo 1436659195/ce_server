@@ -23,16 +23,25 @@ if ($needPython) {
   $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 }
 
-# ② ce.exe(已有则跳过下载,不重复下 95M)
+# ② ce.exe(已有且与中继大小一致才跳过,否则下载/升级;防呆不重下、也不漏更新)
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\ce'
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 $exe = Join-Path $installDir 'ce.exe'
+$dlBase = $relay -replace '^ws','http'
+$dlUrl = "$dlBase/dl/ce-windows-x64.exe"
 if (Test-Path $exe) {
-  Write-Host "[install] ce.exe 已存在,跳过下载"
+  $remote = $null
+  try { $remote = (Invoke-WebRequest $dlUrl -Method Head -UseBasicParsing).Headers.'Content-Length' } catch {}
+  $local = (Get-Item $exe).Length
+  if ($remote -and [string]$remote -eq [string]$local) {
+    Write-Host "[install] ce.exe 已是最新,跳过下载"
+  } else {
+    Write-Host "[install] ce.exe 有更新,重新下载"
+    Invoke-WebRequest -Uri $dlUrl -OutFile $exe
+  }
 } else {
-  $dlBase = $relay -replace '^ws','http'
-  Write-Host "[install] 下载 $dlBase/dl/ce-windows-x64.exe"
-  Invoke-WebRequest -Uri "$dlBase/dl/ce-windows-x64.exe" -OutFile $exe
+  Write-Host "[install] 下载 $dlUrl"
+  Invoke-WebRequest -Uri $dlUrl -OutFile $exe
 }
 
 # ③ 写 config.json(ce 启动读它,不必每次带 --relay)
