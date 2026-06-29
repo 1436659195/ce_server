@@ -9,6 +9,7 @@
  */
 import WebSocket from 'ws'
 import qrcode from 'qrcode'
+import { hostname } from 'node:os'
 import { generateKeyPair, sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
 import { detectServers } from './jupyter-detect'
@@ -78,7 +79,15 @@ async function main(): Promise<void> {
 
   // 2. 生成密钥对 + 二维码({r:relay, s:sid, k:cliPub(b64), t:relayToken})
   const cliKp = generateKeyPair()
-  const qrPayload = JSON.stringify({ r: relayUrl, s: sid, k: b64(cliKp.publicKey), t: relayToken })
+  // n=被控机名、p=平台(手机扫码后作服务器显示名 + 图标);不参与 E2E 握手
+  const qrPayload = JSON.stringify({
+    r: relayUrl,
+    s: sid,
+    k: b64(cliKp.publicKey),
+    t: relayToken,
+    n: hostname(),
+    p: process.platform,
+  })
   console.log('\n' + (await qrcode.toString(qrPayload, { type: 'terminal' })))
   console.log('用 App 扫码连接')
   // 手动连接码兜底(App 摄像头扫码未就绪时,在「扫码连接」里粘贴这串 JSON)
