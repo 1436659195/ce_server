@@ -1,6 +1,10 @@
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createRelayServer } from './server'
 import { Hub } from './hub'
+
+// 静态下载文件路径(中继以 bun 脚本模式跑,import.meta.url 解析正常;src/relay/ → dist|scripts/)。
+const here = fileURLToPath(new URL('.', import.meta.url))
 
 // 端口:--port=NNNN 或 RELAY_PORT 环境变量,默认 8700
 const portArg = process.argv.find((a) => a.startsWith('--port='))
@@ -17,10 +21,12 @@ const statePath =
   process.argv.find((a) => a.startsWith('--state='))?.split('=')[1] ??
   join(process.cwd(), 'relay-state.json')
 const hub = new Hub(statePath)
-const { server, close } = createRelayServer(
-  hub,
-  tlsCert && tlsKey ? { cert: tlsCert, key: tlsKey } : undefined
-)
+const { server, close } = createRelayServer(hub, {
+  cert: tlsCert && tlsKey ? tlsCert : undefined,
+  key: tlsCert && tlsKey ? tlsKey : undefined,
+  ceExePath: join(here, '..', '..', 'dist', 'ce-windows-x64.exe'),
+  installScriptPath: join(here, '..', '..', 'scripts', 'install.ps1'),
+})
 server.listen(port, () => {
   console.log(`[relay] listening on :${port}${tlsCert ? ' (wss/TLS)' : ' (ws)'}`)
 })
