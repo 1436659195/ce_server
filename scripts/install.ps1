@@ -23,13 +23,17 @@ if ($needPython) {
   $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 }
 
-# ② 下 ce.exe(中继 /dl 路由;ws:// → http://)
+# ② ce.exe(已有则跳过下载,不重复下 95M)
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\ce'
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 $exe = Join-Path $installDir 'ce.exe'
-$dlBase = $relay -replace '^ws','http'
-Write-Host "[install] 下载 $dlBase/dl/ce-windows-x64.exe"
-Invoke-WebRequest -Uri "$dlBase/dl/ce-windows-x64.exe" -OutFile $exe
+if (Test-Path $exe) {
+  Write-Host "[install] ce.exe 已存在,跳过下载"
+} else {
+  $dlBase = $relay -replace '^ws','http'
+  Write-Host "[install] 下载 $dlBase/dl/ce-windows-x64.exe"
+  Invoke-WebRequest -Uri "$dlBase/dl/ce-windows-x64.exe" -OutFile $exe
+}
 
 # ③ 写 config.json(ce 启动读它,不必每次带 --relay)
 $ceDir = Join-Path $env:USERPROFILE '.ce'
@@ -43,14 +47,30 @@ if ($userPath -notlike "*$installDir*") {
   Write-Host "[install] 已加到用户 PATH(新终端里 ce 命令生效)"
 }
 
-# ⑤ 开机自启?(写 HKCU Run,免 UAC)
-if (Ask-Yes("[install] 是否开机自动启动 ce?")) {
-  $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+# ⑤ 开机自启?(已设则跳过问,防呆;写 HKCU Run,免 UAC)
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$alreadyAuto = (Get-ItemProperty -Path $runKey -Name 'CodingEverywhere' -ErrorAction SilentlyContinue).CodingEverywhere
+if ($alreadyAuto) {
+  Write-Host "[install] 开机自启已设置,跳过"
+} elseif (Ask-Yes("[install] 是否开机自动启动 ce?")) {
   New-Item -Path $runKey -Force | Out-Null
   Set-ItemProperty -Path $runKey -Name 'CodingEverywhere' -Value $exe
   Write-Host "[install] 已设置开机自启"
 }
 
-# ⑥ 直接前台启动 ce → 二维码出现在本窗口(窗口保持 = ce 在跑)
+# ⑥ 启动 ce(若已在跑则复用其连接码,不起新进程 = 唯一 ce)
+$running = Get-Process -Name 'ce' -ErrorAction SilentlyContinue
+if ($running) {
+  Write-Host "[install] ce 已在运行(PID $($running.Id -join ',')),不重复启动" -ForegroundColor Yellow
+  $codeFile = Join-Path $ceDir 'connection-code.json'
+  if (Test-Path $codeFile) {
+    Write-Host "[install] 原 ce 的连接码(手机粘码用):"
+    Write-Host (Get-Content $codeFile -Raw)
+    Write-Host "[install] 二维码请到原 ce 窗口查看(它还在跑)" -ForegroundColor Yellow
+  } else {
+    Write-Host "[install] 未找到连接码文件,请到原 ce 窗口扫码" -ForegroundColor Yellow
+  }
+  return
+}
 Write-Host "[install] 启动 ce..."
 & $exe
