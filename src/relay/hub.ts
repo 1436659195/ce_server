@@ -86,7 +86,16 @@ export class Hub {
       s = { sid, token, cli, phone: null, phoneBuffer: [], cliBuffer: [] }
       this.sessions.set(sid, s)
     } else {
-      s.cli = cli // ce 重连:更新 socket(phone 若还连着则续用)
+      s.cli = cli // ce 重连:更新 socket
+      // 补发 phone 在 ce 断线期间发的消息(含握手 phonePub);否则 ce 错过握手 → 后续解密全失败
+      for (const m of s.cliBuffer) {
+        try {
+          cli.send(m)
+        } catch {
+          /* 客户端 ws 已关 */
+        }
+      }
+      s.cliBuffer = []
     }
     this.wsMeta.set(cli, { sid, role: 'cli' })
     return { sid, token }

@@ -18,7 +18,7 @@ import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
 import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
-import { makeJupyterClient, handleRpc, type RpcRequest } from './bridge'
+import { makeJupyterClient, handleRpc, type RpcRequest, type RpcResponse } from './bridge'
 import { loadOrCreateIdentity } from './identity'
 
 const enc = new TextEncoder()
@@ -102,7 +102,9 @@ async function main(): Promise<void> {
         if (!Array.isArray(msg)) return
         const [etype, content] = msg
         if ((etype === 'stdout' || etype === 'stderr') && typeof content === 'string') {
-          encryptThenSend(FrameType.TermOutput, enc.encode(content), { sid: name })
+          // stderr 包红码,对齐直连(terminalConnection 把 stderr 渲染红)
+          const out = etype === 'stderr' ? `\x1b[1;31m${content}\x1b[0m` : content
+          encryptThenSend(FrameType.TermOutput, enc.encode(out), { sid: name })
         }
       } catch {
         /* setup/exit/控制帧忽略 */
@@ -138,16 +140,48 @@ async function main(): Promise<void> {
         return
       }
 
-      // 配对握手:第一条 Control 帧载 phone 公钥(明文 b64)→ 据此派生 sharedKey
-      if (!sharedKey) {
-        if (frame.type === FrameType.Control) {
+      // Control 帧:可能是握手 phonePub(明文,手机每次连入/重连都发)或 resize(密文)。
+      // 手机每次重连用新公钥 → 必须每次 phonePub 重新派生 sharedKey,不能只首次
+      // (否则重连后 ce 还用旧 sharedKey,新 phonePub 被当密文丢弃 → createTerminal 无响应)。
+      if (frame.type === FrameType.Control) {
+        if (sharedKey) {
+          // 先按密文解密(resize 等控制帧是密文)
+          try {
+            const decrypted = open(sharedKey, frame.payload)
+            const msg = JSON.parse(dec.decode(decrypted)) as {
+              op?: string
+              rows?: number
+              cols?: number
+            }
+            if (
+              msg.op === 'resize' &&
+              frame.sid &&
+              typeof msg.rows === 'number' &&
+              typeof msg.cols === 'number'
+            ) {
+              const tws = ensureTerm(frame.sid)
+              if (tws.readyState === WebSocket.OPEN) {
+                tws.send(JSON.stringify(['set_size', msg.rows, msg.cols]))
+              }
+            }
+            return
+          } catch {
+            /* 解密失败 → 落到下面当握手 phonePub 处理 */
+          }
+        }
+        // 当作握手 phonePub(明文 b64)→ (重新)派生 sharedKey
+        try {
           const phonePub = unb64(dec.decode(frame.payload))
           sharedKey = sharedSecret(cliPriv, phonePub)
-          console.log('[ce] 手机已配对,E2E 通道建立')
+          console.log('[ce] 手机已配对,E2E 通道(重新)建立')
+        } catch {
+          /* 非法帧 */
         }
         return
       }
 
+      // RPCReq / TermStdin:必须已握手 + 密文
+      if (!sharedKey) return
       let plaintext: Uint8Array
       try {
         plaintext = open(sharedKey, frame.payload)
@@ -158,15 +192,42 @@ async function main(): Promise<void> {
       switch (frame.type) {
         case FrameType.RPCReq: {
           const req = JSON.parse(dec.decode(plaintext)) as RpcRequest
-          const resp = await handleRpc(jupyter, req)
-          // createTerminal 成功后立即开本地 terminado WS,让 shell 初始输出(prompt/banner)
-          // 立即流向手机。ensureTerm 本是懒开,不在这开则手机"标签绿却停正在连接,要点输入才蹦出"。
-          if (
-            req.op === 'createTerminal' &&
-            resp.ok &&
-            (resp.data as { name?: string } | undefined)?.name
-          ) {
-            ensureTerm((resp.data as { name: string }).name)
+          let resp: RpcResponse
+          if (req.op === 'listTerminals') {
+            // 列 ce 端当前活着的终端,供手机杀 app 重开时恢复(而不是新建一个空终端)
+            resp = { ok: true, data: { names: Array.from(terms.keys()) } }
+          } else if (req.op === 'deleteTerminal' && (req as { name?: string }).name) {
+            // 手机「关闭终端」:关 ce 端 terminado + Jupyter DELETE,否则杀 app 重开又恢复回来
+            const termName = (req as { name?: string }).name!
+            const tws = terms.get(termName)
+            if (tws) {
+              try {
+                tws.close()
+              } catch {
+                /* 已关 */
+              }
+              terms.delete(termName)
+            }
+            try {
+              await fetch(`${baseUrl}/api/terminals/${encodeURIComponent(termName)}`, {
+                method: 'DELETE',
+                headers: { Authorization: `Token ${token}` },
+              })
+            } catch {
+              /* 尽力删,失败不阻塞(至多留服务端孤儿终端) */
+            }
+            resp = { ok: true }
+          } else {
+            resp = await handleRpc(jupyter, req)
+            // createTerminal 成功后立即开本地 terminado WS,让 shell 初始输出(prompt/banner)
+            // 立即流向手机。ensureTerm 本是懒开,不在这开则手机"标签绿却停正在连接,要点输入才蹦出"。
+            if (
+              req.op === 'createTerminal' &&
+              resp.ok &&
+              (resp.data as { name?: string } | undefined)?.name
+            ) {
+              ensureTerm((resp.data as { name: string }).name)
+            }
           }
           encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), { reqId: frame.reqId })
           break
@@ -177,26 +238,6 @@ async function main(): Promise<void> {
           const tws = ensureTerm(name)
           if (tws.readyState === WebSocket.OPEN)
             tws.send(JSON.stringify(['stdin', dec.decode(plaintext)]))
-          break
-        }
-        case FrameType.Control: {
-          // resize:plaintext = {op:'resize', rows, cols};sid = terminal name → terminado set_size
-          const msg = JSON.parse(dec.decode(plaintext)) as {
-            op?: string
-            rows?: number
-            cols?: number
-          }
-          if (
-            msg.op === 'resize' &&
-            frame.sid &&
-            typeof msg.rows === 'number' &&
-            typeof msg.cols === 'number'
-          ) {
-            const tws = ensureTerm(frame.sid)
-            if (tws.readyState === WebSocket.OPEN) {
-              tws.send(JSON.stringify(['set_size', msg.rows, msg.cols]))
-            }
-          }
           break
         }
         default:
