@@ -1,6 +1,10 @@
 /**
  * ce —— 跑在被控机的 CLI。编排:
- *   探测/起本地 Jupyter → 连中继注册会话 → 生成密钥+二维码 → 配对握手 → 桥接(手机↔本地 Jupyter)
+ *   探测/起本地 Jupyter → 连中继(带持久 cid)注册会话 → 生成密钥+二维码 → 配对握手 → 桥接
+ *
+ * 持久化:ce 身份(cid + 密钥对)存 ~/.ce/identity.json,中继按 cid 复用 sid/token。
+ *   → ce/中继重启后,手机存的配对码(cliPub + sid)仍有效、不必重扫;ce 断线自动重连中继
+ *   (指数退避),本地 terminado 终端跨重连不丢。
  *
  * 用法:ce --relay=ws://relay.yourserver[:port] [--jupyter=url --jupyter-token=t]
  *       (不传 --jupyter 则先探测、再启动)
@@ -10,11 +14,12 @@
 import WebSocket from 'ws'
 import qrcode from 'qrcode'
 import { hostname } from 'node:os'
-import { generateKeyPair, sharedSecret, seal, open } from '../shared/crypto'
+import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
 import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, type RpcRequest } from './bridge'
+import { loadOrCreateIdentity } from './identity'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -54,53 +59,28 @@ async function main(): Promise<void> {
   const { baseUrl, token, stop } = await resolveJupyter()
   if (stop) process.on('SIGINT', stop)
 
-  // 1. 连中继、注册会话(--insecure:容忍自签证书,跨机器连自签 wss 时用)
-  //    注:bun 下 ws 的 rejectUnauthorized 选项不生效,改设环境变量(实测有效)。
+  // --insecure:容忍自签证书(bun 下 ws 的 rejectUnauthorized 不生效,改设环境变量)
   const insecure = process.argv.includes('--insecure')
   if (insecure) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
-  const ws = new WebSocket(`${relayUrl}/`)
-  const reg = await new Promise<{ sid: string; token: string }>((resolve, reject) => {
-    ws.on('message', function h(raw) {
-      try {
-        const m = JSON.parse(dec.decode(raw as Uint8Array))
-        if (m.type === 'registered') {
-          ws.off('message', h)
-          resolve({ sid: m.sid, token: m.token })
-        } else if (m.type === 'error') {
-          reject(new Error(m.reason))
-        }
-      } catch {
-        /* 非控制帧 */
-      }
-    })
-    ws.on('error', reject)
-  })
-  const { sid, token: relayToken } = reg
 
-  // 2. 生成密钥对 + 二维码({r:relay, s:sid, k:cliPub(b64), t:relayToken})
-  const cliKp = generateKeyPair()
-  // n=被控机名、p=平台(手机扫码后作服务器显示名 + 图标);不参与 E2E 握手
-  const qrPayload = JSON.stringify({
-    r: relayUrl,
-    s: sid,
-    k: b64(cliKp.publicKey),
-    t: relayToken,
-    n: hostname(),
-    p: process.platform,
-  })
-  console.log('\n' + (await qrcode.toString(qrPayload, { type: 'terminal' })))
-  console.log('用 App 扫码连接')
-  // 手动连接码兜底(App 摄像头扫码未就绪时,在「扫码连接」里粘贴这串 JSON)
-  console.log('连接码(手动粘贴): ' + qrPayload + '\n')
+  // 持久身份:cid(机器标识)+ E2E 密钥对(存 ~/.ce/identity.json)。重启复用 →
+  // 中继按 cid 复用 sid/token、手机存的 cliPub 长期有效,不必重扫。
+  const identity = loadOrCreateIdentity()
+  const cliPriv = identity.privateKey
+  const cliPubB64 = b64(identity.publicKey)
+  const cid = identity.cid
 
-  // 3. 桥接状态
   const jupyter = makeJupyterClient(baseUrl, token)
   const wsBase = baseUrl.replace(/^http/, 'ws')
+
+  let ws: WebSocket | null = null
   let sharedKey: Uint8Array | null = null
-  const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS
+  const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
+  let qrPrinted = false
+  let reconnectDelay = 2000
 
   function sendFrame(f: Frame): void {
-    ws.send(dec.decode(encodeFrame(f))) // 帧是 JSON 文本,发字符串
+    ws?.send(dec.decode(encodeFrame(f)))
   }
   function encryptThenSend(
     type: FrameType,
@@ -132,80 +112,133 @@ async function main(): Promise<void> {
     return tws
   }
 
-  // 4. 主消息循环
-  ws.on('message', async (raw) => {
-    let frame: Frame
-    try {
-      frame = decodeFrame(raw as Uint8Array)
-    } catch {
-      return
-    }
+  function printQr(sid: string, relayToken: string): void {
+    const qrPayload = JSON.stringify({
+      r: relayUrl,
+      s: sid,
+      k: cliPubB64,
+      t: relayToken,
+      n: hostname(),
+      p: process.platform,
+    })
+    void qrcode.toString(qrPayload, { type: 'terminal' }).then((qr) => {
+      console.log('\n' + qr)
+      console.log('用 App 扫码连接')
+      console.log('连接码(手动粘贴): ' + qrPayload + '\n')
+    })
+  }
 
-    // 配对握手:第一条 Control 帧载 phone 公钥(明文 b64)→ 据此派生 sharedKey
-    if (!sharedKey) {
-      if (frame.type === FrameType.Control) {
-        const phonePub = unb64(dec.decode(frame.payload))
-        sharedKey = sharedSecret(cliKp.privateKey, phonePub)
-        console.log('[ce] 手机已配对,E2E 通道建立')
+  // 在已注册的 ws 上接主消息循环(握手 + rpc + stdin + resize)
+  function wireBridge(curWs: WebSocket): void {
+    curWs.on('message', async (raw) => {
+      let frame: Frame
+      try {
+        frame = decodeFrame(raw as Uint8Array)
+      } catch {
+        return
       }
-      return
-    }
 
-    // 之后所有 payload 都是密文
-    let plaintext: Uint8Array
-    try {
-      plaintext = open(sharedKey, frame.payload)
-    } catch {
-      return // 解密失败(篡改/错 key)→ 丢弃
-    }
-
-    switch (frame.type) {
-      case FrameType.RPCReq: {
-        const req = JSON.parse(dec.decode(plaintext)) as RpcRequest
-        const resp = await handleRpc(jupyter, req)
-        // createTerminal 成功后立即开本地 terminado WS,让 shell 初始输出(prompt/banner)
-        // 立即流向手机。ensureTerm 本是懒开(只在收到首条 stdin/resize 才开),若不在建终端时
-        // 先开,手机端会"标签已绿、却停在'正在连接',要等用户点一下输入才蹦出内容"。
-        if (
-          req.op === 'createTerminal' &&
-          resp.ok &&
-          (resp.data as { name?: string } | undefined)?.name
-        ) {
-          ensureTerm((resp.data as { name: string }).name)
+      // 配对握手:第一条 Control 帧载 phone 公钥(明文 b64)→ 据此派生 sharedKey
+      if (!sharedKey) {
+        if (frame.type === FrameType.Control) {
+          const phonePub = unb64(dec.decode(frame.payload))
+          sharedKey = sharedSecret(cliPriv, phonePub)
+          console.log('[ce] 手机已配对,E2E 通道建立')
         }
-        encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), { reqId: frame.reqId })
-        break
+        return
       }
-      case FrameType.TermStdin: {
-        const name = frame.sid
-        if (!name) break
-        const tws = ensureTerm(name)
-        if (tws.readyState === WebSocket.OPEN) tws.send(JSON.stringify(['stdin', dec.decode(plaintext)]))
-        break
+
+      let plaintext: Uint8Array
+      try {
+        plaintext = open(sharedKey, frame.payload)
+      } catch {
+        return // 解密失败(篡改/错 key)→ 丢弃
       }
-      case FrameType.Control: {
-        // resize:plaintext = {op:'resize', rows, cols};sid = terminal name → terminado set_size
-        const msg = JSON.parse(dec.decode(plaintext)) as { op?: string; rows?: number; cols?: number }
-        if (
-          msg.op === 'resize' &&
-          frame.sid &&
-          typeof msg.rows === 'number' &&
-          typeof msg.cols === 'number'
-        ) {
-          const tws = ensureTerm(frame.sid)
-          if (tws.readyState === WebSocket.OPEN) {
-            tws.send(JSON.stringify(['set_size', msg.rows, msg.cols]))
+
+      switch (frame.type) {
+        case FrameType.RPCReq: {
+          const req = JSON.parse(dec.decode(plaintext)) as RpcRequest
+          const resp = await handleRpc(jupyter, req)
+          // createTerminal 成功后立即开本地 terminado WS,让 shell 初始输出(prompt/banner)
+          // 立即流向手机。ensureTerm 本是懒开,不在这开则手机"标签绿却停正在连接,要点输入才蹦出"。
+          if (
+            req.op === 'createTerminal' &&
+            resp.ok &&
+            (resp.data as { name?: string } | undefined)?.name
+          ) {
+            ensureTerm((resp.data as { name: string }).name)
           }
+          encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), { reqId: frame.reqId })
+          break
         }
-        break
+        case FrameType.TermStdin: {
+          const name = frame.sid
+          if (!name) break
+          const tws = ensureTerm(name)
+          if (tws.readyState === WebSocket.OPEN)
+            tws.send(JSON.stringify(['stdin', dec.decode(plaintext)]))
+          break
+        }
+        case FrameType.Control: {
+          // resize:plaintext = {op:'resize', rows, cols};sid = terminal name → terminado set_size
+          const msg = JSON.parse(dec.decode(plaintext)) as {
+            op?: string
+            rows?: number
+            cols?: number
+          }
+          if (
+            msg.op === 'resize' &&
+            frame.sid &&
+            typeof msg.rows === 'number' &&
+            typeof msg.cols === 'number'
+          ) {
+            const tws = ensureTerm(frame.sid)
+            if (tws.readyState === WebSocket.OPEN) {
+              tws.send(JSON.stringify(['set_size', msg.rows, msg.cols]))
+            }
+          }
+          break
+        }
+        default:
+          break
       }
-      default:
-        break
-    }
-  })
+    })
+  }
 
-  ws.on('close', () => console.log('[ce] 中继连接断开'))
-  ws.on('error', (e) => console.error('[ce] 中继错误:', (e as Error).message))
+  // 连中继(带 cid)→ 注册 → 打 qr(首次)→ 接桥接;断开则指数退避重连。
+  function connect(): void {
+    ws = new WebSocket(`${relayUrl}/?cid=${cid}`)
+    ws.on('message', function h(raw) {
+      try {
+        const m = JSON.parse(dec.decode(raw as Uint8Array))
+        if (m.type === 'registered') {
+          ws?.off('message', h)
+          reconnectDelay = 2000 // 连上即重置退避
+          const sid: string = m.sid
+          const relayToken: string = m.token
+          console.log(`[ce] 已连中继,sid=${sid}`)
+          if (!qrPrinted) {
+            qrPrinted = true
+            printQr(sid, relayToken) // sid/cliPub 持久 → 二维码不变,只首次打
+          }
+          wireBridge(ws as WebSocket)
+        } else if (m.type === 'error') {
+          console.error('[ce] 中继注册失败:', m.reason)
+        }
+      } catch {
+        /* 非控制帧(registered 之后的消息由 wireBridge 处理,h 已 off) */
+      }
+    })
+    ws.on('close', () => {
+      console.log(`[ce] 中继断开,${reconnectDelay}ms 后重连`)
+      sharedKey = null // 重连后手机重新握手派生
+      setTimeout(connect, reconnectDelay)
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000)
+    })
+    ws.on('error', (e) => console.error('[ce] 中继错误:', (e as Error).message))
+  }
+
+  connect()
 }
 
 main().catch((e) => {

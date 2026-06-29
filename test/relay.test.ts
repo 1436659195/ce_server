@@ -64,7 +64,7 @@ test('端到端:cli ↔ phone 经中继互发密文(真实 ws)', async () => {
   const port = (server.address() as { port: number }).port
   const base = `ws://127.0.0.1:${port}`
 
-  const cli = connect(base + '/')
+  const cli = connect(base + '/?cid=t1')
   const reg = await waitForJson(cli, (m) => m.type === 'registered')
   expect(reg.sid).toBeTruthy()
   expect(reg.token).toBeTruthy()
@@ -89,7 +89,7 @@ test('错误 token 加入被拒', async () => {
   const port = (server.address() as { port: number }).port
   const base = `ws://127.0.0.1:${port}`
 
-  const cli = connect(base + '/')
+  const cli = connect(base + '/?cid=t1')
   const reg = await waitForJson(cli, (m) => m.type === 'registered')
 
   // 错误 token(ASCII,避免裸中文进 WS URL 导致连接异常)

@@ -39,8 +39,10 @@ export function createRelayServer(
     const token = u.searchParams.get('token') ?? ''
 
     if (path === '' || path === '/register') {
-      // cli 注册
-      const { sid, token: tok } = hub.register(ws as RelayWS)
+      // cli 注册:带 cid(机器标识)→ 中继按 cid 复用持久 sid/token(ce/中继重启后手机配对码仍有效)。
+      // 旧 ce 无 cid → 临时匿名(每次新 sid,退化为旧行为)。
+      const cid = u.searchParams.get('cid') ?? 'anon-' + Math.random().toString(36).slice(2, 12)
+      const { sid, token: tok } = hub.register(cid, ws as RelayWS)
       ws.send(JSON.stringify({ type: 'registered', sid, token: tok }))
       wire(ws)
     } else {

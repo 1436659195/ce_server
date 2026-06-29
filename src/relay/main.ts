@@ -1,3 +1,4 @@
+import { join } from 'node:path'
 import { createRelayServer } from './server'
 import { Hub } from './hub'
 
@@ -10,7 +11,12 @@ const port = portArg
 const tlsCert = process.argv.find((a) => a.startsWith('--tls-cert='))?.split('=')[1]
 const tlsKey = process.argv.find((a) => a.startsWith('--tls-key='))?.split('=')[1]
 
-const hub = new Hub()
+// cid→sid/token 持久映射文件:中继重启后 ce 重连仍复用同一 sid(手机配对码长期有效)。
+// --state=<path> 可覆盖,默认 ./relay-state.json。
+const statePath =
+  process.argv.find((a) => a.startsWith('--state='))?.split('=')[1] ??
+  join(process.cwd(), 'relay-state.json')
+const hub = new Hub(statePath)
 const { server, close } = createRelayServer(
   hub,
   tlsCert && tlsKey ? { cert: tlsCert, key: tlsKey } : undefined
