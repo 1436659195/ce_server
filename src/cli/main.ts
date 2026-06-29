@@ -20,6 +20,11 @@ import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, type RpcRequest, type RpcResponse } from './bridge'
 import { loadOrCreateIdentity } from './identity'
+import { spawn, execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { createInterface } from 'node:readline'
+import { loadConfig } from './config'
+import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -32,7 +37,43 @@ function arg(name: string): string | undefined {
 const b64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString('base64')
 const unb64 = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, 'base64'))
 
-/** 解析 Jupyter:显式 > 探测 > 启动。 */
+const pExecFile = promisify(execFile)
+
+/** stdin 问 y/n。 */
+async function askYesNo(msg: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  try {
+    const a = await new Promise<string>((r) => rl.question(`${msg} [y/N] `, r))
+    return /^[yY]/.test(a.trim())
+  } finally {
+    rl.close()
+  }
+}
+
+/** ensureJupyter 的真实副作用实现:spawn jupyter/pip、stdin y/n。 */
+function realJupyterDeps(): JupyterInstallDeps {
+  return {
+    hasJupyter: async () => {
+      try {
+        await pExecFile('jupyter', ['--version'], { shell: true })
+        return true
+      } catch {
+        return false
+      }
+    },
+    prompt: (msg) => askYesNo(msg),
+    install: async () => {
+      console.log('[ce] pip install jupyterlab(约 1-2 分钟,请等待)...')
+      await new Promise<void>((resolve, reject) => {
+        const p = spawn('pip', ['install', 'jupyterlab'], { shell: true, stdio: 'inherit' })
+        p.on('close', (c) => (c === 0 ? resolve() : reject(new Error(`pip 退出码 ${c}`))))
+        p.on('error', reject)
+      })
+    },
+  }
+}
+
+/** 解析 Jupyter:显式 > 探测 > 引导装 > 启动。 */
 async function resolveJupyter(): Promise<{ baseUrl: string; token: string; stop?: () => void }> {
   const explicitUrl = arg('jupyter')
   const explicitToken = arg('jupyter-token')
@@ -43,16 +84,27 @@ async function resolveJupyter(): Promise<{ baseUrl: string; token: string; stop?
     console.log(`[ce] 探测到 Jupyter:${existing[0].url}(root ${existing[0].root})`)
     return { baseUrl: existing[0].url, token: existing[0].token }
   }
-  console.log('[ce] 未探测到 Jupyter,启动一个...')
+  console.log('[ce] 未探测到 Jupyter')
+  const r = await ensureJupyter(realJupyterDeps())
+  if (r === 'cancelled') {
+    console.error('[ce] 未安装 Jupyter,无法继续。手动装:pip install jupyterlab')
+    process.exit(1)
+  }
+  if (r === 'failed') {
+    console.error('[ce] 安装 Jupyter 失败。请手动 pip install jupyterlab 后重试')
+    process.exit(1)
+  }
+  console.log('[ce] 启动 Jupyter...')
   const { server, stop } = await launchJupyter()
   console.log(`[ce] 已启动 Jupyter:${server.url}`)
   return { baseUrl: server.url, token: server.token, stop }
 }
 
 async function main(): Promise<void> {
-  const relayUrl = arg('relay')
+  const relayUrl = arg('relay') ?? loadConfig().relay
   if (!relayUrl) {
     console.error('用法:ce --relay=ws://relay.yourserver[:port] [--jupyter=url --jupyter-token=t]')
+    console.error('（或先运行一行安装器 irm .../install.ps1 | iex,它会写入 ~/.ce/config.json）')
     process.exit(1)
   }
 
