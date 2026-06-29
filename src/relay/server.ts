@@ -32,8 +32,10 @@ export function createRelayServer(
     const path = new URL(req.url ?? '/', 'http://relay').pathname
     if (path === '/install.ps1' && opts?.installScriptPath) {
       try {
+        const body = renderInstallScript(readFileSync(opts.installScriptPath, 'utf8'), relayWs)
         res.setHeader('Content-Type', 'text/plain; charset=utf-8')
-        res.end(renderInstallScript(readFileSync(opts.installScriptPath, 'utf8'), relayWs))
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
       } catch {
         res.writeHead(500)
         res.end('install.ps1 不可读')
@@ -42,8 +44,10 @@ export function createRelayServer(
     }
     if (path === '/dl/ce-windows-x64.exe' && opts?.ceExePath) {
       try {
+        const buf = readFileSync(opts.ceExePath)
         res.setHeader('Content-Type', 'application/octet-stream')
-        res.end(readFileSync(opts.ceExePath))
+        res.setHeader('Content-Length', buf.length)
+        res.end(buf)
       } catch {
         res.writeHead(404)
         res.end('ce.exe 不可读')
