@@ -26,6 +26,9 @@ const { server, close } = createRelayServer(hub, {
   key: tlsCert && tlsKey ? tlsKey : undefined,
   ceExePath: join(here, '..', '..', 'dist', 'ce-windows-x64.exe'),
   installScriptPath: join(here, '..', '..', 'scripts', 'install.ps1'),
+  ceLinuxX64Path: join(here, '..', '..', 'dist', 'ce-linux-x64'),
+  ceLinuxArm64Path: join(here, '..', '..', 'dist', 'ce-linux-arm64'),
+  installShPath: join(here, '..', '..', 'scripts', 'install.sh'),
 })
 server.listen(port, () => {
   console.log(`[relay] listening on :${port}${tlsCert ? ' (wss/TLS)' : ' (ws)'}`)
