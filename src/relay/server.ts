@@ -62,6 +62,30 @@ export function createRelayServer(
       }
       return
     }
+    if (path === '/dl/ce-linux-x64' && opts?.ceLinuxX64Path) {
+      try {
+        const buf = readFileSync(opts.ceLinuxX64Path)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce-linux-x64 不可读')
+      }
+      return
+    }
+    if (path === '/dl/ce-linux-arm64' && opts?.ceLinuxArm64Path) {
+      try {
+        const buf = readFileSync(opts.ceLinuxArm64Path)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce-linux-arm64 不可读')
+      }
+      return
+    }
     res.writeHead(404)
     res.end('not found')
   }
