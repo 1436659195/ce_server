@@ -22,7 +22,15 @@ export function renderInstallScript(template: string, relayWs: string): string {
  */
 export function createRelayServer(
   hub: Hub,
-  opts?: { cert?: string; key?: string; ceExePath?: string; installScriptPath?: string }
+  opts?: {
+    cert?: string
+    key?: string
+    ceExePath?: string
+    installScriptPath?: string
+    ceLinuxX64Path?: string
+    ceLinuxArm64Path?: string
+    installShPath?: string
+  }
 ): { server: Server; close: () => Promise<void> } {
   // 静态下载路由:/install.ps1(注入 __RELAY_URL__)、/dl/ce-windows-x64.exe;其余 404。
   // ws upgrade 仍由下方 WebSocketServer({server}) 接管,与 http requestListener 不冲突。
