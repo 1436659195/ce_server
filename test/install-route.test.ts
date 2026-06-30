@@ -32,7 +32,7 @@ test('install.sh 模板的 __RELAY_URL__ 注入', () => {
 
 test('中继静态路由：/install.sh 返回注入后的脚本', async () => {
   const hub = new Hub()
-  const scriptPath = join(process.cwd(), 'scripts/install.sh')
+  const scriptPath = join(import.meta.dir, '..', 'scripts', 'install.sh')
   const { server, close } = createRelayServer(hub, { installShPath: scriptPath })
 
   const port = await listenPort(server)

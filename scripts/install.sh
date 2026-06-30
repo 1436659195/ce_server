@@ -88,7 +88,7 @@ esac
 
 # 问开机自启(软引导,systemd 可用则装)
 ASK_FROM_TTY() {
-  /bin/sh -c 'read ans </dev/tty; echo "$ans"' || echo "n"
+  sh -c 'read ans </dev/tty; echo "$ans"' || echo "n"
 }
 echo "[install] 是否开机自启?(systemd user service) [y/N]"
 if [ "y" = "$(ASK_FROM_TTY | tr '[:upper:]' '[:lower:]')" ]; then

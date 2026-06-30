@@ -32,7 +32,7 @@ export function createRelayServer(
     installShPath?: string
   }
 ): { server: Server; close: () => Promise<void> } {
-  // 静态下载路由:/install.ps1(注入 __RELAY_URL__)、/dl/ce-windows-x64.exe;其余 404。
+  // 静态下载路由:/install.ps1 + /install.sh(注入 __RELAY_URL__)、/dl/ce-{windows-x64.exe,linux-x64,linux-arm64};其余 404。
   // ws upgrade 仍由下方 WebSocketServer({server}) 接管,与 http requestListener 不冲突。
   const requestListener = (req: IncomingMessage, res: ServerResponse): void => {
     const host = req.headers.host ?? 'localhost'
