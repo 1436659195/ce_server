@@ -106,7 +106,8 @@ async function main(): Promise<void> {
   const relayUrl = arg('relay') ?? loadConfig().relay
   if (!relayUrl) {
     console.error('用法:ce --relay=ws://relay.yourserver[:port] [--jupyter=url --jupyter-token=t]')
-    console.error('（或先运行一行安装器 irm .../install.ps1 | iex,它会写入 ~/.ce/config.json）')
+    console.error('（或先运行一行安装器: curl -fsSL http://<relay>/install.sh | sh）')
+    console.error('（Windows: irm http://<relay>/install.ps1 | iex）')
     process.exit(1)
   }
 
