@@ -50,6 +50,18 @@ export function createRelayServer(
       }
       return
     }
+    if (path === '/install.sh' && opts?.installShPath) {
+      try {
+        const body = renderInstallScript(readFileSync(opts.installShPath, 'utf8'), relayWs)
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
+      } catch {
+        res.writeHead(500)
+        res.end('install.sh 不可读')
+      }
+      return
+    }
     if (path === '/dl/ce-windows-x64.exe' && opts?.ceExePath) {
       try {
         const buf = readFileSync(opts.ceExePath)
