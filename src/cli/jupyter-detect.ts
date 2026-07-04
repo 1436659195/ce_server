@@ -45,15 +45,37 @@ export function parseServerList(output: string): JupyterServer[] {
   return servers
 }
 
-/** 跑 `jupyter server list` 探测本机在跑的 Jupyter(无则空数组)。 */
+/** 验活:`jupyter list` 常把已关掉的 server 当在跑报(runtime 文件没清的残留),fetch 一下连得上才算活。
+ *  任意 HTTP 响应(含 401)即活;连接被拒/超时 = 死。 */
+async function isAlive(url: string, token: string, ms = 3000): Promise<boolean> {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), ms)
+  try {
+    await fetch(`${url}/api/status`, { headers: { Authorization: `Token ${token}` }, signal: ctrl.signal })
+    return true
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 跑 `python -m jupyter_server list` 探测本机在跑的 Jupyter(无则空数组)。
+ *  结果逐个 fetch 验活——`jupyter list` 会列出已关掉的残留 runtime 条目,不验活会复用死 URL → fetch "Unable to connect"。 */
 export async function detectServers(): Promise<JupyterServer[]> {
-  // 优先 `server list`,回退老版 `notebook list`
-  for (const sub of [['server', 'list'], ['notebook', 'list']]) {
+  // 走 `python -m ...` 而非 `jupyter ...`:Bun --compile 的 Windows 二进制 spawn 不了 jupyter.exe,
+  // 但 spawn python.exe 正常(见 launchJupyter 注释)。优先 `jupyter_server list`,回退老版 `notebook list`
+  for (const sub of [['-m', 'jupyter_server', 'list'], ['-m', 'notebook', 'list']]) {
     try {
-      // shell:true —— Windows 上 jupyter 是 jupyter.cmd,不加 shell 会 ENOENT(其它平台无影响)
-      const { stdout } = await pExecFile('jupyter', sub, { shell: true })
-      const servers = parseServerList(stdout)
-      if (servers.length > 0) return servers
+      // shell:true —— Windows 上靠 cmd 的 PATHEXT 解析 python.exe(其它平台无影响)
+      const { stdout } = await pExecFile('python', sub, { shell: true })
+      const parsed = parseServerList(stdout)
+      const live: JupyterServer[] = []
+      for (const s of parsed) {
+        if (await isAlive(s.url, s.token)) live.push(s)
+      }
+      if (live.length > 0) return live
+      // 全是 stale(已关掉的残留)→ 当作没探测到,落到上层自起一个
     } catch {
       // 该子命令不存在或失败,试下一个
     }

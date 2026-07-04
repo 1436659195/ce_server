@@ -18,10 +18,10 @@ BINARY_NAME="ce"
 # 探测平台:uname -s → linux;uname -m → x64/arm64
 detect_platform() {
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
-  if [ "$os" != "linux" ]; then
-    echo "[install] 只支持 Linux,当前系统: $os" >&2
-    return 1
-  fi
+  case "$os" in
+    linux|darwin) ;;  # 支持 Linux 与 macOS
+    *) echo "[install] 只支持 Linux/macOS,当前系统: $os" >&2; return 1 ;;
+  esac
   arch_raw=$(uname -m)
   case "$arch_raw" in
     x86_64|amd64) arch=x64 ;;
@@ -45,8 +45,10 @@ if ! command -v python3 >/dev/null 2>&1; then
     echo "  sudo apt install python3 python3-pip" >&2
   elif command -v dnf >/dev/null 2>&1; then
     echo "  sudo dnf install python3 python3-pip" >&2
+  elif command -v brew >/dev/null 2>&1; then
+    echo "  brew install python" >&2
   else
-    echo "  请用系统包管理器安装 python3 和 pip" >&2
+    echo "  macOS:装 Homebrew 后 brew install python;Linux:用系统包管理器装 python3+pip" >&2
   fi
   exit 1
 fi
@@ -72,6 +74,10 @@ fi
 TARGET="${TARGET_DIR}/${BINARY_NAME}"
 cp "$TMP" "$TARGET"
 chmod +x "$TARGET"
+# macOS:curl 下载的文件带 com.apple.quarantine,未签名二进制首跑会被 Gatekeeper 拦(killed) → 去掉。
+if [ "$(uname -s)" = "Darwin" ]; then
+  xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+fi
 
 # 写 ~/.ce/config.json (relay)
 CE_DIR="$HOME/.ce"

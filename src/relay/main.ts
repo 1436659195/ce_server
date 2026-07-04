@@ -28,6 +28,8 @@ const { server, close } = createRelayServer(hub, {
   installScriptPath: join(here, '..', '..', 'scripts', 'install.ps1'),
   ceLinuxX64Path: join(here, '..', '..', 'dist', 'ce-linux-x64'),
   ceLinuxArm64Path: join(here, '..', '..', 'dist', 'ce-linux-arm64'),
+  ceDarwinX64Path: join(here, '..', '..', 'dist', 'ce-darwin-x64'),
+  ceDarwinArm64Path: join(here, '..', '..', 'dist', 'ce-darwin-arm64'),
   installShPath: join(here, '..', '..', 'scripts', 'install.sh'),
 })
 server.listen(port, () => {

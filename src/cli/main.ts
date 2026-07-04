@@ -52,12 +52,14 @@ async function askYesNo(msg: string): Promise<boolean> {
   }
 }
 
-/** ensureJupyter 的真实副作用实现:spawn jupyter/pip、stdin y/n。 */
+/** ensureJupyter 的真实副作用实现:spawn python/pip、stdin y/n。 */
 function realJupyterDeps(): JupyterInstallDeps {
   return {
+    // 走 `python -m pip show jupyterlab`(而非 `jupyter --version`):Bun --compile 的 Windows 二进制
+    // spawn 不了 jupyter.exe,但 spawn python.exe 正常(见 launchJupyter 注释)。pip show 退码 0=已装。
     hasJupyter: async () => {
       try {
-        await pExecFile('jupyter', ['--version'], { shell: true })
+        await pExecFile('python', ['-m', 'pip', 'show', 'jupyterlab'], { shell: true })
         return true
       } catch {
         return false
@@ -65,9 +67,15 @@ function realJupyterDeps(): JupyterInstallDeps {
     },
     prompt: (msg) => askYesNo(msg),
     install: async () => {
-      console.log('[ce] pip install jupyterlab(约 1-2 分钟,请等待)...')
+      console.log('[ce] pip install jupyterlab(清华源,约 1-2 分钟,请等待)...')
       await new Promise<void>((resolve, reject) => {
-        const p = spawn('pip', ['install', 'jupyterlab'], { shell: true, stdio: 'inherit' })
+        // `python -m pip`(而非裸 `pip`):python 已确认在 PATH 上(ensurePythonOrExit),更稳。
+        // -i 清华 PyPI 源加速(默认源国内慢);--trusted-host 防 SSL 拦截(公司代理/旧证书)
+        const p = spawn(
+          'python',
+          ['-m', 'pip', 'install', 'jupyterlab', '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple', '--trusted-host', 'pypi.tuna.tsinghua.edu.cn'],
+          { shell: true, stdio: 'inherit' }
+        )
         p.on('close', (c) => (c === 0 ? resolve() : reject(new Error(`pip 退出码 ${c}`))))
         p.on('error', reject)
       })
@@ -75,31 +83,92 @@ function realJupyterDeps(): JupyterInstallDeps {
   }
 }
 
+/** 命令是否存在于 PATH(linux 用 sh 内建 command -v;仅非 win32 分支调用)。 */
+async function commandExists(name: string): Promise<boolean> {
+  try {
+    await pExecFile('sh', ['-c', `command -v ${name} >/dev/null 2>&1`])
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 自装 Jupyter(=要走 pip)前先确保本机有 Python:没有就按平台给安装指引 + 让用户
+ * 【重开终端】重跑一行安装器,然后退出。务必在 `pip install jupyterlab` 之前拦下——
+ * 否则会拖到 pip 才报错,用户只看到“pip 退出码 1”,不知道根因是没装 Python。
+ */
+async function ensurePythonOrExit(relayUrl: string): Promise<void> {
+  const isWin = process.platform === 'win32'
+  const cmd = isWin ? 'python' : 'python3'
+  let hasPython = true
+  try {
+    await pExecFile(cmd, ['--version'], { shell: true })
+  } catch {
+    hasPython = false
+  }
+  if (hasPython) return
+
+  const httpBase = relayUrl.replace(/^ws/, 'http')
+  console.error('[ce] 未检测到 Python。Coding Everywhere 需要 Python 才能运行 Jupyter。')
+  if (isWin) {
+    console.error('[ce] 请先安装(任选其一):')
+    console.error('     winget install Python.Python.3.12')
+    console.error('     或到 https://www.python.org/downloads/ 下载(安装时勾选 “Add to PATH”)')
+    console.error('[ce] 安装完成后,请【重新打开】PowerShell,重新执行一行安装命令:')
+    console.error(`     irm ${httpBase}/install.ps1 | iex`)
+  } else {
+    const isMac = process.platform === 'darwin'
+    const hasBrew = await commandExists('brew')
+    const hasApt = await commandExists('apt-get')
+    const hasDnf = await commandExists('dnf')
+    console.error('[ce] 请先安装:')
+    if (hasBrew) console.error('     brew install python')
+    else if (hasApt) console.error('     sudo apt install python3 python3-pip')
+    else if (hasDnf) console.error('     sudo dnf install python3 python3-pip')
+    else if (isMac) console.error('     请先装 Homebrew(brew.sh)后 brew install python')
+    else console.error('     请用系统包管理器安装 python3 和 pip')
+    console.error('[ce] 安装完成后,请【重新打开】终端,重新执行一行安装命令:')
+    console.error(`     curl -fsSL ${httpBase}/install.sh | sh`)
+  }
+  process.exit(1)
+}
+
+/** baseUrl 里 `localhost` → `127.0.0.1`:Bun 偶把 localhost 解析成 IPv6 `::1`,而 Jupyter 默认只听
+ *  IPv4 loopback → fetch 报 "Unable to connect"。127.0.0.1 无歧义、Jupyter 一定在听(它打的 URL 含 127.0.0.1)。 */
+function toLoopback(url: string): string {
+  return url.replace(/:\/\/localhost\b/, '://127.0.0.1')
+}
+
 /** 解析 Jupyter:显式 > 探测 > 引导装 > 启动。 */
-async function resolveJupyter(): Promise<{ baseUrl: string; token: string; stop?: () => void }> {
+async function resolveJupyter(
+  relayUrl: string
+): Promise<{ baseUrl: string; token: string; stop?: () => void }> {
   const explicitUrl = arg('jupyter')
   const explicitToken = arg('jupyter-token')
-  if (explicitUrl && explicitToken) return { baseUrl: explicitUrl, token: explicitToken }
+  if (explicitUrl && explicitToken) return { baseUrl: toLoopback(explicitUrl), token: explicitToken }
 
   const existing = await detectServers()
   if (existing.length > 0) {
     console.log(`[ce] 探测到 Jupyter:${existing[0].url}(root ${existing[0].root})`)
-    return { baseUrl: existing[0].url, token: existing[0].token }
+    return { baseUrl: toLoopback(existing[0].url), token: existing[0].token }
   }
   console.log('[ce] 未探测到 Jupyter')
+  // 自装 Jupyter 前先拦 Python:没 Python 就给指引 + 退出,绝不拖到 pip 报错。
+  await ensurePythonOrExit(relayUrl)
   const r = await ensureJupyter(realJupyterDeps())
   if (r === 'cancelled') {
-    console.error('[ce] 未安装 Jupyter,无法继续。手动装:pip install jupyterlab')
+    console.error('[ce] 未安装 Jupyter,无法继续。手动装:pip install jupyterlab -i https://pypi.tuna.tsinghua.edu.cn/simple')
     process.exit(1)
   }
   if (r === 'failed') {
-    console.error('[ce] 安装 Jupyter 失败。请手动 pip install jupyterlab 后重试')
+    console.error('[ce] 安装 Jupyter 失败。请手动 pip install jupyterlab -i https://pypi.tuna.tsinghua.edu.cn/simple 后重试')
     process.exit(1)
   }
   console.log('[ce] 启动 Jupyter...')
   const { server, stop } = await launchJupyter()
   console.log(`[ce] 已启动 Jupyter:${server.url}`)
-  return { baseUrl: server.url, token: server.token, stop }
+  return { baseUrl: toLoopback(server.url), token: server.token, stop }
 }
 
 async function main(): Promise<void> {
@@ -111,7 +180,7 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
-  const { baseUrl, token, stop } = await resolveJupyter()
+  const { baseUrl, token, stop } = await resolveJupyter(relayUrl)
   if (stop) process.on('SIGINT', stop)
 
   // --insecure:容忍自签证书(bun 下 ws 的 rejectUnauthorized 不生效,改设环境变量)
@@ -311,15 +380,19 @@ async function main(): Promise<void> {
             resp = { ok: true }
           } else {
             resp = await handleRpc(jupyter, req)
-            // createTerminal 成功后立即开本地 terminado WS,让 shell 初始输出(prompt/banner)
-            // 立即流向手机。ensureTerm 本是懒开,不在这开则手机"标签绿却停正在连接,要点输入才蹦出"。
-            if (
-              req.op === 'createTerminal' &&
-              resp.ok &&
-              (resp.data as { name?: string } | undefined)?.name
-            ) {
-              ensureTerm((resp.data as { name: string }).name)
-            }
+            // createTerminal 成功后【不】在此 eager 开 terminado WS。此时 ce 还不知道手机
+            // 的列宽,一旦开 WS,terminado 就按默认 80×24 起进程、PowerShell banner 按 80 列
+            // 打印;等手机 mount→fit→syncSize 的 resize 晚到再 set_size,Windows conpty 对这种
+            // 「晚到的 resize」会整屏 re-serialize,把用户敲入的第一个命令错位打到 banner 行
+            // (PSReadLine 此时还没就绪,光回显不执行)、并在下方留一个空的新 prompt——中继连
+            // Windows「第一个命令错位」即此。直连无此问题:直连是手机自己开 WS 并在 ws.onopen
+            // 里立即 set_size(PTY 起步即正确列宽,无晚到 resize)。
+            // 改懒开以对齐直连:手机首条 resize(useTerminals.attachXterm 的 nextTick fit+syncSize,
+            // 兜底由 tunnel onReady 的 syncSize)到 ce 时,下面 Control-resize 分支自会 ensureTerm
+            // 开 WS,并把 set_size 缓冲到 open 后立即补发——set_size 抵达时机与直连 ws.onopen 的
+            // set_size 完全一致。stdin(TermStdin)分支同样懒开兜底,故此处不预开也安全。
+            // (旧注释担心不预开会「停正在连接、要点输入才蹦出」——那是因为当时手机 mount 后不发
+            //  resize;现已由 attachXterm/onReady 可靠发 resize,懒开不再卡。)
           }
           encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), { reqId: frame.reqId })
           break

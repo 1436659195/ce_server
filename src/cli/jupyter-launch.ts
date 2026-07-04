@@ -19,28 +19,37 @@ export function parseLaunchUrl(output: string): { url: string; token: string } |
 }
 
 /**
- * 启动一个本地 Jupyter(`jupyter lab --no-browser --port=0`),等它打印 URL+token 后返回。
+ * 启动一个本地 Jupyter(`python -m jupyterlab --no-browser --port=0`),等它打印 URL+token 后返回。
  * root 取启动时的 cwd(Jupyter 默认服务 cwd)。返回 stop() 以退出时杀进程。
+ *
+ * ⚠️ 走 `python -m jupyterlab` 而非 `jupyter lab`:Bun `--compile` 出的 Windows 二进制里 `shell:true`
+ * spawn 不了 `jupyter.exe`(setuptools 入口包装器),但 spawn `python.exe` 正常(ensurePythonOrExit 已证)。
+ * `-m` 直接跑模块、绕开坏掉的 `jupyter` 命令 —— 这是你机上「pip 装好了却探测不到 + 启动超时」的根因修复。
  * ⚠️ 需真实 Jupyter,由 main 烟测覆盖(无单测)。
  */
 export async function launchJupyter(
   timeoutMs = 30000
 ): Promise<{ server: JupyterServer; stop: () => void }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn('jupyter', ['lab', '--no-browser', '--port=0'], {
+    const proc = spawn('python', ['-m', 'jupyterlab', '--no-browser', '--port=0'], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: true, // Windows 上 jupyter 是 .cmd,不加 shell 会 ENOENT(其它平台无影响)
+      shell: true, // Windows 上靠 cmd 的 PATHEXT 解析 python.exe;其它平台无影响
     })
     let buf = ''
+    let settled = false
+    // 超时/提前退出都把 Jupyter 真实输出尾巴带上 reject —— 不再静默卡 30s 把根因埋掉
     const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
       proc.kill()
-      reject(new Error('启动 Jupyter 超时'))
+      reject(new Error(`启动 Jupyter 超时(${timeoutMs / 1000}s 内未打印 token)。Jupyter 输出末尾:\n${buf.slice(-1500)}`))
     }, timeoutMs)
 
     const onChunk = (d: Buffer): void => {
       buf += d.toString()
       const parsed = parseLaunchUrl(buf)
-      if (parsed) {
+      if (parsed && !settled) {
+        settled = true
         clearTimeout(timer)
         proc.stdout?.off('data', onChunk)
         proc.stderr?.off('data', onChunk)
@@ -52,7 +61,16 @@ export async function launchJupyter(
     }
     proc.stdout?.on('data', onChunk)
     proc.stderr?.on('data', onChunk) // Jupyter 有时把 URL 打到 stderr
+    proc.on('close', (code) => {
+      // 成功启动的 Jupyter 不会退出;提前退出 = 崩了 → 立刻把输出抛出,不等 30s
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(new Error(`Jupyter 进程提前退出(码 ${code})。输出:\n${buf.slice(-1500)}`))
+    })
     proc.on('error', (e) => {
+      if (settled) return
+      settled = true
       clearTimeout(timer)
       reject(e)
     })

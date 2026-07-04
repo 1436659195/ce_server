@@ -29,6 +29,8 @@ export function createRelayServer(
     installScriptPath?: string
     ceLinuxX64Path?: string
     ceLinuxArm64Path?: string
+    ceDarwinX64Path?: string
+    ceDarwinArm64Path?: string
     installShPath?: string
   }
 ): { server: Server; close: () => Promise<void> } {
@@ -95,6 +97,30 @@ export function createRelayServer(
       } catch {
         res.writeHead(404)
         res.end('ce-linux-arm64 不可读')
+      }
+      return
+    }
+    if (path === '/dl/ce-darwin-x64' && opts?.ceDarwinX64Path) {
+      try {
+        const buf = readFileSync(opts.ceDarwinX64Path)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce-darwin-x64 不可读')
+      }
+      return
+    }
+    if (path === '/dl/ce-darwin-arm64' && opts?.ceDarwinArm64Path) {
+      try {
+        const buf = readFileSync(opts.ceDarwinArm64Path)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce-darwin-arm64 不可读')
       }
       return
     }

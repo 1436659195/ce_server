@@ -11,7 +11,12 @@ function Ask-Yes($msg) {
 
 # ① Python(没装则引导 winget 装,装完刷新本会话 PATH 让 ce 子进程拿到 python/pip)
 $needPython = $true
-try { python --version | Out-Null; $needPython = $false } catch {}
+try {
+  # 必须查 $LASTEXITCODE:Windows 商店 stub 的 python 会让 `python --version` 不抛异常但返回
+  # 非零 → 只用 try/catch 会假成功、跳过 winget(实测踩过)。2>$null 静音 stub 的英文提示。
+  python --version 2>$null | Out-Null
+  if ($LASTEXITCODE -eq 0) { $needPython = $false }
+} catch {}
 if ($needPython) {
   Write-Host "[install] 未检测到 Python"
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -20,7 +25,22 @@ if ($needPython) {
   }
   if (-not (Ask-Yes("[install] 将用 winget 安装 Python 3.12,是否继续?"))) { Write-Host "[install] 已取消"; return }
   winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+  $wingetExit = $LASTEXITCODE
+  # winget 退出码不可靠(返回 0 也可能没真装上)+ Windows 商店 stub 会假成功 → 刷新 PATH 后
+  # 实测 python(还查 $LASTEXITCODE 防 stub)。装失败就停在这、给手动安装指引,绝不闷头继续
+  # 下载/启动 ce(否则 ce 会跑到 pip 才报"没有 pip",用户不知道根因是 Python 没装上)。
   $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+  $pythonInstalled = $false
+  try { python --version 2>$null | Out-Null; if ($LASTEXITCODE -eq 0) { $pythonInstalled = $true } } catch {}
+  if (-not $pythonInstalled) {
+    $httpRelay = $relay -replace '^ws','http'
+    Write-Host "[install] winget 装 Python 失败(winget 退出码 $wingetExit,装完后仍检测不到 python)" -ForegroundColor Red
+    Write-Host "[install] 请手动装 Python 3.12:" -ForegroundColor Red
+    Write-Host "     到 https://www.python.org/downloads/ 下载(安装时勾 'Add to PATH')" -ForegroundColor Red
+    Write-Host "[install] 装好后【重新打开】PowerShell,重新执行本命令:" -ForegroundColor Red
+    Write-Host "     irm $httpRelay/install.ps1 | iex" -ForegroundColor Red
+    return
+  }
 }
 
 # ② ce.exe(已有且与中继大小一致才跳过,否则下载/升级;防呆不重下、也不漏更新)
