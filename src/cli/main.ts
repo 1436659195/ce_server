@@ -20,7 +20,7 @@ import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
 import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
-import { makeJupyterClient, handleRpc, type RpcRequest, type RpcResponse } from './bridge'
+import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { loadOrCreateIdentity } from './identity'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -355,8 +355,10 @@ async function main(): Promise<void> {
           const req = JSON.parse(dec.decode(plaintext)) as RpcRequest
           let resp: RpcResponse
           if (req.op === 'listTerminals') {
-            // 列 ce 端当前活着的终端,供手机杀 app 重开时恢复(而不是新建一个空终端)
-            resp = { ok: true, data: { names: Array.from(terms.keys()) } }
+            // 转发 GET /api/terminals 拿「Jupyter 上所有终端」+ 用 ce 的 terms map 标 managed。
+            // 手机「+」面板显示全部;杀 app 重开自动恢复只挑 managed(= ce 经手过的),零回归。
+            const all = await jupyter.listTerminals()
+            resp = { ok: true, data: { terminals: toRemoteTerminals(all, new Set(terms.keys())) } }
           } else if (req.op === 'deleteTerminal' && (req as { name?: string }).name) {
             // 手机「关闭终端」:关 ce 端 terminado + Jupyter DELETE,否则杀 app 重开又恢复回来
             const termName = (req as { name?: string }).name!

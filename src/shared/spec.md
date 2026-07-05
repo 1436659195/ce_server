@@ -37,3 +37,13 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 - 一律用 tweetnacl 成熟原语,**不自造密码学**。
 - `sharedKey` 绑定 pairing 一次建立,持久化在手机(下次自动重连不重扫)。
 - 中继**零信任**:它只转发密文,从不持 `sharedKey`、无法解密。
+
+## 5. RPC 操作契约(手机 ↔ ce,密文帧内)
+
+手机发 `RPCReq { op, ... }`,ce 回 `RPCResp { ok, data?, error? }`。除 `listTerminals`/`deleteTerminal` 为特例外,其余 `op`(`listDir`/`readFile`/`createDir`/`readFileRange`/`createTerminal`)由 `bridge.ts` 的 `handleRpc` 分派到本地 Jupyter REST。
+
+- **`listTerminals`**(特例,`main.ts` 处理 —— 需访问 ce 的 `terms` map 算 `managed`):返回 `{ ok: true, data: { terminals: RemoteTerminalInfo[] } }`,其中
+  - `RemoteTerminalInfo = { name: string; lastActivityAt: number | null; managed: boolean }`
+  - ce 转发本地 `GET /api/terminals`,用 `toRemoteTerminals(all, managedSet)`(`bridge.ts`)映射:`name` = 终端名(= terminado session name = 隧道 TermOutput 的 sid);`lastActivityAt` = 解析 `last_activity` 的 ms 时间戳(无则 null);`managed` = 该终端是否在 ce `terms` map 里(= ce 经手过、有 terminado WS)。
+  - 手机:**杀 app 重开自动恢复只挑 `managed=true`**(零回归);**「+」面板显示全部**。
+- **`deleteTerminal`**(`{ name }`,特例):关 ce 端 terminado WS + 本地 `DELETE /api/terminals/{name}`。

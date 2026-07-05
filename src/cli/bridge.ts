@@ -21,6 +21,7 @@ export interface JupyterClient {
     bytes: number // 本段实际字节数
     eof: boolean // offset+bytes >= totalSize
   }>
+  listTerminals(): Promise<RawTerminal[]> // GET /api/terminals
 }
 
 /** 手机发来的 RPC 请求(明文 JSON,解密后)。op 为 string 以兜住未知操作。 */
@@ -37,6 +38,35 @@ export interface RpcResponse {
   ok: boolean
   data?: unknown
   error?: string
+}
+
+/** GET /api/terminals 返回的单条(只取我们关心的字段;字段名沿用 Jupyter 原样) */
+export interface RawTerminal {
+  name: string
+  last_activity?: string
+}
+
+/** 列表项(= 手机端 RemoteTerminalInfo 同构;权威契约见 ce-server/src/shared/spec.md)。
+ *  ce 端独立定义此类型 —— ce 与手机是两套 tsconfig,不能跨项目 import。 */
+export interface RemoteTerminalInfo {
+  name: string
+  lastActivityAt: number | null
+  managed: boolean
+}
+
+/**
+ * 把 Jupyter GET /api/terminals 的原始数组转成手机可用的 RemoteTerminalInfo[],
+ * 用 managedSet 标注「ce 经手过的」(手机自动恢复只挑这些)。纯函数 → 可单测。
+ */
+export function toRemoteTerminals(
+  all: RawTerminal[],
+  managedSet: Set<string>
+): RemoteTerminalInfo[] {
+  return all.map((t) => ({
+    name: t.name,
+    lastActivityAt: t.last_activity ? Date.parse(t.last_activity) || null : null,
+    managed: managedSet.has(t.name),
+  }))
 }
 
 /** 把一条 RPC 请求分派到 JupyterClient 对应方法。纯逻辑,异常 → ok:false。 */
@@ -132,6 +162,11 @@ export function makeJupyterClient(baseUrl: string, token: string): JupyterClient
       const totalSize = m ? parseInt(m[1], 10) : buf.length
       const bytes = buf.length
       return { data: buf.toString('base64'), totalSize, bytes, eof: offset + bytes >= totalSize }
+    },
+    async listTerminals() {
+      const res = await fetchTimeout(`${baseUrl}/api/terminals`, { headers })
+      if (!res.ok) throw new Error(`列终端失败:${res.status} ${res.statusText}`)
+      return (await res.json()) as RawTerminal[]
     },
   }
 }

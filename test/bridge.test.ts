@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { handleRpc, type JupyterClient } from '../src/cli/bridge'
+import { handleRpc, toRemoteTerminals, type JupyterClient } from '../src/cli/bridge'
 
 // 用 fake JupyterClient 测 RPC 分派逻辑(不碰真实 Jupyter)。
 
@@ -19,6 +19,9 @@ test('listDir 路由到 client.listDir 且透传 path', async () => {
     async createDir() {},
     async readFileRange() {
       return { data: '', totalSize: 0, bytes: 0, eof: true }
+    },
+    async listTerminals() {
+      return []
     },
   }
   const res = await handleRpc(client, { op: 'listDir', path: '/x' })
@@ -42,6 +45,9 @@ test('createTerminal 路由且透传 cwd', async () => {
     async createDir() {},
     async readFileRange() {
       return { data: '', totalSize: 0, bytes: 0, eof: true }
+    },
+    async listTerminals() {
+      return []
     },
   }
   const res = await handleRpc(client, { op: 'createTerminal', cwd: '/proj' })
@@ -67,6 +73,9 @@ test('createDir 路由且透传 path,响应 ok:true(无 data)', async () => {
     async readFileRange() {
       return { data: '', totalSize: 0, bytes: 0, eof: true }
     },
+    async listTerminals() {
+      return []
+    },
   }
   const res = await handleRpc(client, { op: 'createDir', path: '/sub/new' })
   expect(res).toEqual({ ok: true })
@@ -88,6 +97,9 @@ test('未知 op → ok:false', async () => {
     async readFileRange() {
       return { data: '', totalSize: 0, bytes: 0, eof: true }
     },
+    async listTerminals() {
+      return []
+    },
   }
   const res = await handleRpc(client, { op: '删除' })
   expect(res.ok).toBe(false)
@@ -108,6 +120,9 @@ test('client 抛错 → ok:false + 错误信息(不向上抛)', async () => {
     async createDir() {},
     async readFileRange() {
       return { data: '', totalSize: 0, bytes: 0, eof: true }
+    },
+    async listTerminals() {
+      return []
     },
   }
   const res = await handleRpc(client, { op: 'listDir', path: '/' })
@@ -135,6 +150,9 @@ test('readFileRange 路由且透传 path/offset/length', async () => {
       gotLength = length
       return { data: 'QUJD', totalSize: 100, bytes: 3, eof: false }
     },
+    async listTerminals() {
+      return []
+    },
   }
   const res = await handleRpc(client, {
     op: 'readFileRange',
@@ -149,4 +167,22 @@ test('readFileRange 路由且透传 path/offset/length', async () => {
   expect(gotPath).toBe('/a.apk')
   expect(gotOffset).toBe(0)
   expect(gotLength).toBe(524288)
+})
+
+test('toRemoteTerminals 解析 last_activity + managed 标记', () => {
+  const all = [
+    { name: '1', last_activity: '2026-07-05T10:00:00Z' },
+    { name: '2', last_activity: '2026-07-05T09:00:00Z' },
+    { name: '3' },
+  ]
+  const out = toRemoteTerminals(all, new Set(['1']))
+  expect(out).toEqual([
+    { name: '1', lastActivityAt: Date.parse('2026-07-05T10:00:00Z'), managed: true },
+    { name: '2', lastActivityAt: Date.parse('2026-07-05T09:00:00Z'), managed: false },
+    { name: '3', lastActivityAt: null, managed: false },
+  ])
+})
+
+test('toRemoteTerminals 空数组 → 空数组', () => {
+  expect(toRemoteTerminals([], new Set())).toEqual([])
 })
