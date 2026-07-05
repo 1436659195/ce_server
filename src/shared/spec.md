@@ -46,4 +46,5 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
   - `RemoteTerminalInfo = { name: string; lastActivityAt: number | null; managed: boolean }`
   - ce 转发本地 `GET /api/terminals`,用 `toRemoteTerminals(all, managedSet)`(`bridge.ts`)映射:`name` = 终端名(= terminado session name = 隧道 TermOutput 的 sid);`lastActivityAt` = 解析 `last_activity` 的 ms 时间戳(无则 null);`managed` = 该终端是否在 ce `terms` map 里(= ce 经手过、有 terminado WS)。
   - 手机:**杀 app 重开自动恢复只挑 `managed=true`**(零回归);**「+」面板显示全部**。
-- **`deleteTerminal`**(`{ name }`,特例):关 ce 端 terminado WS + 本地 `DELETE /api/terminals/{name}`。
+- **`deleteTerminal`**(`{ name }`,特例):关 ce 端 terminado WS + 本地 `DELETE /api/terminals/{name}`(硬删:杀服务器终端进程)。
+- **`detachTerminal`**(`{ name }`,特例):只关 ce 端 terminado WS + 从 ce `terms` map 移除,**不** Jupyter DELETE(软移除:服务器终端保留)。→ 该终端 `managed` 变 false(杀 app 重开不自动恢复),但 `GET /api/terminals` 仍返回 →「+」面板可见、可重新接管。

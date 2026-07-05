@@ -380,6 +380,21 @@ async function main(): Promise<void> {
               /* 尽力删,失败不阻塞(至多留服务端孤儿终端) */
             }
             resp = { ok: true }
+          } else if (req.op === 'detachTerminal' && (req as { name?: string }).name) {
+            // 手机「移除」(软):只关 ce 端 terminado WS、不 Jupyter DELETE。
+            // → terms map 移除该 name → 下次 listTerminals managed=false → 杀 app 重开不自动恢复;
+            //   Jupyter 终端仍在(GET /api/terminals 仍返回)→「+」面板可见、可重新接管。
+            const termName = (req as { name?: string }).name!
+            const tws = terms.get(termName)
+            if (tws) {
+              try {
+                tws.close()
+              } catch {
+                /* 已关 */
+              }
+              terms.delete(termName)
+            }
+            resp = { ok: true }
           } else {
             resp = await handleRpc(jupyter, req)
             // createTerminal 成功后【不】在此 eager 开 terminado WS。此时 ce 还不知道手机
