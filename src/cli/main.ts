@@ -222,7 +222,10 @@ async function main(): Promise<void> {
   // (直连因 ws.onopen 里 syncSize,连接好了才发,不丢)。
   function ensureTerm(name: string): WebSocket {
     const cached = terms.get(name)
-    if (cached && cached.readyState === WebSocket.OPEN) return cached
+    // OPEN 或 CONNECTING 都复用 —— CONNECTING 必须复用,否则手机 attach 终端时连续几次
+    // syncSize/resize 落在 CONNECTING 窗口会各自新开一条 terminado WS,多条 WS 各自把同一份
+    // 输出转给手机 → 重复输出 N 次(只有 CLOSING/CLOSED 才重连)。
+    if (cached && (cached.readyState === WebSocket.OPEN || cached.readyState === WebSocket.CONNECTING)) return cached
     const tws = new WebSocket(`${wsBase}/terminals/websocket/${name}?token=${token}`)
     const pending: string[] = [] // CONNECTING 期间缓冲,防 set_size/stdin 丢失
     const origSend = tws.send.bind(tws)
