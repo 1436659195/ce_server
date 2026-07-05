@@ -11,13 +11,25 @@ export interface JupyterClient {
   listDir(path: string): Promise<unknown> // GET /api/contents/{path}(目录)
   readFile(path: string): Promise<unknown> // GET /api/contents/{path}(文件)
   createDir(path: string): Promise<void> // PUT /api/contents/{path} {type:directory}
+  readFileRange(
+    path: string,
+    offset: number,
+    length: number
+  ): Promise<{
+    data: string // 段字节 base64
+    totalSize: number // 全文字节(Content-Range;无则 = 段长)
+    bytes: number // 本段实际字节数
+    eof: boolean // offset+bytes >= totalSize
+  }>
 }
 
 /** 手机发来的 RPC 请求(明文 JSON,解密后)。op 为 string 以兜住未知操作。 */
 export interface RpcRequest {
-  op: string // 'listDir' | 'readFile' | 'createTerminal'(或未知)
+  op: string // 'listDir' | 'readFile' | 'readFileRange' | 'createTerminal'(或未知)
   path?: string
   cwd?: string
+  offset?: number
+  length?: number
 }
 
 /** ce 回的 RPC 响应(明文 JSON,加密前)。 */
@@ -40,6 +52,11 @@ export async function handleRpc(client: JupyterClient, req: RpcRequest): Promise
       case 'createDir':
         await client.createDir(req.path ?? '/')
         return { ok: true }
+      case 'readFileRange':
+        return {
+          ok: true,
+          data: await client.readFileRange(req.path ?? '/', req.offset ?? 0, req.length ?? 0),
+        }
       default:
         return { ok: false, error: `未知操作: ${req.op}` }
     }
@@ -100,6 +117,21 @@ export function makeJupyterClient(baseUrl: string, token: string): JupyterClient
         body: JSON.stringify({ type: 'directory' }),
       })
       if (!res.ok) throw new Error(`创建文件夹失败:${res.status} ${res.statusText}`)
+    },
+    async readFileRange(path, offset, length) {
+      // Range 拉段;Jupyter(/files/ 走 Tornado 静态)通常返 206+Content-Range。
+      // 若服务器忽略 Range → 返 200 全文:totalSize=段长(=全文)、eof=true,phone 一次收完。
+      const end = offset + length - 1
+      const res = await fetchTimeout(`${baseUrl}/files/${encodePath(path)}`, {
+        headers: { ...headers, Range: `bytes=${offset}-${end}` },
+      })
+      if (!res.ok) throw new Error(`读字节失败:${res.status} ${res.statusText}`)
+      const buf = Buffer.from(await res.arrayBuffer())
+      const cr = res.headers.get('content-range') || ''
+      const m = /\/(\d+)/.exec(cr)
+      const totalSize = m ? parseInt(m[1], 10) : buf.length
+      const bytes = buf.length
+      return { data: buf.toString('base64'), totalSize, bytes, eof: offset + bytes >= totalSize }
     },
   }
 }
