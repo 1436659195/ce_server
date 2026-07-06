@@ -109,20 +109,6 @@ def is_alive(url: str, token: str, timeout: float = 3.0) -> bool:
         return False
 
 
-def detect_servers() -> list[dict]:
-    """跑 jupyter server list(回退 notebook list),逐个验活,返回活着的。"""
-    for sub in (['-m', 'jupyter_server', 'list'], ['-m', 'notebook', 'list']):
-        try:
-            r = subprocess.run([sys.executable] + sub, capture_output=True,
-                               text=True, timeout=10, shell=False)
-            live = [s for s in parse_server_list(r.stdout) if is_alive(s['url'], s['token'])]
-            if live:
-                return live
-        except Exception:
-            continue
-    return []
-
-
 def has_jupyter() -> bool:
     try:
         subprocess.run([sys.executable, '-m', 'pip', 'show', 'jupyterlab'],
@@ -163,10 +149,14 @@ def choose_ip(ips: list[str]) -> str:
     print('[lan] 检测到多个网卡 IP,选一个(手机与该网段同 WiFi):')
     for i, ip in enumerate(ips):
         print(f'  [{i}] {ip}')
-    while True:
-        a = input('输入序号: ').strip()
-        if a.isdigit() and 0 <= int(a) < len(ips):
-            return ips[int(a)]
+    try:
+        while True:
+            a = input('输入序号: ').strip()
+            if a.isdigit() and 0 <= int(a) < len(ips):
+                return ips[int(a)]
+    except EOFError:
+        print('[lan] 非交互模式,默认用第一个 IP')
+        return ips[0]
 
 
 def launch_external_jupyter(port: int, token: str):
@@ -190,30 +180,26 @@ def launch_external_jupyter(port: int, token: str):
 
 
 def resolve_jupyter(port: int, token: str):
-    """返回 (base_url, token, proc_or_None)。proc 非 None = 我们起的,退出时要杀。"""
-    external = [s for s in detect_servers() if not is_loopback_url(s['url'])]
-    if external:  # 已有对外实例 → 复用,不开新进程
-        s = external[0]
-        print(f'[lan] 复用已有 Jupyter: {s["url"]}')
-        return s['url'].replace('0.0.0.0', '127.0.0.1'), s['token'], None
+    """新起一个对外(0.0.0.0)Jupyter 实例,返回 Popen。
+    不复用已有 jupyter:其监听 host 不定(常为机器名/loopback/某具体IP),手机不可靠连。
+    起独立的对外实例(默认 8601)保证手机可达;不动用户已有的 loopback 实例。"""
     if not has_jupyter():
         print('[lan] 未检测到 Jupyter。先装:pip install jupyterlab '
               '-i https://pypi.tuna.tsinghua.edu.cn/simple')
         sys.exit(1)
     print('[lan] 启动对外 Jupyter(0.0.0.0)...')
-    proc = launch_external_jupyter(port, token)
-    return f'http://127.0.0.1:{port}', token, proc
+    return launch_external_jupyter(port, token)
 
 
 def main() -> None:
     ensure_python_or_exit()
     port = DEFAULT_PORT
     token = load_or_make_token()
-    base_url, tok, proc = resolve_jupyter(port, token)
+    proc = resolve_jupyter(port, token)
     ip = choose_ip(lan_ip_candidates())
-    display_url = base_url.replace('127.0.0.1', ip)
+    display_url = f'http://{ip}:{port}'
     name = socket.gethostname()
-    payload = build_qr_payload(display_url, tok, name)
+    payload = build_qr_payload(display_url, token, name)
 
     print('\n[lan] 用 App「扫码连接」扫下方二维码(同 WiFi):\n')
     qr = render_qr_ansi(payload)
