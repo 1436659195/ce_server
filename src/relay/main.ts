@@ -31,6 +31,7 @@ const { server, close } = createRelayServer(hub, {
   ceDarwinX64Path: join(here, '..', '..', 'dist', 'ce-darwin-x64'),
   ceDarwinArm64Path: join(here, '..', '..', 'dist', 'ce-darwin-arm64'),
   installShPath: join(here, '..', '..', 'scripts', 'install.sh'),
+  lanPyPath: join(here, '..', '..', 'scripts', 'lan.py'),
 })
 server.listen(port, () => {
   console.log(`[relay] listening on :${port}${tlsCert ? ' (wss/TLS)' : ' (ws)'}`)

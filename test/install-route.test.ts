@@ -48,6 +48,24 @@ test('中继静态路由：/install.sh 返回注入后的脚本', async () => {
   }
 })
 
+test('中继静态路由：/lan.py 返回纯静态脚本(无占位注入)', async () => {
+  const hub = new Hub()
+  const lanPyPath = join(import.meta.dir, '..', 'scripts', 'lan.py')
+  const { server, close } = createRelayServer(hub, { lanPyPath })
+
+  const port = await listenPort(server)
+  try {
+    const resp = await fetch(`http://localhost:${port}/lan.py`)
+    const body = await resp.text()
+
+    expect(resp.ok).toBe(true)
+    expect(body).toContain('def main')
+    expect(resp.headers.get('content-type')).toBe('text/x-python; charset=utf-8')
+  } finally {
+    await close()
+  }
+})
+
 test('中继静态路由：/dl/ce-linux-x64 返回二进制', async () => {
   const hub = new Hub()
   // 写到 tmpdir 而非 dist/,避免覆盖 build 出的真二进制

@@ -32,9 +32,10 @@ export function createRelayServer(
     ceDarwinX64Path?: string
     ceDarwinArm64Path?: string
     installShPath?: string
+    lanPyPath?: string
   }
 ): { server: Server; close: () => Promise<void> } {
-  // 静态下载路由:/install.ps1 + /install.sh(注入 __RELAY_URL__)、/dl/ce-{windows-x64.exe,linux-x64,linux-arm64};其余 404。
+  // 静态下载路由:/install.ps1 + /install.sh(注入 __RELAY_URL__)、/lan.py(纯静态,无占位)、/dl/ce-{windows-x64.exe,linux-x64,linux-arm64};其余 404。
   // ws upgrade 仍由下方 WebSocketServer({server}) 接管,与 http requestListener 不冲突。
   const requestListener = (req: IncomingMessage, res: ServerResponse): void => {
     const host = req.headers.host ?? 'localhost'
@@ -61,6 +62,18 @@ export function createRelayServer(
       } catch {
         res.writeHead(500)
         res.end('install.sh 不可读')
+      }
+      return
+    }
+    if (path === '/lan.py' && opts?.lanPyPath) {
+      try {
+        const body = readFileSync(opts.lanPyPath, 'utf8')
+        res.setHeader('Content-Type', 'text/x-python; charset=utf-8')
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
+      } catch {
+        res.writeHead(500)
+        res.end('lan.py 不可读')
       }
       return
     }
