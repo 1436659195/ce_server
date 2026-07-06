@@ -30,3 +30,9 @@ def test_qr_payload_shape():
 def test_lan_ip_candidates_excludes_loopback():
     ips = lan_ip_candidates()
     assert all(not ip.startswith('127.') for ip in ips)
+
+from lan import render_qr_ansi
+
+def test_render_qr_ansi_returns_block_chars_or_empty():
+    out = render_qr_ansi('{"u":"http://1.2.3.4:8601","t":"tok","n":"h"}')
+    assert out == '' or all(c in '█▀▄ \n' for c in out)

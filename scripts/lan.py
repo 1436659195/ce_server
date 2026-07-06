@@ -67,6 +67,36 @@ def build_qr_payload(url: str, token: str, name: str) -> str:
     return json.dumps({'u': url, 't': token, 'n': name})
 
 
+def render_qr_ansi(payload: str) -> str:
+    """终端 ANSI block 二维码(▀▄█,2 module 合 1 行)。优先 import qrcode;
+    无则 pip install --user(纯 python 小包,几秒);都失败返回 ''(上层 fallback 连接码)。"""
+    try:
+        import qrcode
+    except ImportError:
+        try:
+            subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', '--user', '--quiet', 'qrcode'],
+                check=True, timeout=90,
+            )
+            import qrcode
+        except Exception:
+            return ''
+    qr = qrcode.QRCode()
+    qr.add_data(payload)
+    qr.make(fit=True)
+    modules = qr.modules  # list[list[bool]],modules[y][x] = True 表示该 module 涂黑
+    size = len(modules)
+    lines: list[str] = []
+    for y in range(0, size, 2):
+        line = ''
+        for x in range(size):
+            top = bool(modules[y][x])
+            bot = y + 1 < size and bool(modules[y + 1][x])
+            line += '█' if top and bot else '▀' if top else '▄' if bot else ' '
+        lines.append(line)
+    return '\n'.join(lines)
+
+
 def main() -> None:  # 下一个 Task 实现
     pass
 
