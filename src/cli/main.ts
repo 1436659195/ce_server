@@ -234,6 +234,23 @@ async function main(): Promise<void> {
     })
   }
 
+  /** race loser 通知:两手机近乎同时接管同一空闲终端,先到先得裁决后,给落败方(loserPhoneId)
+   *  发一条加密 Control{op:'attachDenied'},载 winner 显示名。loser 收到后本地回滚会话 + 提示用户。
+   *  用 loser 自己的 sharedKey 加密 + targetPhoneId 路由(中继据此寻路)。 */
+  function denyAttach(name: string, loserPhoneId: string, winnerPhoneId: string): void {
+    encryptThenSend(
+      FrameType.Control,
+      enc.encode(
+        JSON.stringify({
+          op: 'attachDenied',
+          name,
+          occupiedBy: phoneKeys.get(winnerPhoneId)?.name ?? '?',
+        })
+      ),
+      { targetPhoneId: loserPhoneId }
+    )
+  }
+
   // 按 terminal name 懒开/重连 terminado WS(路径无 /api 前缀);输出加密回传。
   // 健壮性:① cached 断开(CLOSING/CLOSED)则重连,不复用死连接;② WS 还在 CONNECTING 时
   // 缓冲 set_size/stdin,open 后补发。否则恢复终端时第一条 resize 落在 CONNECTING 上被
@@ -373,12 +390,14 @@ async function main(): Promise<void> {
               typeof msg.rows === 'number' &&
               typeof msg.cols === 'number'
             ) {
-              // 占用校验:attach(=首条 resize)时按先到先得裁决;别人已占 → 静默丢
-              // (resize 无 reqId 不回错;手机靠 listTerminals occupiedBy 灰显别人在用的,见 Task7)
+              // 占用校验:attach(=首条 resize)时按先到先得裁决;别人已占 → 不 ensureTerm,
+              // 并给 loser 发 attachDenied(race 反馈:loser 此前已本地建会话,需回滚 + 提示)。
               const acq = tryAcquire(terminalOwner, frame.sid, srcPhone)
               if (acq.ok) {
                 const tws = ensureTerm(frame.sid)
                 tws.send(JSON.stringify(['set_size', msg.rows, msg.cols])) // ensureTerm 自缓冲(CONNECTING 时)
+              } else {
+                denyAttach(frame.sid, srcPhone, acq.occupiedBy)
               }
             }
             return
@@ -512,10 +531,13 @@ async function main(): Promise<void> {
         case FrameType.TermStdin: {
           const name = frame.sid
           if (!name) break
-          // 占用校验:懒开 WS 时按先到先得裁决;别人占用的终端其 stdin 静默丢(不回错,手机靠
-          // listTerminals occupiedBy 灰显避免误操作)
+          // 占用校验:懒开 WS 时按先到先得裁决;别人占用的终端其 stdin 不转发,并给 loser 发
+          // attachDenied(race 反馈:loser 可能已本地建会话,需回滚 + 提示)。
           const acq = tryAcquire(terminalOwner, name, srcPhone)
-          if (!acq.ok) break
+          if (!acq.ok) {
+            denyAttach(name, srcPhone, acq.occupiedBy)
+            break
+          }
           const tws = ensureTerm(name)
           tws.send(JSON.stringify(['stdin', dec.decode(plaintext)])) // ensureTerm 自缓冲(CONNECTING 时)
           break

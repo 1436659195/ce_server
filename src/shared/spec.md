@@ -43,8 +43,14 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 手机发 `RPCReq { op, ... }`,ce 回 `RPCResp { ok, data?, error? }`。除 `listTerminals`/`deleteTerminal` 为特例外,其余 `op`(`listDir`/`readFile`/`createDir`/`readFileRange`/`createTerminal`)由 `bridge.ts` 的 `handleRpc` 分派到本地 Jupyter REST。
 
 - **`listTerminals`**(特例,`main.ts` 处理 —— 需访问 ce 的 `terms` map 算 `managed`):返回 `{ ok: true, data: { terminals: RemoteTerminalInfo[] } }`,其中
-  - `RemoteTerminalInfo = { name: string; lastActivityAt: number | null; managed: boolean }`
-  - ce 转发本地 `GET /api/terminals`,用 `toRemoteTerminals(all, managedSet)`(`bridge.ts`)映射:`name` = 终端名(= terminado session name = 隧道 TermOutput 的 sid);`lastActivityAt` = 解析 `last_activity` 的 ms 时间戳(无则 null);`managed` = 该终端是否在 ce `terms` map 里(= ce 经手过、有 terminado WS)。
-  - 手机:**杀 app 重开自动恢复只挑 `managed=true`**(零回归);**「+」面板显示全部**。
+  - `RemoteTerminalInfo = { name: string; lastActivityAt: number | null; managed: boolean; occupiedBy: string | null }`
+  - ce 转发本地 `GET /api/terminals`,用 `toRemoteTerminals(all, managedSet)`(`bridge.ts`)映射:`name` = 终端名(= terminado session name = 隧道 TermOutput 的 sid);`lastActivityAt` = 解析 `last_activity` 的 ms 时间戳(无则 null);`managed` = 该终端是否在 ce `terms` map 里(= ce 经手过、有 terminado WS);`occupiedBy` = 当前占用者显示名(按 `terminalOwner` map 查 phone 显示名;空闲=`null`)。
+  - 手机:**杀 app 重开自动恢复只挑 `managed=true`**(零回归);**「+」面板显示全部**,并据 `occupiedBy` 灰显别人正在用的(自己占用的仍可切)。
 - **`deleteTerminal`**(`{ name }`,特例):关 ce 端 terminado WS + 本地 `DELETE /api/terminals/{name}`(硬删:杀服务器终端进程)。
 - **`detachTerminal`**(`{ name }`,特例):只关 ce 端 terminado WS + 从 ce `terms` map 移除,**不** Jupyter DELETE(软移除:服务器终端保留)。→ 该终端 `managed` 变 false(杀 app 重开不自动恢复),但 `GET /api/terminals` 仍返回 →「+」面板可见、可重新接管。
+
+## 6. Control 帧的密文 op(ce→手机,定向加密 + targetPhoneId 路由)
+
+除手机→ce 的握手(明文 phonePub)/resize(密文)外,ce→手机 也用 `FrameType.Control` 发密文控制通知:
+
+- **`attachDenied`**(`{ op:'attachDenied', name, occupiedBy }`):race 反馈。两手机近乎同时接管同一空闲终端,ce `tryAcquire` 按先到先得裁决,落败方(loser)此前已在本地建会话(接管面板点的)→ ce 给 loser 发此通知(用 loser 的 sharedKey 加密 + `targetPhoneId=loser` 路由)。loser 收到后**本地回滚该 session(软移除,`localOnly=true`:不再对 ce 发 `detachTerminal`,否则会误杀 winner 刚抢到的终端/占用)** + 弹 toast(`「name」刚被 occupiedBy 占用了`)。`occupiedBy` = winner 的显示名。
