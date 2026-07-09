@@ -56,7 +56,8 @@ fi
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
-if ! curl -fsSL "$URL" -o "$TMP"; then
+# -fSL(去 -s 静默)+ --progress-bar:91MB 二进制下载显示进度条,免得像卡住
+if ! curl -fSL --progress-bar "$URL" -o "$TMP"; then
   echo "[install] 下载失败: $URL" >&2
   exit 1
 fi
