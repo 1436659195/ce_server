@@ -170,9 +170,11 @@ export function createRelayServer(
       ws.send(JSON.stringify({ type: 'registered', sid, token: tok }))
       wire(ws)
     } else {
-      // phone 加入:path = '/{sid}'
+      // phone 加入:path = '/{sid}?token=xxx&phoneId=yyy'
+      // phoneId 为手机持久身份(多 phone 共连路由用);老 phone 无 phoneId → 匿名(退化可用)
       const sid = path.startsWith('/') ? path.slice(1) : path
-      const ok = hub.joinPhone(sid, token, ws as RelayWS)
+      const phoneId = u.searchParams.get('phoneId') ?? 'anon-' + Math.random().toString(36).slice(2, 12)
+      const ok = hub.joinPhone(sid, token, ws as RelayWS, phoneId)
       if (ok) {
         ws.send(JSON.stringify({ type: 'joined' }))
         wire(ws)
