@@ -69,9 +69,10 @@ test('App Tunnel ↔ 中继 ↔ ce:握手 + RPC + 终端流 全链路', async ()
     if (typeof m.type === 'string') return // 中继控制消息(registered 等),忽略
     const frame = ceDecode(raw as Uint8Array) // ce 的 decodeFrame 接 Uint8Array/Buffer
     if (!cliSharedKey) {
-      // 握手 Control 帧:phone 公钥(明文 b64)
+      // 握手 Control 帧:明文 JSON {k:phonePub(b64), id:phoneId, n:phoneName}(Task 5 起改 JSON)
       if (frame.type === CeFT.Control) {
-        const phonePub = new Uint8Array(Buffer.from(dec.decode(frame.payload), 'base64'))
+        const parsed = JSON.parse(dec.decode(frame.payload)) as { k: string; id?: string; n?: string }
+        const phonePub = new Uint8Array(Buffer.from(parsed.k, 'base64'))
         cliSharedKey = sharedSecret(cliKp.privateKey, phonePub)
       }
       return
@@ -98,7 +99,7 @@ test('App Tunnel ↔ 中继 ↔ ce:握手 + RPC + 终端流 全链路', async ()
   })
 
   // ── App 侧 Tunnel(phone)──
-  const tunnel = new Tunnel(qr, nodeWS)
+  const tunnel = new Tunnel(qr, nodeWS, 'test-phone-id', '测试机')
   tunnel.connect()
   await tunnel.readyPromise
 
