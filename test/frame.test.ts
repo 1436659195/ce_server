@@ -25,3 +25,27 @@ test('frame round-trip: 终端输入流(带 sid)', () => {
   expect(out.sid).toBe('term-1')
   expect(new TextDecoder().decode(out.payload)).toBe('ls -la\n')
 })
+
+// 多人共连路由字段:cli 用 targetPhoneId 定向发给某手机;hub 用 sourcePhoneId 标注来源。
+// 这些是路由元数据(非 E2E 负载,payload 仍加密不变)。
+test('frame round-trip: targetPhoneId / sourcePhoneId', () => {
+  const f: Frame = {
+    type: FrameType.TermOutput,
+    sid: 't1',
+    targetPhoneId: 'p2',
+    payload: new Uint8Array([1, 2, 3]),
+  }
+  const back = decodeFrame(encodeFrame(f))
+  expect(back.targetPhoneId).toBe('p2')
+  expect(back.sid).toBe('t1')
+})
+
+test('omits route fields when absent (向后兼容)', () => {
+  const wire = JSON.parse(
+    new TextDecoder().decode(
+      encodeFrame({ type: FrameType.Control, payload: new Uint8Array([9]) }),
+    ),
+  ) as Record<string, unknown>
+  expect(wire.targetPhoneId).toBeUndefined()
+  expect(wire.sourcePhoneId).toBeUndefined()
+})

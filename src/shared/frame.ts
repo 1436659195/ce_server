@@ -24,14 +24,19 @@ export interface Frame {
   sid?: string // 终端会话ID(终端流用)
   reqId?: string // RPC 请求ID(RPC 用)
   payload: Uint8Array // 终端:terminado JSON 字节;RPC:请求/响应 JSON 字节;均已加密
+  // 多人共连路由元数据(非 E2E 负载,payload 仍加密不变):
+  targetPhoneId?: string // cli→phone 定向:ce 指明此帧发给哪台手机
+  sourcePhoneId?: string // phone→cli 来源:hub 注入,标明此帧来自哪台手机
 }
 
-// 传输用 JSON 形态(payload 转 base64;sid/reqId 为空时省略)
+// 传输用 JSON 形态(payload 转 base64;sid/reqId/targetPhoneId/sourcePhoneId 为空时省略)
 interface WireFrame {
   type: FrameType
   sid?: string
   reqId?: string
   payload: string // base64
+  targetPhoneId?: string
+  sourcePhoneId?: string
 }
 
 export const encodeFrame = (f: Frame): Uint8Array => {
@@ -41,6 +46,8 @@ export const encodeFrame = (f: Frame): Uint8Array => {
   }
   if (f.sid !== undefined) wire.sid = f.sid
   if (f.reqId !== undefined) wire.reqId = f.reqId
+  if (f.targetPhoneId !== undefined) wire.targetPhoneId = f.targetPhoneId
+  if (f.sourcePhoneId !== undefined) wire.sourcePhoneId = f.sourcePhoneId
   return new TextEncoder().encode(JSON.stringify(wire))
 }
 
@@ -51,5 +58,7 @@ export const decodeFrame = (b: Uint8Array): Frame => {
     sid: o.sid,
     reqId: o.reqId,
     payload: new Uint8Array(Buffer.from(o.payload, 'base64')),
+    targetPhoneId: o.targetPhoneId,
+    sourcePhoneId: o.sourcePhoneId,
   }
 }
