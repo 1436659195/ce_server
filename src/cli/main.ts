@@ -23,6 +23,7 @@ import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { loadOrCreateIdentity } from './identity'
+import { tryAcquire } from './ownership'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
@@ -275,6 +276,12 @@ async function main(): Promise<void> {
         /* setup/exit/控制帧忽略 */
       }
     })
+    tws.on('close', () => {
+      // 手机关终端 / 进程退出 → terminado WS 断 → 释放占用,别人可重新接管。
+      // 守卫:仅当关闭的仍是 terms 当前登记的本条 WS 才释放 —— ensureTerm 重连时,
+      // 旧 WS 的延迟 close 不应误清刚由新 WS 的 attach 设上的新 owner。
+      if (terms.get(name) === tws) terminalOwner.delete(name)
+    })
     terms.set(name, tws)
     return tws
   }
@@ -351,7 +358,7 @@ async function main(): Promise<void> {
       // 手机每次重连用新公钥 → 必须每次 phonePub 重新派生 sharedKey 并 set 进 phoneKeys
       // (按 phoneId 分通道,不覆盖其它 phone —— 这是「多 E2E」与旧单 sharedKey 的核心区别)。
       if (frame.type === FrameType.Control) {
-        if (knownKey) {
+        if (knownKey && srcPhone) {
           // 先按密文解密(resize 等控制帧是密文)
           try {
             const decrypted = open(knownKey, frame.payload)
@@ -366,8 +373,13 @@ async function main(): Promise<void> {
               typeof msg.rows === 'number' &&
               typeof msg.cols === 'number'
             ) {
-              const tws = ensureTerm(frame.sid)
-              tws.send(JSON.stringify(['set_size', msg.rows, msg.cols])) // ensureTerm 自缓冲(CONNECTING 时)
+              // 占用校验:attach(=首条 resize)时按先到先得裁决;别人已占 → 静默丢
+              // (resize 无 reqId 不回错;手机靠 listTerminals occupiedBy 灰显别人在用的,见 Task7)
+              const acq = tryAcquire(terminalOwner, frame.sid, srcPhone)
+              if (acq.ok) {
+                const tws = ensureTerm(frame.sid)
+                tws.send(JSON.stringify(['set_size', msg.rows, msg.cols])) // ensureTerm 自缓冲(CONNECTING 时)
+              }
             }
             return
           } catch {
@@ -399,8 +411,8 @@ async function main(): Promise<void> {
       }
 
       // RPCReq / TermStdin:必须已握手 + 密文。按 frame.sourcePhoneId 查该 phone 的 E2E key 解密;
-      // 查不到(未配对 / 老 hub 未注入 sourcePhoneId)→ 丢弃。
-      if (!knownKey) return
+      // 查不到(未配对 / 老 hub 未注入 sourcePhoneId)→ 丢弃。knownKey 存在 ⇒ srcPhone 必非空。
+      if (!knownKey || !srcPhone) return
       let plaintext: Uint8Array
       try {
         plaintext = open(knownKey, frame.payload)
@@ -416,7 +428,14 @@ async function main(): Promise<void> {
             // 转发 GET /api/terminals 拿「Jupyter 上所有终端」+ 用 ce 的 terms map 标 managed。
             // 手机「+」面板显示全部;杀 app 重开自动恢复只挑 managed(= ce 经手过的),零回归。
             const all = await jupyter.listTerminals()
-            resp = { ok: true, data: { terminals: toRemoteTerminals(all, new Set(terms.keys())) } }
+            // 每条加 occupiedBy(占用者显示名;null=空闲)—— 手机「+」面板据此灰显别人在用的
+            const terminals = toRemoteTerminals(all, new Set(terms.keys())).map((t) => ({
+              ...t,
+              occupiedBy: terminalOwner.has(t.name)
+                ? (phoneKeys.get(terminalOwner.get(t.name)!)?.name ?? null)
+                : null,
+            }))
+            resp = { ok: true, data: { terminals } }
           } else if (req.op === 'deleteTerminal' && (req as { name?: string }).name) {
             // 手机「关闭终端」:关 ce 端 terminado + Jupyter DELETE,否则杀 app 重开又恢复回来
             const termName = (req as { name?: string }).name!
@@ -429,6 +448,7 @@ async function main(): Promise<void> {
               }
               terms.delete(termName)
             }
+            terminalOwner.delete(termName) // 释放占用(终端已删,owner 无意义)
             try {
               await fetch(`${baseUrl}/api/terminals/${encodeURIComponent(termName)}`, {
                 method: 'DELETE',
@@ -452,35 +472,50 @@ async function main(): Promise<void> {
               }
               terms.delete(termName)
             }
+            terminalOwner.delete(termName) // 软移除也释放占用:别人可从「+」面板重新接管
             resp = { ok: true }
-          } else {
-            resp = await handleRpc(jupyter, req)
-            // createTerminal 成功后【不】在此 eager 开 terminado WS。此时 ce 还不知道手机
-            // 的列宽,一旦开 WS,terminado 就按默认 80×24 起进程、PowerShell banner 按 80 列
-            // 打印;等手机 mount→fit→syncSize 的 resize 晚到再 set_size,Windows conpty 对这种
-            // 「晚到的 resize」会整屏 re-serialize,把用户敲入的第一个命令错位打到 banner 行
-            // (PSReadLine 此时还没就绪,光回显不执行)、并在下方留一个空的新 prompt——中继连
-            // Windows「第一个命令错位」即此。直连无此问题:直连是手机自己开 WS 并在 ws.onopen
-            // 里立即 set_size(PTY 起步即正确列宽,无晚到 resize)。
+          } else if (req.op === 'createTerminal') {
+            // 新建终端:Jupyter 分配的新 name 必空闲 → 创建者即 owner(先到先得天然满足)。
+            // 成功后【不】在此 eager 开 terminado WS。此时 ce 还不知道手机的列宽,一旦开 WS,
+            // terminado 就按默认 80×24 起进程、PowerShell banner 按 80 列打印;等手机
+            // mount→fit→syncSize 的 resize 晚到再 set_size,Windows conpty 对这种「晚到的 resize」
+            // 会整屏 re-serialize,把用户敲入的第一个命令错位打到 banner 行(PSReadLine 此时还没
+            // 就绪,光回显不执行)、并在下方留一个空的新 prompt——中继连 Windows「第一个命令错位」
+            // 即此。直连无此问题:直连是手机自己开 WS 并在 ws.onopen 里立即 set_size(PTY 起步即
+            // 正确列宽,无晚到 resize)。
             // 改懒开以对齐直连:手机首条 resize(useTerminals.attachXterm 的 nextTick fit+syncSize,
-            // 兜底由 tunnel onReady 的 syncSize)到 ce 时,下面 Control-resize 分支自会 ensureTerm
-            // 开 WS,并把 set_size 缓冲到 open 后立即补发——set_size 抵达时机与直连 ws.onopen 的
-            // set_size 完全一致。stdin(TermStdin)分支同样懒开兜底,故此处不预开也安全。
+            // 兜底由 tunnel onReady 的 syncSize)到 ce 时,上面 Control-resize 分支自会 ensureTerm
+            // 开 WS(并 tryAcquire 标 owner),并把 set_size 缓冲到 open 后立即补发——set_size 抵达
+            // 时机与直连 ws.onopen 的 set_size 完全一致。stdin(TermStdin)分支同样懒开兜底,故此处
+            // 不预开也安全。
             // (旧注释担心不预开会「停正在连接、要点输入才蹦出」——那是因为当时手机 mount 后不发
             //  resize;现已由 attachXterm/onReady 可靠发 resize,懒开不再卡。)
+            resp = await handleRpc(jupyter, req)
+            if (
+              resp.ok &&
+              resp.data &&
+              typeof (resp.data as { name?: string }).name === 'string'
+            ) {
+              terminalOwner.set((resp.data as { name: string }).name, srcPhone)
+            }
+          } else {
+            resp = await handleRpc(jupyter, req)
           }
-          // RPCResp 按发起方 phoneId 定向加密(谁问的回谁;srcPhone 来自 frame.sourcePhoneId)
-          if (srcPhone) {
-            encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), {
-              reqId: frame.reqId,
-              targetPhoneId: srcPhone,
-            })
-          }
+          // RPCResp 按发起方 phoneId 定向加密(谁问的回谁;srcPhone 来自 frame.sourcePhoneId,
+          // 上方 !knownKey||!srcPhone 守卫保证非空)
+          encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), {
+            reqId: frame.reqId,
+            targetPhoneId: srcPhone,
+          })
           break
         }
         case FrameType.TermStdin: {
           const name = frame.sid
           if (!name) break
+          // 占用校验:懒开 WS 时按先到先得裁决;别人占用的终端其 stdin 静默丢(不回错,手机靠
+          // listTerminals occupiedBy 灰显避免误操作)
+          const acq = tryAcquire(terminalOwner, name, srcPhone)
+          if (!acq.ok) break
           const tws = ensureTerm(name)
           tws.send(JSON.stringify(['stdin', dec.decode(plaintext)])) // ensureTerm 自缓冲(CONNECTING 时)
           break
