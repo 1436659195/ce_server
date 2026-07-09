@@ -16,6 +16,7 @@ import qrcode from 'qrcode'
 import { hostname, homedir } from 'node:os'
 import { writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
 import { detectServers } from './jupyter-detect'
@@ -38,6 +39,11 @@ function arg(name: string): string | undefined {
 
 const b64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString('base64')
 const unb64 = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, 'base64'))
+
+/** 随机十六进制 id(老 hub 未注入 sourcePhoneId 时,握手生成匿名 phoneId 用)。 */
+function randId(n = 8): string {
+  return randomBytes(n).toString('hex')
+}
 
 const pExecFile = promisify(execFile)
 
@@ -198,7 +204,11 @@ async function main(): Promise<void> {
   const wsBase = baseUrl.replace(/^http/, 'ws')
 
   let ws: WebSocket | null = null
-  let sharedKey: Uint8Array | null = null
+  // 多手机共连:每台手机一条独立 E2E 通道(phoneId → 派生 sharedKey + 显示名)。
+  // 握手按 frame.sourcePhoneId(hub 注入)分通道;加密按 targetPhoneId、解密按 sourcePhoneId 寻路。
+  const phoneKeys = new Map<string, { sharedKey: Uint8Array; name: string }>()
+  // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
+  const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
   let qrPrinted = false
   let reconnectDelay = 2000
@@ -209,10 +219,18 @@ async function main(): Promise<void> {
   function encryptThenSend(
     type: FrameType,
     plaintext: Uint8Array,
-    opts: { sid?: string; reqId?: string }
+    opts: { sid?: string; reqId?: string; targetPhoneId: string }
   ): void {
-    if (!sharedKey) return
-    sendFrame({ type, sid: opts.sid, reqId: opts.reqId, payload: seal(sharedKey, plaintext) })
+    // 多 phone:按 targetPhoneId 取该 phone 的 E2E key 加密;无该 phone(已离开/未配对)→ 不发
+    const sk = phoneKeys.get(opts.targetPhoneId)?.sharedKey
+    if (!sk) return
+    sendFrame({
+      type,
+      sid: opts.sid,
+      reqId: opts.reqId,
+      targetPhoneId: opts.targetPhoneId,
+      payload: seal(sk, plaintext),
+    })
   }
 
   // 按 terminal name 懒开/重连 terminado WS(路径无 /api 前缀);输出加密回传。
@@ -247,7 +265,11 @@ async function main(): Promise<void> {
         if ((etype === 'stdout' || etype === 'stderr') && typeof content === 'string') {
           // stderr 包红码,对齐直连(terminalConnection 把 stderr 渲染红)
           const out = etype === 'stderr' ? `\x1b[1;31m${content}\x1b[0m` : content
-          encryptThenSend(FrameType.TermOutput, enc.encode(out), { sid: name })
+          // 输出只发给 owner(Task 4 的 tryAcquire 在 attach 时标 owner);无 owner → 不发(避免泄露给非占用者)
+          const owner = terminalOwner.get(name)
+          if (owner) {
+            encryptThenSend(FrameType.TermOutput, enc.encode(out), { sid: name, targetPhoneId: owner })
+          }
         }
       } catch {
         /* setup/exit/控制帧忽略 */
@@ -303,17 +325,36 @@ async function main(): Promise<void> {
       try {
         frame = decodeFrame(raw as Uint8Array)
       } catch {
+        // 非 Frame 帧:可能是 hub 的明文控制通知 phoneLeft(hub 生成、非加密帧,缺 payload
+        // 致 decodeFrame 抛错)。识别后清该 phone 的 E2E 通道 + 其占用终端(Task 4 terminalOwner)。
+        try {
+          const notice = JSON.parse(dec.decode(raw as Uint8Array)) as { type?: string; phoneId?: string }
+          if (notice.type === 'phoneLeft' && notice.phoneId) {
+            phoneKeys.delete(notice.phoneId)
+            for (const [tname, owner] of terminalOwner) {
+              if (owner === notice.phoneId) terminalOwner.delete(tname)
+            }
+            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道与终端占用`)
+          }
+        } catch {
+          /* 真正的非法帧 → 忽略 */
+        }
         return
       }
 
+      // 多 phone:按 frame.sourcePhoneId(hub 注入)查该 phone 的 E2E 通道。
+      const srcPhone = frame.sourcePhoneId
+      const knownKey = srcPhone ? phoneKeys.get(srcPhone)?.sharedKey : undefined
+
       // Control 帧:可能是握手 phonePub(明文,手机每次连入/重连都发)或 resize(密文)。
-      // 手机每次重连用新公钥 → 必须每次 phonePub 重新派生 sharedKey,不能只首次
-      // (否则重连后 ce 还用旧 sharedKey,新 phonePub 被当密文丢弃 → createTerminal 无响应)。
+      // 多 phone 下:已配对的 phone 发的 resize 用其 key 解密;未配对/解密失败 → 当握手。
+      // 手机每次重连用新公钥 → 必须每次 phonePub 重新派生 sharedKey 并 set 进 phoneKeys
+      // (按 phoneId 分通道,不覆盖其它 phone —— 这是「多 E2E」与旧单 sharedKey 的核心区别)。
       if (frame.type === FrameType.Control) {
-        if (sharedKey) {
+        if (knownKey) {
           // 先按密文解密(resize 等控制帧是密文)
           try {
-            const decrypted = open(sharedKey, frame.payload)
+            const decrypted = open(knownKey, frame.payload)
             const msg = JSON.parse(dec.decode(decrypted)) as {
               op?: string
               rows?: number
@@ -333,22 +374,36 @@ async function main(): Promise<void> {
             /* 解密失败 → 落到下面当握手 phonePub 处理 */
           }
         }
-        // 当作握手 phonePub(明文 b64)→ (重新)派生 sharedKey
+        // 当作握手 phonePub(明文):{ k: phonePub(b64), n?: name } 或兼容老格式(纯 b64 公钥)
         try {
-          const phonePub = unb64(dec.decode(frame.payload))
-          sharedKey = sharedSecret(cliPriv, phonePub)
-          console.log('[ce] 手机已配对,E2E 通道(重新)建立')
+          const text = dec.decode(frame.payload).trim()
+          let phonePubB64: string
+          let name = ''
+          if (text.startsWith('{')) {
+            const obj = JSON.parse(text) as { k?: string; n?: string }
+            if (!obj.k || typeof obj.k !== 'string') throw new Error('handshake json missing k')
+            phonePubB64 = obj.k
+            name = obj.n ?? ''
+          } else {
+            phonePubB64 = text // 老格式:纯 b64 公钥
+          }
+          const phonePub = unb64(phonePubB64)
+          const sharedKey = sharedSecret(cliPriv, phonePub)
+          const phoneId = srcPhone ?? `anon-${randId(8)}`
+          phoneKeys.set(phoneId, { sharedKey, name })
+          console.log(`[ce] 手机配对 phoneId=${phoneId}${name ? ` name=${name}` : ''},E2E 通道建立`)
         } catch {
           /* 非法帧 */
         }
         return
       }
 
-      // RPCReq / TermStdin:必须已握手 + 密文
-      if (!sharedKey) return
+      // RPCReq / TermStdin:必须已握手 + 密文。按 frame.sourcePhoneId 查该 phone 的 E2E key 解密;
+      // 查不到(未配对 / 老 hub 未注入 sourcePhoneId)→ 丢弃。
+      if (!knownKey) return
       let plaintext: Uint8Array
       try {
-        plaintext = open(sharedKey, frame.payload)
+        plaintext = open(knownKey, frame.payload)
       } catch {
         return // 解密失败(篡改/错 key)→ 丢弃
       }
@@ -414,7 +469,13 @@ async function main(): Promise<void> {
             // (旧注释担心不预开会「停正在连接、要点输入才蹦出」——那是因为当时手机 mount 后不发
             //  resize;现已由 attachXterm/onReady 可靠发 resize,懒开不再卡。)
           }
-          encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), { reqId: frame.reqId })
+          // RPCResp 按发起方 phoneId 定向加密(谁问的回谁;srcPhone 来自 frame.sourcePhoneId)
+          if (srcPhone) {
+            encryptThenSend(FrameType.RPCResp, enc.encode(JSON.stringify(resp)), {
+              reqId: frame.reqId,
+              targetPhoneId: srcPhone,
+            })
+          }
           break
         }
         case FrameType.TermStdin: {
@@ -456,7 +517,8 @@ async function main(): Promise<void> {
     })
     ws.on('close', () => {
       console.log(`[ce] 中继断开,${reconnectDelay}ms 后重连`)
-      sharedKey = null // 重连后手机重新握手派生
+      phoneKeys.clear() // 中继断了:所有 phone 通道失效,重连后手机重新握手派生
+      terminalOwner.clear() // 占用随连接重置(手机重连后重新 attach/tryAcquire)
       setTimeout(connect, reconnectDelay)
       reconnectDelay = Math.min(reconnectDelay * 2, 30000)
     })
