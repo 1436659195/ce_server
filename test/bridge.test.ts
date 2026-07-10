@@ -2,26 +2,36 @@ import { test, expect } from 'bun:test'
 import { handleRpc, toRemoteTerminals, type JupyterClient } from '../src/cli/bridge'
 
 // 用 fake JupyterClient 测 RPC 分派逻辑(不碰真实 Jupyter)。
+// noopClient 给全方法空默认:新增 JupyterClient 方法只在此补一处;各 test 用 spread + override 关注的方法。
+const noopClient: JupyterClient = {
+  async listDir() {
+    return null
+  },
+  async readFile() {
+    return null
+  },
+  async createTerminal() {
+    return { name: 'x' }
+  },
+  async createDir() {},
+  async deleteFile() {},
+  async renameFile() {},
+  async saveFile() {},
+  async readFileRange() {
+    return { data: '', totalSize: 0, bytes: 0, eof: true }
+  },
+  async listTerminals() {
+    return []
+  },
+}
 
 test('listDir 路由到 client.listDir 且透传 path', async () => {
   let got = ''
   const client: JupyterClient = {
+    ...noopClient,
     async listDir(path) {
       got = path
       return { entries: ['a', 'b'] }
-    },
-    async readFile() {
-      return null
-    },
-    async createTerminal() {
-      return { name: 'x' }
-    },
-    async createDir() {},
-    async readFileRange() {
-      return { data: '', totalSize: 0, bytes: 0, eof: true }
-    },
-    async listTerminals() {
-      return []
     },
   }
   const res = await handleRpc(client, { op: 'listDir', path: '/x' })
@@ -32,22 +42,10 @@ test('listDir 路由到 client.listDir 且透传 path', async () => {
 test('createTerminal 路由且透传 cwd', async () => {
   let got = ''
   const client: JupyterClient = {
-    async listDir() {
-      return null
-    },
-    async readFile() {
-      return null
-    },
+    ...noopClient,
     async createTerminal(cwd) {
       got = cwd
       return { name: 'term-7' }
-    },
-    async createDir() {},
-    async readFileRange() {
-      return { data: '', totalSize: 0, bytes: 0, eof: true }
-    },
-    async listTerminals() {
-      return []
     },
   }
   const res = await handleRpc(client, { op: 'createTerminal', cwd: '/proj' })
@@ -58,23 +56,9 @@ test('createTerminal 路由且透传 cwd', async () => {
 test('createDir 路由且透传 path,响应 ok:true(无 data)', async () => {
   let got = ''
   const client: JupyterClient = {
-    async listDir() {
-      return null
-    },
-    async readFile() {
-      return null
-    },
-    async createTerminal() {
-      return { name: 'x' }
-    },
+    ...noopClient,
     async createDir(path) {
       got = path
-    },
-    async readFileRange() {
-      return { data: '', totalSize: 0, bytes: 0, eof: true }
-    },
-    async listTerminals() {
-      return []
     },
   }
   const res = await handleRpc(client, { op: 'createDir', path: '/sub/new' })
@@ -82,47 +66,70 @@ test('createDir 路由且透传 path,响应 ok:true(无 data)', async () => {
   expect(got).toBe('/sub/new')
 })
 
-test('未知 op → ok:false', async () => {
+test('deleteFile 路由且透传 path,响应 ok:true(无 data)', async () => {
+  let got = ''
   const client: JupyterClient = {
-    async listDir() {
-      return null
-    },
-    async readFile() {
-      return null
-    },
-    async createTerminal() {
-      return { name: 'x' }
-    },
-    async createDir() {},
-    async readFileRange() {
-      return { data: '', totalSize: 0, bytes: 0, eof: true }
-    },
-    async listTerminals() {
-      return []
+    ...noopClient,
+    async deleteFile(path) {
+      got = path
     },
   }
-  const res = await handleRpc(client, { op: '删除' })
+  const res = await handleRpc(client, { op: 'deleteFile', path: '/a/b.txt' })
+  expect(res).toEqual({ ok: true })
+  expect(got).toBe('/a/b.txt')
+})
+
+test('renameFile 路由且透传 path/newPath', async () => {
+  let gotOld = ''
+  let gotNew = ''
+  const client: JupyterClient = {
+    ...noopClient,
+    async renameFile(oldPath, newPath) {
+      gotOld = oldPath
+      gotNew = newPath
+    },
+  }
+  const res = await handleRpc(client, { op: 'renameFile', path: '/a/b.txt', newPath: 'a/c.txt' })
+  expect(res).toEqual({ ok: true })
+  expect(gotOld).toBe('/a/b.txt')
+  expect(gotNew).toBe('a/c.txt')
+})
+
+test('saveFile 路由且透传 path/content/format', async () => {
+  let gotPath = ''
+  let gotContent = ''
+  let gotFormat = ''
+  const client: JupyterClient = {
+    ...noopClient,
+    async saveFile(path, content, format) {
+      gotPath = path
+      gotContent = content
+      gotFormat = format
+    },
+  }
+  const res = await handleRpc(client, {
+    op: 'saveFile',
+    path: '/a/c.txt',
+    content: '你好',
+    format: 'text',
+  })
+  expect(res).toEqual({ ok: true })
+  expect(gotPath).toBe('/a/c.txt')
+  expect(gotContent).toBe('你好')
+  expect(gotFormat).toBe('text')
+})
+
+test('未知 op → ok:false', async () => {
+  const res = await handleRpc(noopClient, { op: '删除' })
   expect(res.ok).toBe(false)
   expect(res.error).toContain('未知')
 })
 
 test('client 抛错 → ok:false + 错误信息(不向上抛)', async () => {
   const client: JupyterClient = {
+    ...noopClient,
     async listDir() {
       throw new Error('token 无效')
-    },
-    async readFile() {
-      return null
-    },
-    async createTerminal() {
-      return { name: 'x' }
-    },
-    async createDir() {},
-    async readFileRange() {
-      return { data: '', totalSize: 0, bytes: 0, eof: true }
-    },
-    async listTerminals() {
-      return []
     },
   }
   const res = await handleRpc(client, { op: 'listDir', path: '/' })
@@ -134,24 +141,12 @@ test('readFileRange 路由且透传 path/offset/length', async () => {
     gotOffset = -1,
     gotLength = -1
   const client: JupyterClient = {
-    async listDir() {
-      return null
-    },
-    async readFile() {
-      return null
-    },
-    async createTerminal() {
-      return { name: 'x' }
-    },
-    async createDir() {},
+    ...noopClient,
     async readFileRange(path, offset, length) {
       gotPath = path
       gotOffset = offset
       gotLength = length
       return { data: 'QUJD', totalSize: 100, bytes: 3, eof: false }
-    },
-    async listTerminals() {
-      return []
     },
   }
   const res = await handleRpc(client, {

@@ -11,6 +11,9 @@ export interface JupyterClient {
   listDir(path: string): Promise<unknown> // GET /api/contents/{path}(目录)
   readFile(path: string): Promise<unknown> // GET /api/contents/{path}(文件)
   createDir(path: string): Promise<void> // PUT /api/contents/{path} {type:directory}
+  deleteFile(path: string): Promise<void> // DELETE /api/contents/{path}
+  renameFile(oldPath: string, newPath: string): Promise<void> // PATCH /api/contents/{old} {path:relNew}(body 不 encode)
+  saveFile(path: string, content: string, format: 'text' | 'base64'): Promise<void> // PUT /api/contents/{path} {type:file,format,content}
   readFileRange(
     path: string,
     offset: number,
@@ -26,11 +29,14 @@ export interface JupyterClient {
 
 /** 手机发来的 RPC 请求(明文 JSON,解密后)。op 为 string 以兜住未知操作。 */
 export interface RpcRequest {
-  op: string // 'listDir' | 'readFile' | 'readFileRange' | 'createTerminal'(或未知)
+  op: string // 'listDir'|'readFile'|'readFileRange'|'createTerminal'|'createDir'|'deleteFile'|'renameFile'|'saveFile'(或未知)
   path?: string
   cwd?: string
   offset?: number
   length?: number
+  newPath?: string // renameFile:去前导/的新路径(PATCH body.path,JSON 值不 encode)
+  content?: string // saveFile:文本(text)或 base64(base64)
+  format?: 'text' | 'base64' // saveFile
 }
 
 /** ce 回的 RPC 响应(明文 JSON,加密前)。 */
@@ -81,6 +87,15 @@ export async function handleRpc(client: JupyterClient, req: RpcRequest): Promise
         return { ok: true, data: await client.createTerminal(req.cwd ?? '/') }
       case 'createDir':
         await client.createDir(req.path ?? '/')
+        return { ok: true }
+      case 'deleteFile':
+        await client.deleteFile(req.path ?? '/')
+        return { ok: true }
+      case 'renameFile':
+        await client.renameFile(req.path ?? '/', req.newPath ?? '/')
+        return { ok: true }
+      case 'saveFile':
+        await client.saveFile(req.path ?? '/', req.content ?? '', req.format ?? 'text')
         return { ok: true }
       case 'readFileRange':
         return {
@@ -147,6 +162,32 @@ export function makeJupyterClient(baseUrl: string, token: string): JupyterClient
         body: JSON.stringify({ type: 'directory' }),
       })
       if (!res.ok) throw new Error(`创建文件夹失败:${res.status} ${res.statusText}`)
+    },
+    async deleteFile(path) {
+      const res = await fetchTimeout(`${baseUrl}/api/contents/${encodePath(path)}`, {
+        method: 'DELETE',
+        headers,
+      })
+      if (!res.ok) throw new Error(`删除失败:${res.status} ${res.statusText}`)
+    },
+    async renameFile(oldPath, newPath) {
+      // PATCH body.path 是相对 root_dir 的逻辑路径(去前导/),JSON 值不 URL-encode(区别于 URL 段的 encodePath)
+      const rel = newPath.replace(/^\/+/, '')
+      const res = await fetchTimeout(`${baseUrl}/api/contents/${encodePath(oldPath)}`, {
+        method: 'PATCH',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: rel }),
+      })
+      if (!res.ok) throw new Error(`重命名失败:${res.status} ${res.statusText}`)
+    },
+    async saveFile(path, content, format) {
+      // PUT 整文件覆盖(无分段语义):新建空文件/编辑保存/上传(base64)共用
+      const res = await fetchTimeout(`${baseUrl}/api/contents/${encodePath(path)}`, {
+        method: 'PUT',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'file', format, content }),
+      })
+      if (!res.ok) throw new Error(`保存失败:${res.status} ${res.statusText}`)
     },
     async readFileRange(path, offset, length) {
       // Range 拉段;Jupyter(/files/ 走 Tornado 静态)通常返 206+Content-Range。

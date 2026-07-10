@@ -40,7 +40,13 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 
 ## 5. RPC 操作契约(手机 ↔ ce,密文帧内)
 
-手机发 `RPCReq { op, ... }`,ce 回 `RPCResp { ok, data?, error? }`。除 `listTerminals`/`deleteTerminal` 为特例外,其余 `op`(`listDir`/`readFile`/`createDir`/`readFileRange`/`createTerminal`)由 `bridge.ts` 的 `handleRpc` 分派到本地 Jupyter REST。
+手机发 `RPCReq { op, ... }`,ce 回 `RPCResp { ok, data?, error? }`。除 `listTerminals`/`deleteTerminal`/`detachTerminal` 为特例外,其余 `op`(`listDir`/`readFile`/`createDir`/`readFileRange`/`createTerminal`/`deleteFile`/`renameFile`/`saveFile`)由 `bridge.ts` 的 `handleRpc` 分派到本地 Jupyter REST。
+
+文件写操作(直连与中继对称,见 `useFiles.ts` ↔ `bridge.ts`):
+
+- **`deleteFile`**(`{ path }`):`DELETE /api/contents/{path}`(目录递归删)。
+- **`renameFile`**(`{ path, newPath }`):`PATCH /api/contents/{path}` body `{path: newPath}`。`newPath` 是去前导 `/` 的逻辑路径(JSON 值,**不** URL-encode;URL 段才走 `encodePath`)。仅同目录改名。
+- **`saveFile`**(`{ path, content, format }`):`PUT /api/contents/{path}` body `{type:'file', format:'text'|'base64', content}`。整文件覆盖(无分段语义):新建空文件(`content:''`)/ 编辑保存(text)/ 上传(base64)共用。
 
 - **`listTerminals`**(特例,`main.ts` 处理 —— 需访问 ce 的 `terms` map 算 `managed`):返回 `{ ok: true, data: { terminals: RemoteTerminalInfo[] } }`,其中
   - `RemoteTerminalInfo = { name: string; lastActivityAt: number | null; managed: boolean; occupiedBy: string | null }`
