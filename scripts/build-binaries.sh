@@ -15,5 +15,10 @@ for target in bun-linux-x64 bun-linux-arm64 bun-darwin-x64 bun-darwin-arm64 bun-
   bun build "$ENTRY" --compile --target="$target" --outfile="dist/$name"
 done
 
+# 聚合 sha256 清单(install.sh/ps1 据此判更新,比 size 可靠:同 size 不同内容也检出)。
+# sha256sum 标准格式 "<hash>  <filename>";install 用 awk/正则按平台名取对应 hash。
+( cd dist && sha256sum ce-linux-x64 ce-linux-arm64 ce-darwin-x64 ce-darwin-arm64 ce-windows-x64.exe ) > dist/sha256.txt
+echo "[build] sha256 清单 → dist/sha256.txt"
+
 echo "[build] 完成:"
 ls -lh dist/

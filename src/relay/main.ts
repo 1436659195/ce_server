@@ -30,6 +30,7 @@ const { server, close } = createRelayServer(hub, {
   ceLinuxArm64Path: join(here, '..', '..', 'dist', 'ce-linux-arm64'),
   ceDarwinX64Path: join(here, '..', '..', 'dist', 'ce-darwin-x64'),
   ceDarwinArm64Path: join(here, '..', '..', 'dist', 'ce-darwin-arm64'),
+  sha256Path: join(here, '..', '..', 'dist', 'sha256.txt'),
   installShPath: join(here, '..', '..', 'scripts', 'install.sh'),
   lanPyPath: join(here, '..', '..', 'scripts', 'lan.py'),
 })

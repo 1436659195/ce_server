@@ -106,3 +106,25 @@ test('中继静态路由：/dl/ce-linux-arm64 返回二进制', async () => {
     rmSync(linuxArm64Path, { force: true })
   }
 })
+
+test('中继静态路由：/dl/sha256.txt 返回哈希清单(install 据此判更新)', async () => {
+  const hub = new Hub()
+  const shaPath = join(tmpdir(), `sha256-test-${process.pid}.txt`)
+  await Bun.write(shaPath, 'abc123  ce-linux-x64\ndef456  ce-windows-x64.exe\n')
+
+  const { server, close } = createRelayServer(hub, { sha256Path: shaPath })
+
+  const port = await listenPort(server)
+  try {
+    const resp = await fetch(`http://localhost:${port}/dl/sha256.txt`)
+    const body = await resp.text()
+
+    expect(resp.ok).toBe(true)
+    expect(body).toContain('ce-linux-x64')
+    expect(body).toContain('ce-windows-x64.exe')
+    expect(resp.headers.get('content-type')).toBe('text/plain; charset=utf-8')
+  } finally {
+    await close()
+    rmSync(shaPath, { force: true })
+  }
+})

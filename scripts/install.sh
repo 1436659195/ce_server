@@ -10,7 +10,7 @@
 #
 # 防呆(对齐 install.ps1):
 #   A. ce 已在跑 → 复用其连接码,不起新进程(唯一 ce,免端口冲突/重复配对)
-#   B. ce 已装且与中继同 size → 跳过下载(免每次重下 91MB)
+#   B. ce 已装且与中继同 sha256 → 跳过下载(免每次重下 91MB;hash 比 size 可靠)
 set -e
 
 RELAY='__RELAY_URL__'
@@ -82,17 +82,19 @@ else
 fi
 TARGET="${TARGET_DIR}/${BINARY_NAME}"
 
-# 防呆 B:ce 已装且与中继同 size → 跳过下载(免每次重下 91MB)
-# HEAD 拿 Content-Length;拿不到(中继旧版/网络)→ 当作需下载,安全 fallback
+# 防呆 B:ce 已装且与中继同 sha256 → 跳过下载(免每次重下 91MB)。
+# hash 比 size 可靠:同 size 不同内容也能检出(根治 size 巧合相同的漏更新)。
+# 下 /dl/sha256.txt 取对应平台 hash;拿不到(中继旧版/网络)→ 当作需下载,安全 fallback。
 SKIP_DOWNLOAD=0
 if [ -x "$TARGET" ]; then
-  REMOTE_SIZE=$(curl -sI "$URL" 2>/dev/null | awk 'tolower($1)=="content-length:"{gsub(/\r/,"",$2);print $2;exit}')
-  LOCAL_SIZE=$(stat -c%s "$TARGET" 2>/dev/null || stat -f%z "$TARGET" 2>/dev/null || echo 0)
-  if [ -n "$REMOTE_SIZE" ] && [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ]; then
-    echo "[install] ce 已是最新($TARGET,$LOCAL_SIZE 字节),跳过下载"
+  REMOTE_HASH=$(curl -fsSL "$DOWNLOAD_BASE/dl/sha256.txt" 2>/dev/null | awk -v p="ce-$PLATFORM" '$2==p{print $1;exit}')
+  LOCAL_HASH=$(sha256sum "$TARGET" 2>/dev/null | awk '{print $1}')
+  [ -z "$LOCAL_HASH" ] && LOCAL_HASH=$(shasum -a 256 "$TARGET" 2>/dev/null | awk '{print $1}')  # macOS 无 sha256sum
+  if [ -n "$REMOTE_HASH" ] && [ -n "$LOCAL_HASH" ] && [ "$REMOTE_HASH" = "$LOCAL_HASH" ]; then
+    echo "[install] ce 已是最新($LOCAL_HASH),跳过下载"
     SKIP_DOWNLOAD=1
   else
-    echo "[install] ce 有更新(本地 $LOCAL_SIZE / 远程 ${REMOTE_SIZE:-未知}),重新下载"
+    echo "[install] ce 有更新(本地 ${LOCAL_HASH:-未知} / 远程 ${REMOTE_HASH:-未知}),重新下载"
   fi
 fi
 

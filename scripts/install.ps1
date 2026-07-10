@@ -43,20 +43,26 @@ if ($needPython) {
   }
 }
 
-# ② ce.exe(已有且与中继大小一致才跳过,否则下载/升级;防呆不重下、也不漏更新)
+# ② ce.exe(已有且与中继 sha256 一致才跳过,否则下载/升级;hash 比 size 可靠:同 size 不同内容也检出)
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\ce'
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 $exe = Join-Path $installDir 'ce.exe'
 $dlBase = $relay -replace '^ws','http'
 $dlUrl = "$dlBase/dl/ce-windows-x64.exe"
+$shaUrl = "$dlBase/dl/sha256.txt"
 if (Test-Path $exe) {
-  $remote = $null
-  try { $remote = (Invoke-WebRequest $dlUrl -Method Head -UseBasicParsing).Headers.'Content-Length' } catch {}
-  $local = (Get-Item $exe).Length
-  if ($remote -and [string]$remote -eq [string]$local) {
-    Write-Host "[install] ce.exe 已是最新,跳过下载"
+  $remoteHash = $null
+  try {
+    # 解析 sha256.txt 取 ce-windows-x64.exe 的 hash(sha256sum 格式 "<hash>  <name>")
+    $shaList = (Invoke-WebRequest $shaUrl -UseBasicParsing).Content
+    $line = ($shaList -split "`n" | Where-Object { $_ -match 'ce-windows-x64\.exe\s*$' } | Select-Object -First 1)
+    if ($line) { $remoteHash = ($line -split '\s+')[0].ToLower() }
+  } catch {}
+  $localHash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+  if ($remoteHash -and $remoteHash -eq $localHash) {
+    Write-Host "[install] ce.exe 已是最新($localHash),跳过下载"
   } else {
-    Write-Host "[install] ce.exe 有更新,重新下载"
+    Write-Host "[install] ce.exe 有更新(本地 $localHash / 远程 $remoteHash),重新下载"
     Invoke-WebRequest -Uri $dlUrl -OutFile $exe
   }
 } else {

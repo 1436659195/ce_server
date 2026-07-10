@@ -31,6 +31,7 @@ export function createRelayServer(
     ceLinuxArm64Path?: string
     ceDarwinX64Path?: string
     ceDarwinArm64Path?: string
+    sha256Path?: string
     installShPath?: string
     lanPyPath?: string
   }
@@ -159,6 +160,19 @@ export function createRelayServer(
       } catch {
         res.writeHead(404)
         res.end('ce-darwin-arm64 不可读')
+      }
+      return
+    }
+    if (path === '/dl/sha256.txt' && opts?.sha256Path) {
+      // 聚合 sha256 清单(install.sh/ps1 据此判更新,比 size 比对可靠:同 size 不同内容也检出)
+      try {
+        const body = readFileSync(opts.sha256Path, 'utf8')
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
+      } catch {
+        res.writeHead(404)
+        res.end('sha256.txt 不可读')
       }
       return
     }
