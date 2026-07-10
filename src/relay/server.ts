@@ -82,6 +82,11 @@ export function createRelayServer(
         const buf = readFileSync(opts.ceExePath)
         res.setHeader('Content-Type', 'application/octet-stream')
         res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
         res.end(buf)
       } catch {
         res.writeHead(404)
@@ -94,6 +99,11 @@ export function createRelayServer(
         const buf = readFileSync(opts.ceLinuxX64Path)
         res.setHeader('Content-Type', 'application/octet-stream')
         res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
         res.end(buf)
       } catch {
         res.writeHead(404)
@@ -106,6 +116,11 @@ export function createRelayServer(
         const buf = readFileSync(opts.ceLinuxArm64Path)
         res.setHeader('Content-Type', 'application/octet-stream')
         res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
         res.end(buf)
       } catch {
         res.writeHead(404)
@@ -118,6 +133,11 @@ export function createRelayServer(
         const buf = readFileSync(opts.ceDarwinX64Path)
         res.setHeader('Content-Type', 'application/octet-stream')
         res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
         res.end(buf)
       } catch {
         res.writeHead(404)
@@ -130,6 +150,11 @@ export function createRelayServer(
         const buf = readFileSync(opts.ceDarwinArm64Path)
         res.setHeader('Content-Type', 'application/octet-stream')
         res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
         res.end(buf)
       } catch {
         res.writeHead(404)
