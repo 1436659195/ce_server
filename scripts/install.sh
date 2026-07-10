@@ -7,6 +7,10 @@
 #   ① 探测平台 → 下对应二进制 → 装(本脚本)
 #   ② ce 首跑时自探 jupyter server list(在 ce 里,不在此)
 #   ③ 缺 Jupyter 则引导(在 ce 里)
+#
+# 防呆(对齐 install.ps1):
+#   A. ce 已在跑 → 复用其连接码,不起新进程(唯一 ce,免端口冲突/重复配对)
+#   B. ce 已装且与中继同 size → 跳过下载(免每次重下 91MB)
 set -e
 
 RELAY='__RELAY_URL__'
@@ -27,8 +31,7 @@ detect_platform() {
     x86_64|amd64) arch=x64 ;;
     aarch64|arm64) arch=arm64 ;;
     *)
-      echo "[install] 不支持的架构: $arch_raw" >&2
-      return 1
+      echo "[install] 不支持的架构: $arch_raw" >&2; return 1
       ;;
   esac
   echo "${os}-${arch}"
@@ -53,17 +56,22 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
-
-# -fSL(去 -s 静默)+ --progress-bar:91MB 二进制下载显示进度条,免得像卡住
-if ! curl -fSL --progress-bar "$URL" -o "$TMP"; then
-  echo "[install] 下载失败: $URL" >&2
-  exit 1
+# 防呆 A:ce 已在跑 → 复用其连接码,不起新进程(唯一 ce)
+RUNNING=$(pgrep -x "$BINARY_NAME" 2>/dev/null | head -1 || true)
+if [ -n "$RUNNING" ]; then
+  echo "[install] ce 已在运行(PID $RUNNING),不重复启动" >&2
+  CODE="$HOME/.ce/connection-code.json"
+  if [ -f "$CODE" ]; then
+    echo "[install] 原 ce 的连接码(手机粘码用):"
+    cat "$CODE"
+    echo "[install] 二维码请到原 ce 窗口查看(它还在跑)" >&2
+  else
+    echo "[install] 未找到连接码文件,请到原 ce 窗口扫码" >&2
+  fi
+  exit 0
 fi
-chmod +x "$TMP"
 
-# 安装:优先 INSTALL_DIR 可写,否则回退 ~/.local/bin
+# 安装目录:优先 INSTALL_DIR 可写,否则回退 ~/.local/bin
 TARGET_DIR=""
 if mkdir -p "$INSTALL_DIR" 2>/dev/null && [ -w "$INSTALL_DIR" ]; then
   TARGET_DIR="$INSTALL_DIR"
@@ -73,11 +81,36 @@ else
   mkdir -p "$TARGET_DIR"
 fi
 TARGET="${TARGET_DIR}/${BINARY_NAME}"
-cp "$TMP" "$TARGET"
-chmod +x "$TARGET"
-# macOS:curl 下载的文件带 com.apple.quarantine,未签名二进制首跑会被 Gatekeeper 拦(killed) → 去掉。
-if [ "$(uname -s)" = "Darwin" ]; then
-  xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+
+# 防呆 B:ce 已装且与中继同 size → 跳过下载(免每次重下 91MB)
+# HEAD 拿 Content-Length;拿不到(中继旧版/网络)→ 当作需下载,安全 fallback
+SKIP_DOWNLOAD=0
+if [ -x "$TARGET" ]; then
+  REMOTE_SIZE=$(curl -sI "$URL" 2>/dev/null | awk 'tolower($1)=="content-length:"{gsub(/\r/,"",$2);print $2;exit}')
+  LOCAL_SIZE=$(stat -c%s "$TARGET" 2>/dev/null || stat -f%z "$TARGET" 2>/dev/null || echo 0)
+  if [ -n "$REMOTE_SIZE" ] && [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ]; then
+    echo "[install] ce 已是最新($TARGET,$LOCAL_SIZE 字节),跳过下载"
+    SKIP_DOWNLOAD=1
+  else
+    echo "[install] ce 有更新(本地 $LOCAL_SIZE / 远程 ${REMOTE_SIZE:-未知}),重新下载"
+  fi
+fi
+
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+if [ "$SKIP_DOWNLOAD" = 0 ]; then
+  # -fSL(去 -s 静默)+ --progress-bar:91MB 二进制下载显示进度条,免得像卡住
+  if ! curl -fSL --progress-bar "$URL" -o "$TMP"; then
+    echo "[install] 下载失败: $URL" >&2
+    exit 1
+  fi
+  chmod +x "$TMP"
+  cp "$TMP" "$TARGET"
+  chmod +x "$TARGET"
+  # macOS:curl 下载的文件带 com.apple.quarantine,未签名二进制首跑会被 Gatekeeper 拦(killed) → 去掉。
+  if [ "$(uname -s)" = "Darwin" ]; then
+    xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+  fi
 fi
 
 # 写 ~/.ce/config.json (relay)
