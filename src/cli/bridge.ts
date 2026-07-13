@@ -37,6 +37,8 @@ export interface RpcRequest {
   newPath?: string // renameFile:去前导/的新路径(PATCH body.path,JSON 值不 encode)
   content?: string // saveFile:文本(text)或 base64(base64)
   format?: 'text' | 'base64' // saveFile
+  skill?: string // butlerStart:管家 skill 文本(ce 据此 spawn cc 的 --append-system-prompt)
+  sid?: string // butlerStart/butlerStop:管家 sid(butlerStop 指定杀哪个 cc)
 }
 
 /** ce 回的 RPC 响应(明文 JSON,加密前)。 */

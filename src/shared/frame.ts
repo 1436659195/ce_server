@@ -17,6 +17,8 @@ export enum FrameType {
   RPCReq, // 手机→ce:RPC 请求(列目录/建终端/读文件)
   RPCResp, // ce→手机:RPC 响应
   Control, // 控制帧(配对确认、resize、ping)
+  ButlerStdin, // 手机→ce:管家 cc 的 stdin(stream-json user 帧字节)
+  ButlerOutput, // ce→手机:管家 cc 的 stdout/stderr 字节
 }
 
 export interface Frame {

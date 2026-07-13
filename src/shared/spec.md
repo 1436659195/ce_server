@@ -60,3 +60,27 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 除手机→ce 的握手(明文 phonePub)/resize(密文)外,ce→手机 也用 `FrameType.Control` 发密文控制通知:
 
 - **`attachDenied`**(`{ op:'attachDenied', name, occupiedBy }`):race 反馈。两手机近乎同时接管同一空闲终端,ce `tryAcquire` 按先到先得裁决,落败方(loser)此前已在本地建会话(接管面板点的)→ ce 给 loser 发此通知(用 loser 的 sharedKey 加密 + `targetPhoneId=loser` 路由)。loser 收到后**本地回滚该 session(软移除,`localOnly=true`:不再对 ce 发 `detachTerminal`,否则会误杀 winner 刚抢到的终端/占用)** + 弹 toast(`「name」刚被 occupiedBy 占用了`)。`occupiedBy` = winner 的显示名。
+
+## 7. AI 管家(ce 托管,B 方案)
+
+管家 cc 跑在 **ce 里**(被控机),由 ce 以**全 pipe** stdio spawn(`claude -p --input-format stream-json --output-format stream-json --verbose --allowedTools Read Grep Glob --add-dir / --append-system-prompt <skill>`)→ 等同 stream-json 长驻所需环境(无 PTY/TTY)。手机经新隧道帧与 ce 上的 cc 收发,**管家是中继专属**(直连无 ce,无管家)。
+
+- **skill 由手机在 `butlerStart` RPC 里传**(`req.skill`),ce 不另存 skill 文本(避免两边复制)。
+- cc 的 **stdout+stderr** 都回传(诊断:未装 claude 的报错在 stderr)。
+
+### 7.1 RPC(复用 RPCReq/Resp)
+
+- **`butlerStart`**(`{ op:'butlerStart', skill }`):ce spawn cc、登记 `owner=srcPhoneId`、回 `{ ok:true, data:{ sid } }`(`sid` 形如 `butler-<hex>`)。
+- **`butlerStop`**(`{ op:'butlerStop', sid }`):ce kill 该 cc、清 map、回 `{ ok:true }`。
+
+### 7.2 流帧(新增 FrameType)
+
+- **`ButlerStdin`**(手机→ce,`sid`=butlerSid,payload 密文 = stream-json user 帧字节):ce 解密后 `writeStdin` 到 cc.stdin。
+- **`ButlerOutput`**(ce→手机,`sid`=butlerSid,`targetPhoneId`=owner,payload 密文 = cc.stdout/stderr 原始字节):手机喂 stream-json 解析器。
+- cc 进程退出时,ce 发一条 `ButlerOutput`,payload = `{"type":"system","subtype":"butler_exit","code":N}`(哨兵);手机见之转 `dead` + 提示。
+
+### 7.3 生命周期
+
+- **phoneLeft**:ce `stopAllForPhone(phoneId)`(该手机管家 cc 全 kill)。
+- **中继断**:ce `stopAll()`(手机全失联,cc 全清);手机重连后重新 `butlerStart`(cc 新进程,旧对话不保留——MVP 可接受)。
+- **多手机**:管家 `owner`=发起 `butlerStart` 的 phoneId;`ButlerOutput` 只定向该 phone(同终端占用语义)。

@@ -22,6 +22,7 @@ import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame
 import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
+import { ButlerManager } from './butler'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
 import { spawn, execFile } from 'node:child_process'
@@ -211,6 +212,17 @@ async function main(): Promise<void> {
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
+  // AI 管家:每台手机一个 cc(stream-json,全 pipe 由 ce spawn),ce 桥接 ButlerStdin/ButlerOutput。
+  // onOutput:cc 的 stdout/stderr 字节 → 加密回传 owner 手机;onExit:cc 退了发 butler_exit 哨兵让手机转 dead。
+  const butlers = new ButlerManager(
+    (sid, owner, chunk) => encryptThenSend(FrameType.ButlerOutput, chunk, { sid, targetPhoneId: owner }),
+    (sid, owner, code) =>
+      encryptThenSend(
+        FrameType.ButlerOutput,
+        enc.encode(JSON.stringify({ type: 'system', subtype: 'butler_exit', code })),
+        { sid, targetPhoneId: owner }
+      )
+  )
   let qrPrinted = false
   let reconnectDelay = 2000
 
@@ -358,7 +370,8 @@ async function main(): Promise<void> {
             for (const [tname, owner] of terminalOwner) {
               if (owner === notice.phoneId) terminalOwner.delete(tname)
             }
-            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道与终端占用`)
+            butlers.stopAllForPhone(notice.phoneId) // 该手机的管家 cc 也清
+            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道、终端占用与管家`)
           }
         } catch {
           /* 真正的非法帧 → 忽略 */
@@ -517,6 +530,14 @@ async function main(): Promise<void> {
             ) {
               terminalOwner.set((resp.data as { name: string }).name, srcPhone)
             }
+          } else if (req.op === 'butlerStart') {
+            // AI 管家:ce spawn cc(stream-json 全 pipe),回 butlerSid;手机据此收发 ButlerStdin/ButlerOutput。
+            // skill 由手机传(避免 ce 复制一份 skill 文本)。
+            const bSid = butlers.start(req.skill ?? '', srcPhone)
+            resp = { ok: true, data: { sid: bSid } }
+          } else if (req.op === 'butlerStop' && req.sid) {
+            butlers.stop(req.sid)
+            resp = { ok: true }
           } else {
             resp = await handleRpc(jupyter, req)
           }
@@ -540,6 +561,11 @@ async function main(): Promise<void> {
           }
           const tws = ensureTerm(name)
           tws.send(JSON.stringify(['stdin', dec.decode(plaintext)])) // ensureTerm 自缓冲(CONNECTING 时)
+          break
+        }
+        case FrameType.ButlerStdin: {
+          // 管家 cc 的 stdin(手机 ButlerStdin 帧的密文 = stream-json user 帧字节)→ 写 cc.stdin
+          if (frame.sid) butlers.writeStdin(frame.sid, plaintext)
           break
         }
         default:
@@ -576,6 +602,7 @@ async function main(): Promise<void> {
       console.log(`[ce] 中继断开,${reconnectDelay}ms 后重连`)
       phoneKeys.clear() // 中继断了:所有 phone 通道失效,重连后手机重新握手派生
       terminalOwner.clear() // 占用随连接重置(手机重连后重新 attach/tryAcquire)
+      butlers.stopAll() // 手机全失联,ce 上管家 cc 无意义 → 全清(手机重连后重新 butlerStart)
       setTimeout(connect, reconnectDelay)
       reconnectDelay = Math.min(reconnectDelay * 2, 30000)
     })
