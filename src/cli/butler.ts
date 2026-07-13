@@ -5,16 +5,22 @@
  * (无 PTY)——等同 stream-json 长驻所需的环境(spike 证:pipe stdin 下 cc 多轮长驻)。
  * 手机经 ButlerStdin/ButlerOutput 帧与 cc 收发,ce 只做字节桥接 + 进程生命周期。
  *
- * 不经 shell:cc args(含 skill)直传 spawn → 无引号/base64 问题(终端方案走 shell 才需 base64)。
+ * spawn 经 `sh -c 'exec claude …'`:Bun 的 posix_spawn 直接 exec claude 会 ENOEXEC(Bun exec 不了
+ * npm 装的 claude 包装脚本,但 sh 能),故走 shell exec。skill 写临时文件、用 --append-system-prompt-file
+ * (避免经 shell 时 skill 的换行/引号破坏命令行)。
+ *
+ * spawn 的 'error'(ENOENT/ENOEXEC/…)一律兜为 finish(-2):ce **绝不因 cc 起不来而崩**(否则手机断连)。
  *
  * 可单测:spawnCc 注入假 cc(读 stdin、回 JSON),验证 writeStdin→onOutput→stop 闭环。
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { writeFileSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-/** cc 启动参数(不含 bin 本身;skill 直传 arg)。不带 prompt 参数(cc 从 stdin 读 stream-json 长驻);
- *  不带 --bare(用 OAuth,--bare 强制 API-key 拒 OAuth)。 */
-export function ccArgs(skill: string): string[] {
+/** cc 启动参数(不含 bin;skill 走文件 --append-system-prompt-file,不经命令行 → 无引号问题)。 */
+export function ccArgs(skillFile: string): string[] {
   return [
     '-p',
     '--input-format', 'stream-json',
@@ -22,7 +28,7 @@ export function ccArgs(skill: string): string[] {
     '--verbose',
     '--allowedTools', 'Read', 'Grep', 'Glob',
     '--add-dir', '/',
-    '--append-system-prompt', skill,
+    '--append-system-prompt-file', skillFile,
   ]
 }
 
@@ -30,32 +36,34 @@ export interface ButlerProc {
   sid: string
   owner: string // 占用手机 phoneId(ButlerOutput 只定向回它)
   proc: ChildProcess
+  skillFile: string // 临时 skill 文件(进程结束时删)
 }
 
 /**
  * ce 端管家进程表 + 桥接。
- * - start(skill, owner):spawn cc(全 pipe),stdout/stderr → onOutput,exit → onExit;返回 butlerSid。
+ * - start(skill, owner):写 skill 临时文件 + spawn cc(全 pipe),stdout/stderr → onOutput,exit/error → onExit;返回 butlerSid。
  * - writeStdin(sid, bytes):写 cc.stdin(手机 ButlerStdin)。
- * - stop(sid) / stopAllForPhone(phoneId):kill cc(phoneLeft/中继断/手机 butlerStop)。
+ * - stop(sid) / stopAllForPhone(phoneId) / stopAll():kill cc + 删 skill 文件。
  */
 export class ButlerManager {
   private procs = new Map<string, ButlerProc>()
 
   constructor(
-    /** cc stdout/stderr 有字节 → 回调(main.ts 据此加密发 ButlerOutput 给 owner 手机)。 */
     private readonly onOutput: (sid: string, owner: string, chunk: Uint8Array) => void,
-    /** cc 进程退出 → 回调(main.ts 发 butler_exit 通知 owner 手机)。 */
     private readonly onExit: (sid: string, owner: string, code: number | null) => void,
-    /** 注入点:生产 spawn claude;测试 spawn 假 cc。默认全 pipe stdio。 */
+    /** 注入点:默认 `sh -c 'exec claude …'`(Bun 直接 exec claude 会 ENOEXEC,经 shell 才行);
+     *  测试 spawn 假 cc。全 pipe stdio。 */
     private readonly spawnCc: (args: string[]) => ChildProcess = (args) =>
-      spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'] })
+      spawn('sh', ['-c', `exec claude ${args.join(' ')}`], { stdio: ['pipe', 'pipe', 'pipe'] })
   ) {}
 
   /** spawn 一个 cc,登记并返回 butlerSid。 */
   start(skill: string, owner: string): string {
     const sid = `butler-${randomBytes(4).toString('hex')}`
-    const proc = this.spawnCc(ccArgs(skill))
-    let settled = false // 退出/错误只通知一次(ENOENT 后不会再 exit,正常 exit 也不会再 error)
+    const skillFile = join(tmpdir(), `ce-butler-skill-${sid}.txt`)
+    writeFileSync(skillFile, skill, 'utf8')
+    const proc = this.spawnCc(ccArgs(skillFile))
+    let settled = false // 退出/错误只通知一次
     const feed = (buf: Buffer): void => {
       if (buf.length) this.onOutput(sid, owner, new Uint8Array(buf))
     }
@@ -63,17 +71,19 @@ export class ButlerManager {
       if (settled) return
       settled = true
       this.procs.delete(sid)
+      try { unlinkSync(skillFile) } catch { /* 已删 */ }
       this.onExit(sid, owner, code)
     }
     // stdout + stderr 都回传:cc 的 stream-json 在 stdout,启动报错在 stderr。
     proc.stdout?.on('data', feed)
     proc.stderr?.on('data', feed)
-    // spawn 失败(ENOENT = claude 未装)→ finish(-2) 特殊码,main.ts 据此发 butler_nocc 哨兵(可靠,不靠正则猜)。
+    // 任何 spawn 错(ENOENT=路径无/ENOEXEC=Bun exec 不了包装脚本/…)→ finish(-2),ce 不崩。
     proc.on('error', (e) => {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') finish(-2)
+      console.warn('[ce:butler] spawn cc 失败(不崩 ce):', (e as Error).message)
+      finish(-2)
     })
     proc.on('exit', (code) => finish(code))
-    this.procs.set(sid, { sid, owner, proc })
+    this.procs.set(sid, { sid, owner, proc, skillFile })
     return sid
   }
 
@@ -87,27 +97,24 @@ export class ButlerManager {
   stop(sid: string): void {
     const p = this.procs.get(sid)
     if (!p) return
-    this.procs.delete(sid) // 先删:onExit 回调再触发时已是 no-op
-    try {
-      p.proc.kill()
-    } catch {
-      /* 已退 */
-    }
+    this.procs.delete(sid)
+    try { unlinkSync(p.skillFile) } catch { /* 已删 */ }
+    try { p.proc.kill() } catch { /* 已退 */ }
   }
 
-  /** kill 某手机的所有 cc(phoneLeft / 中继断:该 phone 的管家都失效)。 */
+  /** kill 某手机的所有 cc(phoneLeft / 中继断)。 */
   stopAllForPhone(phoneId: string): void {
     for (const p of this.procs.values()) {
       if (p.owner === phoneId) this.stop(p.sid)
     }
   }
 
-  /** kill 所有 cc(中继断:手机全失联,ce 上 cc 无意义)。 */
+  /** kill 所有 cc(中继断:手机全失联)。 */
   stopAll(): void {
     for (const sid of [...this.procs.keys()]) this.stop(sid)
   }
 
-  /** 某手机是否有活管家(诊断/调试用)。 */
+  /** 某手机是否有活管家。 */
   hasForPhone(phoneId: string): boolean {
     for (const p of this.procs.values()) if (p.owner === phoneId) return true
     return false

@@ -217,8 +217,8 @@ async function main(): Promise<void> {
   const butlers = new ButlerManager(
     (sid, owner, chunk) => encryptThenSend(FrameType.ButlerOutput, chunk, { sid, targetPhoneId: owner }),
     (sid, owner, code) => {
-      // code -2 = ce spawn claude 失败(ENOENT = 未装)→ butler_nocc 哨兵(手机显安装提示);其余 = 进程退出。
-      const subtype = code === -2 ? 'butler_nocc' : 'butler_exit'
+      // code -2 = spawn 错(ENOENT/ENOEXEC…);127 = sh "command not found"(claude 没装)。两者 → butler_nocc(手机显安装提示);其余 = 进程退出。
+      const subtype = code === -2 || code === 127 ? 'butler_nocc' : 'butler_exit'
       encryptThenSend(
         FrameType.ButlerOutput,
         enc.encode(JSON.stringify({ type: 'system', subtype, code })),

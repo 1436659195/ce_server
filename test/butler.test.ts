@@ -16,14 +16,14 @@ const FAKE_CC = (_args: string[]): ReturnType<typeof spawn> =>
 
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-test('ccArgs:全 pipe 长驻命令——带 -p + stream-json、不带 prompt 参数、不带 --bare、skill 为末 arg', () => {
-  const a = ccArgs('管家的 skill 文本')
+test('ccArgs:全 pipe 长驻命令——带 -p + stream-json、不带 prompt 参数、不带 --bare、skill 走 --append-system-prompt-file', () => {
+  const a = ccArgs('/tmp/skill.txt')
   expect(a).toContain('-p')
   expect(a).toContain('--input-format')
   expect(a[a.indexOf('--input-format') + 1]).toBe('stream-json')
-  expect(a).toContain('--output-format')
+  expect(a).toContain('--append-system-prompt-file') // skill 走文件(避经 shell 的引号/换行问题)
+  expect(a[a.indexOf('--append-system-prompt-file') + 1]).toBe('/tmp/skill.txt')
   expect(a.join(' ')).not.toContain('--bare')
-  expect(a[a.length - 1]).toBe('管家的 skill 文本') // skill 直传(--append-system-prompt 的值)
 })
 
 test('start → writeStdin → onOutput 收到 cc 输出;stop → onExit;size 归零', async () => {
