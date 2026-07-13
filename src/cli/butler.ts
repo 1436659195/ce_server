@@ -55,17 +55,24 @@ export class ButlerManager {
   start(skill: string, owner: string): string {
     const sid = `butler-${randomBytes(4).toString('hex')}`
     const proc = this.spawnCc(ccArgs(skill))
+    let settled = false // 退出/错误只通知一次(ENOENT 后不会再 exit,正常 exit 也不会再 error)
     const feed = (buf: Buffer): void => {
       if (buf.length) this.onOutput(sid, owner, new Uint8Array(buf))
     }
-    // stdout + stderr 都回传:cc 的 stream-json 在 stdout,启动报错/未装 claude 的诊断在 stderr。
+    const finish = (code: number | null): void => {
+      if (settled) return
+      settled = true
+      this.procs.delete(sid)
+      this.onExit(sid, owner, code)
+    }
+    // stdout + stderr 都回传:cc 的 stream-json 在 stdout,启动报错在 stderr。
     proc.stdout?.on('data', feed)
     proc.stderr?.on('data', feed)
-    proc.on('exit', (code) => {
-      // 先通知(onExit 内 main.ts 还能据 owner 定向),再清 map
-      this.onExit(sid, owner, code)
-      this.procs.delete(sid)
+    // spawn 失败(ENOENT = claude 未装)→ finish(-2) 特殊码,main.ts 据此发 butler_nocc 哨兵(可靠,不靠正则猜)。
+    proc.on('error', (e) => {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') finish(-2)
     })
+    proc.on('exit', (code) => finish(code))
     this.procs.set(sid, { sid, owner, proc })
     return sid
   }

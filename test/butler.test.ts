@@ -69,3 +69,14 @@ test('stopAllForPhone:只 kill 该 phone 的 cc,他 phone 保留', async () => {
   await wait(100)
   expect(mgr.size).toBe(0)
 })
+
+test('spawn claude 失败(ENOENT=未装)→ onExit code -2(butler_nocc)', async () => {
+  const exits: { sid: string; code: number | null }[] = []
+  const missingBin = (_args: string[]) =>
+    spawn('ce-definitely-not-a-real-binary-xyz123', [], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const mgr = new ButlerManager(() => {}, (sid, _owner, code) => exits.push({ sid, code }), missingBin)
+  mgr.start('S', 'phone-A')
+  await wait(200)
+  expect(exits.some((e) => e.code === -2)).toBe(true)
+  expect(mgr.size).toBe(0)
+})

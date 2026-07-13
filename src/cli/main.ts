@@ -216,12 +216,15 @@ async function main(): Promise<void> {
   // onOutput:cc 的 stdout/stderr 字节 → 加密回传 owner 手机;onExit:cc 退了发 butler_exit 哨兵让手机转 dead。
   const butlers = new ButlerManager(
     (sid, owner, chunk) => encryptThenSend(FrameType.ButlerOutput, chunk, { sid, targetPhoneId: owner }),
-    (sid, owner, code) =>
+    (sid, owner, code) => {
+      // code -2 = ce spawn claude 失败(ENOENT = 未装)→ butler_nocc 哨兵(手机显安装提示);其余 = 进程退出。
+      const subtype = code === -2 ? 'butler_nocc' : 'butler_exit'
       encryptThenSend(
         FrameType.ButlerOutput,
-        enc.encode(JSON.stringify({ type: 'system', subtype: 'butler_exit', code })),
+        enc.encode(JSON.stringify({ type: 'system', subtype, code })),
         { sid, targetPhoneId: owner }
       )
+    }
   )
   let qrPrinted = false
   let reconnectDelay = 2000
