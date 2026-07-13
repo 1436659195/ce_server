@@ -179,6 +179,28 @@ async function resolveJupyter(
   return { baseUrl: toLoopback(server.url), token: server.token, stop }
 }
 
+/** 探测一个能跑的 claude 二进制。机器上可能装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
+ *  "native binary not installed"。优先 --claude-bin 参数;否则试 /usr/bin/claude 等绝对路径,
+ *  跑 --version 验证(含版本号 + 无 native binary 报错),用第一个好的。管家 cc 用它 spawn。 */
+async function resolveClaudeBin(): Promise<string> {
+  const explicit = arg('claude-bin')
+  if (explicit) return explicit
+  for (const c of ['/usr/bin/claude', '/usr/local/bin/claude', 'claude']) {
+    try {
+      // timeout 6 防 npx-stub 触发安装挂起;要含版本号且无 native binary 报错才算可用。
+      const { stdout } = await pExecFile('sh', ['-c', `timeout 6 "${c}" --version 2>&1`], { timeout: 8000 })
+      if (/\d+\.\d+\.\d+/.test(stdout) && !/native binary not installed/i.test(stdout)) {
+        console.log(`[ce] 管家用 claude: ${c} (${stdout.trim().split('\n')[0]})`)
+        return c
+      }
+    } catch {
+      /* 此候选不行(超时/报错),试下一个 */
+    }
+  }
+  console.warn('[ce] 未找到能跑的 claude(--version 都失败),管家可能起不来;可用 --claude-bin=<path> 指定')
+  return 'claude'
+}
+
 async function main(): Promise<void> {
   const relayUrl = arg('relay') ?? loadConfig().relay
   if (!relayUrl) {
@@ -213,18 +235,21 @@ async function main(): Promise<void> {
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
   // AI 管家:每台手机一个 cc(stream-json,全 pipe 由 ce spawn),ce 桥接 ButlerStdin/ButlerOutput。
-  // onOutput:cc 的 stdout/stderr 字节 → 加密回传 owner 手机;onExit:cc 退了发 butler_exit 哨兵让手机转 dead。
+  // claudeBin:探测一个能跑的 claude——机器上常装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
+  //   "native binary not installed"。优先绝对路径、跑 --version 验证,用第一个好的;管家 cc 用它 spawn。
+  const claudeBin = await resolveClaudeBin()
   const butlers = new ButlerManager(
     (sid, owner, chunk) => encryptThenSend(FrameType.ButlerOutput, chunk, { sid, targetPhoneId: owner }),
     (sid, owner, code) => {
-      // code -2 = spawn 错(ENOENT/ENOEXEC…);127 = sh "command not found"(claude 没装)。两者 → butler_nocc(手机显安装提示);其余 = 进程退出。
+      // code -2 = spawn 错(ENOENT/ENOEXEC…);127 = sh "command not found"(claude 没装)。两者 → butler_nocc;其余 = 进程退出。
       const subtype = code === -2 || code === 127 ? 'butler_nocc' : 'butler_exit'
       encryptThenSend(
         FrameType.ButlerOutput,
         enc.encode(JSON.stringify({ type: 'system', subtype, code })),
         { sid, targetPhoneId: owner }
       )
-    }
+    },
+    (args) => spawn('sh', ['-c', `exec ${claudeBin} ${args.join(' ')}`], { stdio: ['pipe', 'pipe', 'pipe'] })
   )
   let qrPrinted = false
   let reconnectDelay = 2000
