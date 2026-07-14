@@ -75,6 +75,9 @@ function isButlerRelevant(msg: SDKMessage): boolean {
   return false
 }
 
+/** 读类工具:canUseTool 直接放行(不问手机)。其余(send_terminal 等)走手机审批。 */
+const READ_TOOLS = new Set(['mcp__ce-butler__list_terminals', 'mcp__ce-butler__read_terminal', 'Read', 'Grep', 'Glob'])
+
 export class ButlerManager {
   private procs = new Map<string, ButlerProc>()
   constructor(private readonly opts: ButlerOpts) {}
@@ -106,10 +109,10 @@ export class ButlerManager {
         cwd: BUTLER_CWD,
         pathToClaudeCodeExecutable: this.opts.claudeBin,
         tools: ['Read', 'Grep', 'Glob'], // 内置只留只读三件
-        // 读类自动放行(canUseTool 不触发);send_terminal 不在内 → 走 canUseTool 问手机。
-        allowedTools: ['mcp__ce-butler__list_terminals', 'mcp__ce-butler__read_terminal', 'Read', 'Grep', 'Glob'],
         includeHookEvents: false, // 不发 PreToolUse/Stop 类 hook 事件(SessionStart 仍始终发,靠下方 filter 丢)
-        canUseTool: async (toolName, input) => this.requestApproval(proc, toolName, input),
+        // 不用 allowedTools:它会让条目绕过 canUseTool 直接 auto-approve,SDK 报 CLAUDE_SDK_CAN_USE_TOOL_SHADOWED 警告。
+        // 所有工具都走 canUseTool 单门:读类直接放行、send_terminal 问手机审批。
+        canUseTool: async (toolName, input) => this.canUseTool(proc, toolName, input),
       },
     })
     // 只转发管家 UI 关心的事件;hook_*(SessionStart 在装 superpowers 的机器上吐巨量 skill 文本,
@@ -122,7 +125,13 @@ export class ButlerManager {
     this.finish(proc, 0)
   }
 
-  /** canUseTool:能到这的都是非 allowedTools 的(目前=send_terminal)→ 发审批事件问手机,等响应/超时。 */
+  /** canUseTool 单门:读类(READ_TOOLS)直接放行;其余(send_terminal)→ 问手机审批。 */
+  private async canUseTool(proc: ButlerProc, toolName: string, input: Record<string, unknown>): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string }> {
+    if (READ_TOOLS.has(toolName)) return { behavior: 'allow' }
+    return this.requestApproval(proc, toolName, input)
+  }
+
+  /** 发审批事件问手机,等 butler_approval_response 或 15s 超时。 */
   private requestApproval(
     proc: ButlerProc,
     toolName: string,
