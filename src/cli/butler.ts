@@ -18,6 +18,15 @@ import { makeButlerTools, type ToolDeps } from './butler-tools'
 const BUTLER_CWD = '/tmp/ce-butler-cwd'
 /** 写类工具(非 allowedTools)走手机审批;15s 不答 → 自动拒。 */
 const APPROVAL_TIMEOUT_MS = 15000
+/**
+ * 启动即喂的首条消息。★ 必要:SDK 的 query 在 prompt 为空队列时【不会 boot cc、不发 system/init】
+ * (探针实测:空队列 70s 零事件;seed 一条后 init 1.1s 到)。所以 start 时必须 seed 一条触发 cc 启动。
+ * cc 处理它时先吐 system/init(手机据其就绪),再回「就绪」(顺带确认 cc 活着)。
+ */
+const BOOTSTRAP: SDKUserMessage = {
+  type: 'user',
+  message: { role: 'user', content: [{ type: 'text', text: '[系统] 管家已连接。请只回复「就绪」二字,不要调用工具。' }] },
+} as SDKUserMessage
 
 /** 推入式异步队列:writeStdin push,query 当 AsyncIterable<SDKUserMessage> 消费。永不 end → cc 长驻。 */
 class InputQueue {
@@ -90,6 +99,7 @@ export class ButlerManager {
     const sid = `butler-${randomBytes(4).toString('hex')}`
     const proc: ButlerProc = { sid, owner, queue: new InputQueue(), approvals: new Map(), stopping: false }
     this.procs.set(sid, proc)
+    proc.queue.push(BOOTSTRAP) // ★ seed 首条:触发 cc boot + 吐 system/init(空队列 cc 不启动)
     // 后台跑对话循环;query 自身 spawn cc,异常 → finish(-2)(ce 不崩)。
     this.runConversation(proc, skill).catch((e) => {
       console.warn('[ce:butler] 对话循环异常(不崩 ce):', (e as Error).message)
@@ -108,6 +118,8 @@ export class ButlerManager {
         mcpServers: { 'ce-butler': server },
         cwd: BUTLER_CWD,
         pathToClaudeCodeExecutable: this.opts.claudeBin,
+        settingSources: [], // 跳过用户/项目/本地设置 → 不加载 superpowers 等用户级插件/hook(否则 SessionStart hook 吐巨量 skill 文本 + 拖慢 init → 唤醒 40s 超时)。auth 走 credentials,不受影响。
+        plugins: [], // 显式不载任何插件(双保险)
         tools: ['Read', 'Grep', 'Glob'], // 内置只留只读三件
         includeHookEvents: false, // 不发 PreToolUse/Stop 类 hook 事件(SessionStart 仍始终发,靠下方 filter 丢)
         // 不用 allowedTools:它会让条目绕过 canUseTool 直接 auto-approve,SDK 报 CLAUDE_SDK_CAN_USE_TOOL_SHADOWED 警告。
