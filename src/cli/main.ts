@@ -579,7 +579,14 @@ async function main(): Promise<void> {
             // 一机一管家:同手机已有活管家 → 复用 sid(手机重连/重开接回带历史上下文的 cc;phoneLeft 不杀管家)。
             const bSid = butlers.sidForPhone(srcPhone) ?? butlers.start(req.skill ?? '', srcPhone)
             resp = { ok: true, data: { sid: bSid } }
-            // 不发合成 init:SDK 的 cc 启动自然吐 system/init 事件 → 手机据其 ready。
+            // 合成 system/init:【复用路径必须发】——cc 每会话只发一次 init、重连时已发过不会重发,
+            //   手机新会话收不到 init 会 40s 超时(长闲置后重连正是此路径)。新 start 时也提前 ready
+            //   (cc 真 init 后到、手机 handleEvent 幂等)。手机据此清 connect 计时器转 ready。
+            encryptThenSend(
+              FrameType.ButlerOutput,
+              enc.encode(JSON.stringify({ type: 'system', subtype: 'init' })),
+              { sid: bSid, targetPhoneId: srcPhone },
+            )
           } else if (req.op === 'butlerStop' && req.sid) {
             butlers.stop(req.sid)
             resp = { ok: true }
