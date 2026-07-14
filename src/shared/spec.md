@@ -61,26 +61,33 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 
 - **`attachDenied`**(`{ op:'attachDenied', name, occupiedBy }`):race 反馈。两手机近乎同时接管同一空闲终端,ce `tryAcquire` 按先到先得裁决,落败方(loser)此前已在本地建会话(接管面板点的)→ ce 给 loser 发此通知(用 loser 的 sharedKey 加密 + `targetPhoneId=loser` 路由)。loser 收到后**本地回滚该 session(软移除,`localOnly=true`:不再对 ce 发 `detachTerminal`,否则会误杀 winner 刚抢到的终端/占用)** + 弹 toast(`「name」刚被 occupiedBy 占用了`)。`occupiedBy` = winner 的显示名。
 
-## 7. AI 管家(ce 托管,B 方案)
+## 7. AI 管家(ce 托管,Agent SDK 工具化版)
 
-管家 cc 跑在 **ce 里**(被控机),由 ce 以**全 pipe** stdio spawn(`claude -p --input-format stream-json --output-format stream-json --verbose --allowedTools Read Grep Glob --add-dir / --append-system-prompt <skill>`)→ 等同 stream-json 长驻所需环境(无 PTY/TTY)。手机经新隧道帧与 ce 上的 cc 收发,**管家是中继专属**(直连无 ce,无管家)。
+管家大脑 = **ce 里的一个 cc**,经 `@anthropic-ai/claude-agent-sdk` 的 `query()` 长驻跑(`prompt` = 永不结束的异步队列 → cc 多轮常驻)。终端操作是 cc 的**自定义工具**(`createSdkMcpServer` 里 `list_terminals`/`read_terminal`/`send_terminal`),handler 跑在 ce 进程内、直接读 ce 终端缓冲 / 写 terminado stdin。**管家是中继专属**(直连无 ce,无管家),且**工具无关**——终端里跑 cc/codex/opencode/服务/裸 shell 都用同一套工具管。
 
-- **skill 由手机在 `butlerStart` RPC 里传**(`req.skill`),ce 不另存 skill 文本(避免两边复制)。
-- cc 的 **stdout+stderr** 都回传(诊断:未装 claude 的报错在 stderr)。
+- **skill** 由手机在 `butlerStart` RPC 里传(`req.skill`),ce 作为 mcpServer `instructions` 注入;ce 不另存。
+- **隔离**:`cwd='/tmp/ce-butler-cwd'`(空)→ cc 不加载任何项目 CLAUDE.md;`pathToClaudeCodeExecutable=resolveClaudeBin()` 复用系统 claude(连带 auth,绕开编译期 extractFromBunfs)。
+- **读类工具**(`list_terminals`/`read_terminal`/`Read`/`Grep`/`Glob`)进 `allowedTools` 自动放行;**写类**(`send_terminal`)走 `canUseTool` 问手机审批。
 
 ### 7.1 RPC(复用 RPCReq/Resp)
 
-- **`butlerStart`**(`{ op:'butlerStart', skill }`):ce spawn cc、登记 `owner=srcPhoneId`、回 `{ ok:true, data:{ sid } }`(`sid` 形如 `butler-<hex>`)。
-- **`butlerStop`**(`{ op:'butlerStop', sid }`):ce kill 该 cc、清 map、回 `{ ok:true }`。
+- **`butlerStart`**(`{ op:'butlerStart', skill }`):ce 起(或复用,见 7.3)cc、登记 `owner=srcPhoneId`、回 `{ ok:true, data:{ sid } }`(`sid` 形如 `butler-<hex>`)。不发合成 init——SDK cc 启动自然吐 `system/init`。
+- **`butlerStop`**(`{ op:'butlerStop', sid }`):ce 收尾该 cc、清 map、回 `{ ok:true }`。
 
-### 7.2 流帧(新增 FrameType)
+### 7.2 流帧(FrameType 沿用 `ButlerStdin=5`/`ButlerOutput=6`,不新增)
 
-- **`ButlerStdin`**(手机→ce,`sid`=butlerSid,payload 密文 = stream-json user 帧字节):ce 解密后 `writeStdin` 到 cc.stdin。
-- **`ButlerOutput`**(ce→手机,`sid`=butlerSid,`targetPhoneId`=owner,payload 密文 = cc.stdout/stderr 原始字节):手机喂 stream-json 解析器。
-- cc 进程退出时,ce 发一条 `ButlerOutput`,payload = `{"type":"system","subtype":"butler_exit","code":N}`(哨兵);手机见之转 `dead` + 提示。
+- **`ButlerStdin`**(手机→ce,`sid`=butlerSid,payload 密文)。两种 JSON 载荷:
+  - 用户发言:`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"…"}]}}`(SDKUserMessage)→ ce `writeStdin` 入对话队列。
+  - 审批响应:`{"type":"butler_approval_response","reqId":"…","allow":true|false}` → ce `resolveApproval` 解 `canUseTool` 的 pending。
+- **`ButlerOutput`**(ce→手机,`sid`=butlerSid,`targetPhoneId`=owner,payload 密文 = JSON + `\n`):cc 吐的每个 SDKMessage 原样转发——`system/init`(就绪)、`assistant`(内容块:text 人话 / tool_use 工具调用)、`user`(含 tool_result)、`result`(一轮完)。手机直接渲染(白盒:工具调用是结构化事件,不再解析文本信封)。
+- **额外 system 事件**(ce 造):
+  - `{"type":"system","subtype":"butler_approval","reqId","tool","input"}`:写工具被 `canUseTool` 拦下 → 手机弹审批卡。
+  - `{"type":"system","subtype":"butler_exit","code":N}`:cc 进程退 → 手机转 `dead`。
+  - `{"type":"system","subtype":"butler_nocc","code":-2|127}`:spawn claude 失败(未装/native 缺)→ 手机转 `nocc` + 安装提示。
 
-### 7.3 生命周期
+### 7.3 生命周期(管家是 ce 侧长驻进程,同终端,扛过手机瞬时断连)
 
-- **phoneLeft**:ce `stopAllForPhone(phoneId)`(该手机管家 cc 全 kill)。
-- **中继断**:ce `stopAll()`(手机全失联,cc 全清);手机重连后重新 `butlerStart`(cc 新进程,旧对话不保留——MVP 可接受)。
-- **多手机**:管家 `owner`=发起 `butlerStart` 的 phoneId;`ButlerOutput` 只定向该 phone(同终端占用语义)。
+- **phoneLeft / 中继断**:**不杀管家**(只清 E2E 通道 + 终端占用)。手机瞬时断连(后台/切应用致 WS 冻结重连)极常见,管家留活,手机重连后重新握手派生 phoneKeys、按 `owner=phoneId` 续接同一 cc(保留对话历史)。
+- **复用**:`butlerStart` 先 `sidForPhone(srcPhone)` 查同 owner 活管家 → 命中则返回其 sid(接回带历史上下文的 cc),不二次 spawn。
+- **真死**:cc 进程退 / ce 整体重启 → 管家没了(进程死)→ 手机端超时或 `butler_exit` → 重开 respawn。
+- **多手机**:管家 `owner`=发起 `butlerStart` 的 phoneId;`ButlerOutput` 只定向该 phone(同终端占用语义);一机一管家。
