@@ -252,10 +252,12 @@ async function main(): Promise<void> {
         { sid, targetPhoneId: owner },
       )
     },
-    // 终端工具依赖:list 走 Jupyter /api/terminals(权威:机器上所有终端;缓冲会漏没喷过输出的),
-    // read 走 buffers(输出缓冲),send 写 terminado stdin(复用 TermStdin 同款 ['stdin',text])。
+    // 终端工具依赖:list 只列【ce 经手的终端】(= 你 app 里开着的)= terms.keys()。
+    //   不用 Jupyter 全量 /api/terminals——那会含机器上没在 app 开的终端,而那些 ce 没中继、读不到也发不了,
+    //   列出来反而误导。terms 比 buffers 全:开了但还没喷输出的终端也在 terms 里(缓冲里没有)。
+    //   read 走 buffers(输出缓冲),send 写 terminado stdin(复用 TermStdin 同款 ['stdin',text])。
     deps: {
-      listTerminals: async () => (await jupyter.listTerminals()).map((t) => t.name),
+      listTerminals: async () => [...terms.keys()],
       readTerminal: (name, n) => buffers.read(name, n),
       send: async (name, text) => { terms.get(name)?.send(JSON.stringify(['stdin', text])) },
     },
