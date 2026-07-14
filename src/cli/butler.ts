@@ -1,133 +1,178 @@
 /**
- * ce 端 AI 管家进程管理器。
+ * ce 端 AI 管家进程管理器 —— Agent SDK 版(Phase 1)。
  *
- * 每台手机一个 cc(claude -p --input-format stream-json),由 ce 以【全 pipe】stdio spawn
- * (无 PTY)——等同 stream-json 长驻所需的环境(spike 证:pipe stdin 下 cc 多轮长驻)。
- * 手机经 ButlerStdin/ButlerOutput 帧与 cc 收发,ce 只做字节桥接 + 进程生命周期。
+ * 管家大脑 = 一个 cc,经 @anthropic-ai/claude-agent-sdk 的 query() 长驻跑。终端操作(list/read/send)
+ * 是 createSdkMcpServer 里的自定义工具(handler 在本进程,直读 ce 缓冲/直写 terminado stdin)。
+ * 手机经 ButlerStdin/Output 隧道帧与管家收发:用户发言帧喂 InputQueue → query 消费;管家吐的每个
+ * SDKMessage 事件经 onOutput 加密回手机(白盒)。写类工具(send_terminal)过 canUseTool → 问手机审批。
  *
- * spawn 经 `sh -c 'exec claude …'`:Bun 的 posix_spawn 直接 exec claude 会 ENOEXEC(Bun exec 不了
- * npm 装的 claude 包装脚本,但 sh 能),故走 shell exec。skill 写临时文件、用 --append-system-prompt-file
- * (避免经 shell 时 skill 的换行/引号破坏命令行)。
- *
- * spawn 的 'error'(ENOENT/ENOEXEC/…)一律兜为 finish(-2):ce **绝不因 cc 起不来而崩**(否则手机断连)。
- *
- * 可单测:spawnCc 注入假 cc(读 stdin、回 JSON),验证 writeStdin→onOutput→stop 闭环。
+ * 长驻机制:query 的 prompt 是一个【永不结束】的 InputQueue(推入式异步迭代器)→ cc 多轮常驻,
+ * 跨手机瞬时重连存活(phoneLeft 不杀管家;butlerStart 用 sidForPhone 复用)。
  */
-import { spawn, type ChildProcess } from 'node:child_process'
+import { query, createSdkMcpServer, type SDKMessage, type SDKUserMessage, type Options } from '@anthropic-ai/claude-agent-sdk'
 import { randomBytes } from 'node:crypto'
-import { writeFileSync, unlinkSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { mkdirSync } from 'node:fs'
+import { makeButlerTools, type ToolDeps } from './butler-tools'
 
-/** cc 启动参数(不含 bin;skill 走文件 --append-system-prompt-file,不经命令行 → 无引号问题)。 */
-export function ccArgs(skillFile: string): string[] {
-  return [
-    '-p',
-    '--input-format', 'stream-json',
-    '--output-format', 'stream-json',
-    '--verbose',
-    '--allowedTools', 'Read', 'Grep', 'Glob',
-    '--add-dir', '/',
-    '--append-system-prompt-file', skillFile,
-  ]
+/** 管家隔离工作目录(空)→ cc 不加载任何项目 CLAUDE.md,身份只由 skill 决定。 */
+const BUTLER_CWD = '/tmp/ce-butler-cwd'
+/** 写类工具(非 allowedTools)走手机审批;15s 不答 → 自动拒。 */
+const APPROVAL_TIMEOUT_MS = 15000
+
+/** 推入式异步队列:writeStdin push,query 当 AsyncIterable<SDKUserMessage> 消费。永不 end → cc 长驻。 */
+class InputQueue {
+  private buf: SDKUserMessage[] = []
+  private waiters: Array<() => void> = []
+  private done = false
+  push(msg: SDKUserMessage): void {
+    this.buf.push(msg)
+    this.waiters.shift()?.()
+  }
+  /** 结束迭代器:让 query 的 prompt 流完结 → 对话循环收尾(stop 用)。 */
+  close(): void {
+    this.done = true
+    for (const w of this.waiters.splice(0)) w()
+  }
+  async *[Symbol.asyncIterator](): AsyncIterableIterator<SDKUserMessage> {
+    while (true) {
+      while (this.buf.length) yield this.buf.shift()!
+      if (this.done) return
+      await new Promise<void>((r) => this.waiters.push(r))
+    }
+  }
 }
 
-export interface ButlerProc {
+export interface ButlerOpts {
+  onOutput: (sid: string, owner: string, chunk: Uint8Array) => void
+  onExit: (sid: string, owner: string, code: number | null) => void
+  /** 终端工具依赖(buffers + send),全 ce 共享一份。 */
+  deps: ToolDeps
+  /** resolveClaudeBin() 结果;SDK 经 pathToClaudeCodeExecutable 复用系统 claude(连带 auth)。 */
+  claudeBin: string
+  /** 注入点(测试用):喂假 query 避免真 spawn cc。默认用 SDK 的 query。签名同 SDK query(单 params 对象)。 */
+  query?: (params: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => AsyncIterable<SDKMessage>
+}
+
+interface Approval {
+  resolve: (v: { behavior: 'allow' } | { behavior: 'deny'; message: string }) => void
+  timer: ReturnType<typeof setTimeout>
+}
+interface ButlerProc {
   sid: string
-  owner: string // 占用手机 phoneId(ButlerOutput 只定向回它)
-  proc: ChildProcess
-  skillFile: string // 临时 skill 文件(进程结束时删)
+  owner: string
+  queue: InputQueue
+  approvals: Map<string, Approval>
+  stopping: boolean
 }
 
-/**
- * ce 端管家进程表 + 桥接。
- * - start(skill, owner):写 skill 临时文件 + spawn cc(全 pipe),stdout/stderr → onOutput,exit/error → onExit;返回 butlerSid。
- * - writeStdin(sid, bytes):写 cc.stdin(手机 ButlerStdin)。
- * - stop(sid) / stopAllForPhone(phoneId) / stopAll():kill cc + 删 skill 文件。
- */
 export class ButlerManager {
   private procs = new Map<string, ButlerProc>()
+  constructor(private readonly opts: ButlerOpts) {}
 
-  constructor(
-    private readonly onOutput: (sid: string, owner: string, chunk: Uint8Array) => void,
-    private readonly onExit: (sid: string, owner: string, code: number | null) => void,
-    /** 注入点:默认 `sh -c 'exec claude …'`(Bun 直接 exec claude 会 ENOEXEC,经 shell 才行);
-     *  测试 spawn 假 cc。全 pipe stdio。 */
-    private readonly spawnCc: (args: string[]) => ChildProcess = (args) =>
-      spawn('sh', ['-c', `exec claude ${args.join(' ')}`], { stdio: ['pipe', 'pipe', 'pipe'] })
-  ) {}
-
-  /** spawn 一个 cc,登记并返回 butlerSid。 */
+  /** 启动/复用一个管家(按 owner 一机一管家)。返回 butlerSid。 */
   start(skill: string, owner: string): string {
+    const existing = this.sidForPhone(owner)
+    if (existing) return existing
+    try { mkdirSync(BUTLER_CWD, { recursive: true }) } catch { /* 已在 */ }
     const sid = `butler-${randomBytes(4).toString('hex')}`
-    const skillFile = join(tmpdir(), `ce-butler-skill-${sid}.txt`)
-    writeFileSync(skillFile, skill, 'utf8')
-    const proc = this.spawnCc(ccArgs(skillFile))
-    let settled = false // 退出/错误只通知一次
-    const feed = (buf: Buffer): void => {
-      if (buf.length) this.onOutput(sid, owner, new Uint8Array(buf))
-    }
-    const finish = (code: number | null): void => {
-      if (settled) return
-      settled = true
-      this.procs.delete(sid)
-      try { unlinkSync(skillFile) } catch { /* 已删 */ }
-      this.onExit(sid, owner, code)
-    }
-    // stdout + stderr 都回传:cc 的 stream-json 在 stdout,启动报错在 stderr。
-    proc.stdout?.on('data', feed)
-    proc.stderr?.on('data', feed)
-    // 任何 spawn 错(ENOENT=路径无/ENOEXEC=Bun exec 不了包装脚本/…)→ finish(-2),ce 不崩。
-    proc.on('error', (e) => {
-      console.warn('[ce:butler] spawn cc 失败(不崩 ce):', (e as Error).message)
-      finish(-2)
+    const proc: ButlerProc = { sid, owner, queue: new InputQueue(), approvals: new Map(), stopping: false }
+    this.procs.set(sid, proc)
+    // 后台跑对话循环;query 自身 spawn cc,异常 → finish(-2)(ce 不崩)。
+    this.runConversation(proc, skill).catch((e) => {
+      console.warn('[ce:butler] 对话循环异常(不崩 ce):', (e as Error).message)
+      this.finish(proc, -2)
     })
-    proc.on('exit', (code) => finish(code))
-    this.procs.set(sid, { sid, owner, proc, skillFile })
     return sid
   }
 
-  /** 写 cc.stdin。无此 sid(已退/不存在)→ 静默 no-op。 */
-  writeStdin(sid: string, bytes: Uint8Array): void {
-    const stdin = this.procs.get(sid)?.proc.stdin
-    if (stdin && !stdin.destroyed) stdin.write(bytes)
-  }
-
-  /** kill 某 sid 的 cc(手机 butlerStop / dispose)。 */
-  stop(sid: string): void {
-    const p = this.procs.get(sid)
-    if (!p) return
-    this.procs.delete(sid)
-    try { unlinkSync(p.skillFile) } catch { /* 已删 */ }
-    try { p.proc.kill() } catch { /* 已退 */ }
-  }
-
-  /** kill 某手机的所有 cc(phoneLeft / 中继断)。 */
-  stopAllForPhone(phoneId: string): void {
-    for (const p of this.procs.values()) {
-      if (p.owner === phoneId) this.stop(p.sid)
+  /** 跑一轮长驻对话:createSdkMcpServer(工具) + query(流式输入) → 逐事件 onOutput。 */
+  private async runConversation(proc: ButlerProc, skill: string): Promise<void> {
+    const server = createSdkMcpServer({ name: 'ce-butler', tools: makeButlerTools(this.opts.deps), instructions: skill })
+    const run = this.opts.query ?? query
+    const conversation = run({
+      prompt: proc.queue,
+      options: {
+        mcpServers: { 'ce-butler': server },
+        cwd: BUTLER_CWD,
+        pathToClaudeCodeExecutable: this.opts.claudeBin,
+        tools: ['Read', 'Grep', 'Glob'], // 内置只留只读三件
+        // 读类自动放行(canUseTool 不触发);send_terminal 不在内 → 走 canUseTool 问手机。
+        allowedTools: ['mcp__ce-butler__list_terminals', 'mcp__ce-butler__read_terminal', 'Read', 'Grep', 'Glob'],
+        canUseTool: async (toolName, input) => this.requestApproval(proc, toolName, input),
+      },
+    })
+    for await (const msg of conversation) {
+      if (proc.stopping) break
+      this.opts.onOutput(proc.sid, proc.owner, Buffer.from(JSON.stringify(msg) + '\n', 'utf8'))
     }
+    this.finish(proc, 0)
   }
 
-  /** kill 所有 cc(中继断:手机全失联)。 */
+  /** canUseTool:能到这的都是非 allowedTools 的(目前=send_terminal)→ 发审批事件问手机,等响应/超时。 */
+  private requestApproval(
+    proc: ButlerProc,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string }> {
+    const reqId = randomBytes(4).toString('hex')
+    this.opts.onOutput(
+      proc.sid, proc.owner,
+      Buffer.from(JSON.stringify({ type: 'system', subtype: 'butler_approval', reqId, tool: toolName, input }) + '\n', 'utf8'),
+    )
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { if (proc.approvals.delete(reqId)) resolve({ behavior: 'deny', message: '审批超时(15s 未答)' }) }, APPROVAL_TIMEOUT_MS)
+      proc.approvals.set(reqId, { resolve, timer })
+    })
+  }
+
+  /** 手机审批响应(ButlerStdin 来)→ 解对应 pending。 */
+  resolveApproval(sid: string, reqId: string, allow: boolean): void {
+    const proc = this.procs.get(sid)
+    const a = proc?.approvals.get(reqId)
+    if (!proc || !a) return
+    clearTimeout(a.timer)
+    proc.approvals.delete(reqId)
+    a.resolve(allow ? { behavior: 'allow' } : { behavior: 'deny', message: '用户拒绝' })
+  }
+
+  /** 喂用户发言帧(手机 ButlerStdin 来的 SDKUserMessage JSON 字节)→ 入队,cc 下一轮消费。 */
+  writeStdin(sid: string, bytes: Uint8Array): void {
+    const proc = this.procs.get(sid)
+    if (!proc) return
+    try {
+      proc.queue.push(JSON.parse(new TextDecoder().decode(bytes)) as SDKUserMessage)
+    } catch { /* 非法 JSON 丢弃 */ }
+  }
+
+  /** 收尾:去重,删表,关队列,拒所有未决审批,onExit。 */
+  private finish(proc: ButlerProc, code: number | null): void {
+    if (!this.procs.has(proc.sid)) return
+    this.procs.delete(proc.sid)
+    proc.stopping = true
+    proc.queue.close()
+    for (const [, a] of proc.approvals) { clearTimeout(a.timer); a.resolve({ behavior: 'deny', message: '管家退出' }) }
+    proc.approvals.clear()
+    this.opts.onExit(proc.sid, proc.owner, code)
+  }
+
+  stop(sid: string): void {
+    const proc = this.procs.get(sid)
+    if (!proc) return
+    this.finish(proc, null)
+  }
+  stopAllForPhone(phoneId: string): void {
+    for (const p of [...this.procs.values()]) if (p.owner === phoneId) this.stop(p.sid)
+  }
   stopAll(): void {
     for (const sid of [...this.procs.keys()]) this.stop(sid)
   }
-
-  /** 某手机是否有活管家。 */
-  hasForPhone(phoneId: string): boolean {
-    for (const p of this.procs.values()) if (p.owner === phoneId) return true
-    return false
-  }
-
-  /** 某手机当前活管家的 sid(无则 null)。butlerStart 据此复用:一机一管家,手机重连/重开时接回带历史上下文的 cc,
-   *  不二次 spawn 成孤儿。管家是 ce 侧长驻进程(同终端),靠它在 phoneLeft 后留活、被本方法接回。 */
   sidForPhone(phoneId: string): string | null {
     for (const p of this.procs.values()) if (p.owner === phoneId) return p.sid
     return null
   }
-
-  get size(): number {
-    return this.procs.size
-  }
+  hasForPhone(phoneId: string): boolean { return this.sidForPhone(phoneId) !== null }
+  get size(): number { return this.procs.size }
 }
+
+// 仅测用导出(单测验 InputQueue 的有序 + close 收尾)。
+export { InputQueue }

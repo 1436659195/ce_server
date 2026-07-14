@@ -241,19 +241,24 @@ async function main(): Promise<void> {
   // claudeBin:探测一个能跑的 claude——机器上常装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
   //   "native binary not installed"。优先绝对路径、跑 --version 验证,用第一个好的;管家 cc 用它 spawn。
   const claudeBin = await resolveClaudeBin()
-  const butlers = new ButlerManager(
-    (sid, owner, chunk) => encryptThenSend(FrameType.ButlerOutput, chunk, { sid, targetPhoneId: owner }),
-    (sid, owner, code) => {
-      // code -2 = spawn 错(ENOENT/ENOEXEC…);127 = sh "command not found"(claude 没装)。两者 → butler_nocc;其余 = 进程退出。
+  const butlers = new ButlerManager({
+    onOutput: (sid, owner, chunk) => encryptThenSend(FrameType.ButlerOutput, chunk, { sid, targetPhoneId: owner }),
+    onExit: (sid, owner, code) => {
+      // code -2 = spawn/对话异常(含 ENOENT=claude 没装、ENOEXEC);127 = sh "command not found"。两者 → butler_nocc;其余 = 进程退出。
       const subtype = code === -2 || code === 127 ? 'butler_nocc' : 'butler_exit'
       encryptThenSend(
         FrameType.ButlerOutput,
         enc.encode(JSON.stringify({ type: 'system', subtype, code })),
-        { sid, targetPhoneId: owner }
+        { sid, targetPhoneId: owner },
       )
     },
-    (args) => spawn('sh', ['-c', `exec ${claudeBin} ${args.join(' ')}`], { stdio: ['pipe', 'pipe', 'pipe'] })
-  )
+    // 终端工具依赖:buffers(read 数据源)+ send(写 terminado stdin,复用 TermStdin 同款 ['stdin',text])。
+    deps: {
+      buffers,
+      send: async (name, text) => { terms.get(name)?.send(JSON.stringify(['stdin', text])) },
+    },
+    claudeBin,
+  })
   let qrPrinted = false
   let reconnectDelay = 2000
 
@@ -566,21 +571,11 @@ async function main(): Promise<void> {
               terminalOwner.set((resp.data as { name: string }).name, srcPhone)
             }
           } else if (req.op === 'butlerStart') {
-            // AI 管家:ce spawn cc(stream-json 全 pipe),回 butlerSid;手机据此收发 ButlerStdin/ButlerOutput。
-            // skill 由手机传(避免 ce 复制一份 skill 文本)。
-            // 一机一管家:同手机已有活管家 → 复用其 sid。管家是 ce 侧长驻进程(同终端),手机瞬时断连(后台/
-            //   切应用致 WS 冻结重连)极常见——管家留活,手机重连后重新握手派生 phoneKeys、按 owner 续接同一 cc,
-            //   保留对话历史(不必每轮冷启)。phoneLeft 不再杀管家(见下),此处复用即可接回。
+            // AI 管家:ce 用 SDK query 起 cc,回 butlerSid;手机据此收发 ButlerStdin/ButlerOutput。skill 由手机传。
+            // 一机一管家:同手机已有活管家 → 复用 sid(手机重连/重开接回带历史上下文的 cc;phoneLeft 不杀管家)。
             const bSid = butlers.sidForPhone(srcPhone) ?? butlers.start(req.skill ?? '', srcPhone)
             resp = { ok: true, data: { sid: bSid } }
-            // 合成 system/init 立即下发:① 复用时 cc 每会话只发一次 init、不会重发,靠这个让手机 ready;
-            //   ② 新 spawn 时也提前 ready,不必干等 cc 启动吐真 init(原 40s 窗口)。cc 真正的 init 后到,
-            //   手机 handleEvent 幂等(已 ready 不再转)。手机据此清 connect 计时器。
-            encryptThenSend(
-              FrameType.ButlerOutput,
-              enc.encode(JSON.stringify({ type: 'system', subtype: 'init' })),
-              { sid: bSid, targetPhoneId: srcPhone },
-            )
+            // 不发合成 init:SDK 的 cc 启动自然吐 system/init 事件 → 手机据其 ready。
           } else if (req.op === 'butlerStop' && req.sid) {
             butlers.stop(req.sid)
             resp = { ok: true }
@@ -610,8 +605,13 @@ async function main(): Promise<void> {
           break
         }
         case FrameType.ButlerStdin: {
-          // 管家 cc 的 stdin(手机 ButlerStdin 帧的密文 = stream-json user 帧字节)→ 写 cc.stdin
-          if (frame.sid) butlers.writeStdin(frame.sid, plaintext)
+          // 管家 ButlerStdin 两种 payload:① 审批响应 {type:'butler_approval_response',reqId,allow}
+          //   → 解 canUseTool 的 pending;② 用户发言帧(SDKUserMessage)→ writeStdin 入对话队列。
+          if (!frame.sid) break
+          let p: { type?: string; reqId?: string; allow?: boolean } | null = null
+          try { p = JSON.parse(dec.decode(plaintext)) as { type?: string; reqId?: string; allow?: boolean } } catch { p = null }
+          if (p?.type === 'butler_approval_response' && p.reqId) butlers.resolveApproval(frame.sid, p.reqId, p.allow !== false)
+          else butlers.writeStdin(frame.sid, plaintext)
           break
         }
         default:

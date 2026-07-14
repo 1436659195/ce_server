@@ -1,82 +1,60 @@
 import { test, expect } from 'bun:test'
-import { spawn } from 'node:child_process'
-import { ButlerManager, ccArgs } from '../src/cli/butler'
-
-/**
- * 假 cc:读 stdin → 回一行 JSON result(node -e,避免 fixture 路径)。用于验证管家进程桥接收发闭环,
- * 不依赖真 claude(真 claude 的长驻由 spike 证,这里只测 ce 侧的字节桥接 + 生命周期)。
- */
-// 假 cc 忽略 args(那些是给真 claude 的;传给 bun 会被当 flag 解析报错)。只读 stdin → 写 result。
-const FAKE_CC = (_args: string[]): ReturnType<typeof spawn> =>
-  spawn(
-    process.execPath, // bun 本体(ce 运行时,必在);避免依赖 node 是否在 PATH
-    ['-e', "process.stdin.on('data',d=>{process.stdout.write('{\"type\":\"result\",\"subtype\":\"success\"}\\n')})"],
-    { stdio: ['pipe', 'pipe', 'pipe'] }
-  )
+import { type SDKMessage, type SDKUserMessage, type Options } from '@anthropic-ai/claude-agent-sdk'
+import { ButlerManager, InputQueue } from '../src/cli/butler'
+import type { ToolDeps } from '../src/cli/butler-tools'
 
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+const userMsg = (t: string): SDKUserMessage =>
+  ({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: t }] } }) as SDKUserMessage
 
-test('ccArgs:全 pipe 长驻命令——带 -p + stream-json、不带 prompt 参数、不带 --bare、skill 走 --append-system-prompt-file', () => {
-  const a = ccArgs('/tmp/skill.txt')
-  expect(a).toContain('-p')
-  expect(a).toContain('--input-format')
-  expect(a[a.indexOf('--input-format') + 1]).toBe('stream-json')
-  expect(a).toContain('--append-system-prompt-file') // skill 走文件(避经 shell 的引号/换行问题)
-  expect(a[a.indexOf('--append-system-prompt-file') + 1]).toBe('/tmp/skill.txt')
-  expect(a.join(' ')).not.toContain('--bare')
+/** 假 query:吐一条 system/init,然后排空 prompt 队列(直到 close)。不 spawn cc,让生命周期可单测。 */
+const fakeQuery = async function* (params: { prompt: AsyncIterable<SDKUserMessage>; options: Options }): AsyncGenerator<SDKMessage> {
+  yield { type: 'system', subtype: 'init', session_id: 'fake' } as SDKMessage
+  for await (const _m of params.prompt) { /* 排空,忽略 */ }
+}
+
+const fakeDeps: ToolDeps = { buffers: { list: () => [], read: () => '' }, send: async () => {} }
+const newMgr = (onOutput: (sid: string, _o: string, chunk: Uint8Array) => void) =>
+  new ButlerManager({ onOutput, onExit: () => {}, deps: fakeDeps, claudeBin: 'claude', query: fakeQuery })
+
+test('InputQueue:按序消费 + close 后迭代器结束', async () => {
+  const q = new InputQueue()
+  const a = userMsg('a')
+  const b = userMsg('b')
+  const got: SDKUserMessage[] = []
+  const drain = (async () => { for await (const m of q) got.push(m) })()
+  q.push(a)
+  q.push(b)
+  await wait(30)
+  q.close()
+  await drain
+  expect(got).toEqual([a, b])
 })
 
-test('start → writeStdin → onOutput 收到 cc 输出;stop → onExit;size 归零', async () => {
-  const outputs: { sid: string; chunk: Uint8Array }[] = []
-  const exits: { sid: string; code: number | null }[] = []
-  const mgr = new ButlerManager(
-    (sid, _owner, chunk) => outputs.push({ sid, chunk }),
-    (sid, _owner, code) => exits.push({ sid, code }),
-    FAKE_CC
-  )
-  const sid = mgr.start('SKILL', 'phone-A')
-  expect(sid.startsWith('butler-')).toBe(true)
-  expect(mgr.size).toBe(1)
-
-  // 写一帧到 cc.stdin → 假 cc 回 result → onOutput
-  mgr.writeStdin(sid, new TextEncoder().encode('{"type":"user"}\n'))
-  await wait(300)
-  const got = outputs.find((o) => o.sid === sid && new TextDecoder().decode(o.chunk).includes('"type":"result"'))
-  expect(got).toBeDefined()
-
-  // stop → cc 被 kill → onExit;map 清
-  mgr.stop(sid)
-  await wait(150)
-  expect(exits.some((e) => e.sid === sid)).toBe(true)
-  expect(mgr.size).toBe(0)
+test('start:吐 system/init;同 owner 第二次 start 复用 sid', async () => {
+  const outs: Uint8Array[] = []
+  const mgr = newMgr((_, __, chunk) => outs.push(chunk))
+  const s1 = mgr.start('SKILL', 'phone-A')
+  await wait(30) // 让 fakeQuery 吐 init
+  expect(outs.some((c) => new TextDecoder().decode(c).includes('"subtype":"init"'))).toBe(true)
+  const s2 = mgr.start('SKILL', 'phone-A')
+  expect(s2).toBe(s1) // 复用,不二次 spawn
+  mgr.stopAll()
 })
 
-test('writeStdin 对未知 sid 静默 no-op(不抛)', () => {
-  const mgr = new ButlerManager(() => {}, () => {}, FAKE_CC)
-  expect(() => mgr.writeStdin('butler-nope', new TextEncoder().encode('x'))).not.toThrow()
-})
-
-test('stopAllForPhone:只 kill 该 phone 的 cc,他 phone 保留', async () => {
-  const mgr = new ButlerManager(() => {}, () => {}, FAKE_CC)
+test('stopAllForPhone:只杀该 owner,他 owner 保留', async () => {
+  const mgr = newMgr(() => {})
   mgr.start('S', 'phone-A')
   mgr.start('S', 'phone-B')
+  await wait(20)
   expect(mgr.size).toBe(2)
   mgr.stopAllForPhone('phone-A')
-  await wait(150)
   expect(mgr.hasForPhone('phone-A')).toBe(false)
   expect(mgr.hasForPhone('phone-B')).toBe(true)
-  mgr.stopAllForPhone('phone-B')
-  await wait(100)
-  expect(mgr.size).toBe(0)
+  mgr.stopAll()
 })
 
-test('spawn claude 失败(ENOENT=未装)→ onExit code -2(butler_nocc)', async () => {
-  const exits: { sid: string; code: number | null }[] = []
-  const missingBin = (_args: string[]) =>
-    spawn('ce-definitely-not-a-real-binary-xyz123', [], { stdio: ['pipe', 'pipe', 'pipe'] })
-  const mgr = new ButlerManager(() => {}, (sid, _owner, code) => exits.push({ sid, code }), missingBin)
-  mgr.start('S', 'phone-A')
-  await wait(200)
-  expect(exits.some((e) => e.code === -2)).toBe(true)
-  expect(mgr.size).toBe(0)
+test('writeStdin:未知 sid 静默 no-op(不抛)', () => {
+  const mgr = newMgr(() => {})
+  expect(() => mgr.writeStdin('butler-nope', new TextEncoder().encode('{}'))).not.toThrow()
 })
