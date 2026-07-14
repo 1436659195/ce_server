@@ -394,12 +394,15 @@ async function main(): Promise<void> {
         try {
           const notice = JSON.parse(dec.decode(raw as Uint8Array)) as { type?: string; phoneId?: string }
           if (notice.type === 'phoneLeft' && notice.phoneId) {
-            phoneKeys.delete(notice.phoneId)
+            phoneKeys.delete(notice.phoneId) // E2E 通道失效(安全:断连后该 phone 密钥不可再用于解密)
             for (const [tname, owner] of terminalOwner) {
-              if (owner === notice.phoneId) terminalOwner.delete(tname)
+              if (owner === notice.phoneId) terminalOwner.delete(tname) // 终端占用随连接重置
             }
-            butlers.stopAllForPhone(notice.phoneId) // 该手机的管家 cc 也清
-            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道、终端占用与管家`)
+            // 【不杀管家】。管家是 ce 侧长驻进程,和终端一样——手机瞬时断连(后台/切应用致 WS 冻结重连)极常见,
+            // 此时杀管家会让手机重连后接到一个已死的 sid(stop 不发 butler_exit)→ 发消息无响应、120s 超时
+            // (这正是「接着上次的」开管家后超时的根因)。管家留活,手机重连后重新握手派生 phoneKeys、按
+            // owner=phoneId 续接同一 cc(下次 butlerStart 也由 sidForPhone 复用接回)。
+            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道与终端占用(管家保留,等重连续接)`)
           }
         } catch {
           /* 真正的非法帧 → 忽略 */
@@ -561,8 +564,19 @@ async function main(): Promise<void> {
           } else if (req.op === 'butlerStart') {
             // AI 管家:ce spawn cc(stream-json 全 pipe),回 butlerSid;手机据此收发 ButlerStdin/ButlerOutput。
             // skill 由手机传(避免 ce 复制一份 skill 文本)。
-            const bSid = butlers.start(req.skill ?? '', srcPhone)
+            // 一机一管家:同手机已有活管家 → 复用其 sid。管家是 ce 侧长驻进程(同终端),手机瞬时断连(后台/
+            //   切应用致 WS 冻结重连)极常见——管家留活,手机重连后重新握手派生 phoneKeys、按 owner 续接同一 cc,
+            //   保留对话历史(不必每轮冷启)。phoneLeft 不再杀管家(见下),此处复用即可接回。
+            const bSid = butlers.sidForPhone(srcPhone) ?? butlers.start(req.skill ?? '', srcPhone)
             resp = { ok: true, data: { sid: bSid } }
+            // 合成 system/init 立即下发:① 复用时 cc 每会话只发一次 init、不会重发,靠这个让手机 ready;
+            //   ② 新 spawn 时也提前 ready,不必干等 cc 启动吐真 init(原 40s 窗口)。cc 真正的 init 后到,
+            //   手机 handleEvent 幂等(已 ready 不再转)。手机据此清 connect 计时器。
+            encryptThenSend(
+              FrameType.ButlerOutput,
+              enc.encode(JSON.stringify({ type: 'system', subtype: 'init' })),
+              { sid: bSid, targetPhoneId: srcPhone },
+            )
           } else if (req.op === 'butlerStop' && req.sid) {
             butlers.stop(req.sid)
             resp = { ok: true }
@@ -630,7 +644,8 @@ async function main(): Promise<void> {
       console.log(`[ce] 中继断开,${reconnectDelay}ms 后重连`)
       phoneKeys.clear() // 中继断了:所有 phone 通道失效,重连后手机重新握手派生
       terminalOwner.clear() // 占用随连接重置(手机重连后重新 attach/tryAcquire)
-      butlers.stopAll() // 手机全失联,ce 上管家 cc 无意义 → 全清(手机重连后重新 butlerStart)
+      // 【不杀管家】(同 phoneLeft 理由:管家是 ce 侧长驻进程)。中继重连后手机也重连,管家按 owner 续接;
+      //   ce 若整体重启则进程死、管家自然没了,手机端会超时→重开 respawn(useButler.open 见 dead 即重建)。
       setTimeout(connect, reconnectDelay)
       reconnectDelay = Math.min(reconnectDelay * 2, 30000)
     })

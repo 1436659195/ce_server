@@ -120,6 +120,13 @@ export class ButlerManager {
     return false
   }
 
+  /** 某手机当前活管家的 sid(无则 null)。butlerStart 据此复用:一机一管家,手机重连/重开时接回带历史上下文的 cc,
+   *  不二次 spawn 成孤儿。管家是 ce 侧长驻进程(同终端),靠它在 phoneLeft 后留活、被本方法接回。 */
+  sidForPhone(phoneId: string): string | null {
+    for (const p of this.procs.values()) if (p.owner === phoneId) return p.sid
+    return null
+  }
+
   get size(): number {
     return this.procs.size
   }
