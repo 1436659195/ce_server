@@ -65,6 +65,16 @@ interface ButlerProc {
   stopping: boolean
 }
 
+/** 只转发管家 UI 关心的事件:assistant(人话+工具调用)/ user(tool_result)/ result(一轮完)/ system.init(就绪)。
+ *  hook_*(SessionStart 注入的 superpowers 等巨量 skill 文本)/ status / api_retry 等噪声一律丢——
+ *  它们对管家无用,且单条可达数 MB,转发会让手机解析超时、把 init 挤到 40s 窗口外。 */
+function isButlerRelevant(msg: SDKMessage): boolean {
+  const t = (msg as { type?: string }).type
+  if (t === 'assistant' || t === 'user' || t === 'result') return true
+  if (t === 'system') return (msg as { subtype?: string }).subtype === 'init'
+  return false
+}
+
 export class ButlerManager {
   private procs = new Map<string, ButlerProc>()
   constructor(private readonly opts: ButlerOpts) {}
@@ -98,11 +108,15 @@ export class ButlerManager {
         tools: ['Read', 'Grep', 'Glob'], // 内置只留只读三件
         // 读类自动放行(canUseTool 不触发);send_terminal 不在内 → 走 canUseTool 问手机。
         allowedTools: ['mcp__ce-butler__list_terminals', 'mcp__ce-butler__read_terminal', 'Read', 'Grep', 'Glob'],
+        includeHookEvents: false, // 不发 PreToolUse/Stop 类 hook 事件(SessionStart 仍始终发,靠下方 filter 丢)
         canUseTool: async (toolName, input) => this.requestApproval(proc, toolName, input),
       },
     })
+    // 只转发管家 UI 关心的事件;hook_*(SessionStart 在装 superpowers 的机器上吐巨量 skill 文本,
+    //   几 MB 一坨,转发会把手机撑爆、system/init 排其后导致 40s 超时)/ status / api_retry 等噪声全丢。
     for await (const msg of conversation) {
       if (proc.stopping) break
+      if (!isButlerRelevant(msg)) continue
       this.opts.onOutput(proc.sid, proc.owner, Buffer.from(JSON.stringify(msg) + '\n', 'utf8'))
     }
     this.finish(proc, 0)
