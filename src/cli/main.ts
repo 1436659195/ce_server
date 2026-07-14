@@ -23,6 +23,7 @@ import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { ButlerManager } from './butler'
+import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
 import { spawn, execFile } from 'node:child_process'
@@ -234,6 +235,8 @@ async function main(): Promise<void> {
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
+  // 终端输出环形缓冲:转发 TermOutput 时旁路 append(与 owner 无关);read_terminal 工具读它(ce 本地,不回程问手机)。
+  const buffers = new TermBuffers(500)
   // AI 管家:每台手机一个 cc(stream-json,全 pipe 由 ce spawn),ce 桥接 ButlerStdin/ButlerOutput。
   // claudeBin:探测一个能跑的 claude——机器上常装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
   //   "native binary not installed"。优先绝对路径、跑 --version 验证,用第一个好的;管家 cc 用它 spawn。
@@ -323,6 +326,7 @@ async function main(): Promise<void> {
         if ((etype === 'stdout' || etype === 'stderr') && typeof content === 'string') {
           // stderr 包红码,对齐直连(terminalConnection 把 stderr 渲染红)
           const out = etype === 'stderr' ? `\x1b[1;31m${content}\x1b[0m` : content
+          buffers.append(name, Buffer.from(out)) // 旁路缓存:read_terminal 读尾部≈当前帧(与 owner 无关,无条件存)
           // 输出只发给 owner(Task 4 的 tryAcquire 在 attach 时标 owner);无 owner → 不发(避免泄露给非占用者)
           const owner = terminalOwner.get(name)
           if (owner) {
