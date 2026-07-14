@@ -63,7 +63,8 @@ export interface ButlerOpts {
 }
 
 interface Approval {
-  resolve: (v: { behavior: 'allow' } | { behavior: 'deny'; message: string }) => void
+  input: Record<string, unknown> // allow 时回灌 updatedInput(否则 ZodError)
+  resolve: (v: { behavior: 'allow'; updatedInput: Record<string, unknown> } | { behavior: 'deny'; message: string }) => void
   timer: ReturnType<typeof setTimeout>
 }
 interface ButlerProc {
@@ -137,9 +138,10 @@ export class ButlerManager {
     this.finish(proc, 0)
   }
 
-  /** canUseTool 单门:读类(READ_TOOLS)直接放行;其余(send_terminal)→ 问手机审批。 */
-  private async canUseTool(proc: ButlerProc, toolName: string, input: Record<string, unknown>): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string }> {
-    if (READ_TOOLS.has(toolName)) return { behavior: 'allow' }
+  /** canUseTool 单门:读类(READ_TOOLS)直接放行;其余(send_terminal)→ 问手机审批。
+   *  ★ allow 必须回灌 updatedInput——否则 SDK 以 undefined 调工具,z.object(...).parse(undefined) → ZodError(所有工具都中招)。 */
+  private async canUseTool(proc: ButlerProc, toolName: string, input: Record<string, unknown>): Promise<{ behavior: 'allow'; updatedInput: Record<string, unknown> } | { behavior: 'deny'; message: string }> {
+    if (READ_TOOLS.has(toolName)) return { behavior: 'allow', updatedInput: input }
     return this.requestApproval(proc, toolName, input)
   }
 
@@ -148,7 +150,7 @@ export class ButlerManager {
     proc: ButlerProc,
     toolName: string,
     input: Record<string, unknown>,
-  ): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string }> {
+  ): Promise<{ behavior: 'allow'; updatedInput: Record<string, unknown> } | { behavior: 'deny'; message: string }> {
     const reqId = randomBytes(4).toString('hex')
     this.opts.onOutput(
       proc.sid, proc.owner,
@@ -156,7 +158,7 @@ export class ButlerManager {
     )
     return new Promise((resolve) => {
       const timer = setTimeout(() => { if (proc.approvals.delete(reqId)) resolve({ behavior: 'deny', message: '审批超时(15s 未答)' }) }, APPROVAL_TIMEOUT_MS)
-      proc.approvals.set(reqId, { resolve, timer })
+      proc.approvals.set(reqId, { input, resolve, timer })
     })
   }
 
@@ -167,7 +169,7 @@ export class ButlerManager {
     if (!proc || !a) return
     clearTimeout(a.timer)
     proc.approvals.delete(reqId)
-    a.resolve(allow ? { behavior: 'allow' } : { behavior: 'deny', message: '用户拒绝' })
+    a.resolve(allow ? { behavior: 'allow', updatedInput: a.input } : { behavior: 'deny', message: '用户拒绝' })
   }
 
   /** 喂用户发言帧(手机 ButlerStdin 来的 SDKUserMessage JSON 字节)→ 入队,cc 下一轮消费。 */
