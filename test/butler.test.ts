@@ -13,7 +13,7 @@ const fakeQuery = async function* (params: { prompt: AsyncIterable<SDKUserMessag
   for await (const _m of params.prompt) { /* 排空,忽略 */ }
 }
 
-const fakeDeps: ToolDeps = { buffers: { list: () => [], read: () => '' }, send: async () => {} }
+const fakeDeps: ToolDeps = { listTerminals: async () => [], readTerminal: () => '', send: async () => {} }
 const newMgr = (onOutput: (sid: string, _o: string, chunk: Uint8Array) => void) =>
   new ButlerManager({ onOutput, onExit: () => {}, deps: fakeDeps, claudeBin: 'claude', query: fakeQuery })
 

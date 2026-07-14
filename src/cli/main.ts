@@ -252,9 +252,11 @@ async function main(): Promise<void> {
         { sid, targetPhoneId: owner },
       )
     },
-    // 终端工具依赖:buffers(read 数据源)+ send(写 terminado stdin,复用 TermStdin 同款 ['stdin',text])。
+    // 终端工具依赖:list 走 Jupyter /api/terminals(权威:机器上所有终端;缓冲会漏没喷过输出的),
+    // read 走 buffers(输出缓冲),send 写 terminado stdin(复用 TermStdin 同款 ['stdin',text])。
     deps: {
-      buffers,
+      listTerminals: async () => (await jupyter.listTerminals()).map((t) => t.name),
+      readTerminal: (name, n) => buffers.read(name, n),
       send: async (name, text) => { terms.get(name)?.send(JSON.stringify(['stdin', text])) },
     },
     claudeBin,
