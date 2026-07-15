@@ -415,7 +415,9 @@ async function main(): Promise<void> {
             // 此时杀管家会让手机重连后接到一个已死的 sid(stop 不发 butler_exit)→ 发消息无响应、120s 超时
             // (这正是「接着上次的」开管家后超时的根因)。管家留活,手机重连后重新握手派生 phoneKeys、按
             // owner=phoneId 续接同一 cc(下次 butlerStart 也由 sidForPhone 复用接回)。
-            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道与终端占用(管家保留,等重连续接)`)
+            // 但「移除服务器后不再回来」会孤儿 cc 常驻泄漏 → 挂 6h 回收计时(重连由 markPhoneBack 取消)。
+            butlers.markPhoneLeft(notice.phoneId)
+            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道与终端占用(管家保留,6h 不归则回收)`)
           }
         } catch {
           /* 真正的非法帧 → 忽略 */
@@ -479,6 +481,7 @@ async function main(): Promise<void> {
           const sharedKey = sharedSecret(cliPriv, phonePub)
           const phoneId = srcPhone ?? `anon-${randId(8)}`
           phoneKeys.set(phoneId, { sharedKey, name })
+          butlers.markPhoneBack(phoneId) // 手机(重)连 → 取消其孤儿回收计时(管家续用、保留上下文)
           console.log(`[ce] 手机配对 phoneId=${phoneId}${name ? ` name=${name}` : ''},E2E 通道建立`)
         } catch {
           /* 非法帧 */
@@ -500,6 +503,8 @@ async function main(): Promise<void> {
         case FrameType.RPCReq: {
           const req = JSON.parse(dec.decode(plaintext)) as RpcRequest
           let resp: RpcResponse
+          // butlerStart 的合成 init 要排在 RPCResp 之【后】发(见 butlerStart 分支注释),此处先占位。
+          let postRespInit: { sid: string } | null = null
           if (req.op === 'listTerminals') {
             // 转发 GET /api/terminals 拿「Jupyter 上所有终端」+ 用 ce 的 terms map 标 managed。
             // 手机「+」面板显示全部;杀 app 重开自动恢复只挑 managed(= ce 经手过的),零回归。
@@ -580,13 +585,14 @@ async function main(): Promise<void> {
             const bSid = butlers.sidForPhone(srcPhone) ?? butlers.start(req.skill ?? '', srcPhone)
             resp = { ok: true, data: { sid: bSid } }
             // 合成 system/init:【复用路径必须发】——cc 每会话只发一次 init、重连时已发过不会重发,
-            //   手机新会话收不到 init 会 40s 超时(长闲置后重连正是此路径)。新 start 时也提前 ready
-            //   (cc 真 init 后到、手机 handleEvent 幂等)。手机据此清 connect 计时器转 ready。
-            encryptThenSend(
-              FrameType.ButlerOutput,
-              enc.encode(JSON.stringify({ type: 'system', subtype: 'init' })),
-              { sid: bSid, targetPhoneId: srcPhone },
-            )
+            //   手机新会话收不到 init 会 40s 超时(杀 app 重进 / 休眠重连正是此路径)。
+            // ★ 必须排在 RPCResp 之【后】发:手机在 `await tunnel.rpc(butlerStart)` resolve 之后才注册
+            //   onButlerOutput 订阅(useButler.open);init 排在 RPCResp 前 → 到达时订阅还没注册 → 被丢
+            //   → 复用路径照样 40s 超时(63d7edd 加的合成 init 因此一度无效)。排在 RPCResp 后:手机先
+            //   resolve(微任务里设 butlerSid + 注册订阅),再收 init → 接住、清 connect 计时器转 ready。
+            //   RPCResp 与 init 是两条独立 WS 帧 = 两个 message 事件,JS 事件循环在两 macrotask 间排空
+            //   微任务(rpc 的 await 续体),故「订阅先于 init」时序可靠(Chromium WebView 遵 spec)。
+            postRespInit = { sid: bSid }
           } else if (req.op === 'butlerStop' && req.sid) {
             butlers.stop(req.sid)
             resp = { ok: true }
@@ -599,6 +605,14 @@ async function main(): Promise<void> {
             reqId: frame.reqId,
             targetPhoneId: srcPhone,
           })
+          // butlerStart 的合成 init:必须在 RPCResp 之【后】发(见 butlerStart 分支注释)。
+          if (postRespInit) {
+            encryptThenSend(
+              FrameType.ButlerOutput,
+              enc.encode(JSON.stringify({ type: 'system', subtype: 'init' })),
+              { sid: postRespInit.sid, targetPhoneId: srcPhone },
+            )
+          }
           break
         }
         case FrameType.TermStdin: {

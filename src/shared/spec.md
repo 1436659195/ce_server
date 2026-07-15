@@ -71,7 +71,7 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 
 ### 7.1 RPC(复用 RPCReq/Resp)
 
-- **`butlerStart`**(`{ op:'butlerStart', skill }`):ce 起(或复用,见 7.3)cc、登记 `owner=srcPhoneId`、回 `{ ok:true, data:{ sid } }`(`sid` 形如 `butler-<hex>`)。不发合成 init——SDK cc 启动自然吐 `system/init`。
+- **`butlerStart`**(`{ op:'butlerStart', skill }`):ce 起(或复用,见 7.3)cc、登记 `owner=srcPhoneId`、回 `{ ok:true, data:{ sid } }`(`sid` 形如 `butler-<hex>`)。**合成 `system/init` 排在 RPCResp 之【后】发**(复用路径 cc 已 boot、不再吐 init,须补一条;排在 RPCResp 后是为让手机先 resolve `tunnel.rpc`→注册 `onButlerOutput` 订阅→再收 init——否则 init 到达时订阅还没注册、被丢弃 → 复用路径 40s 超时)。
 - **`butlerStop`**(`{ op:'butlerStop', sid }`):ce 收尾该 cc、清 map、回 `{ ok:true }`。
 
 ### 7.2 流帧(FrameType 沿用 `ButlerStdin=5`/`ButlerOutput=6`,不新增)
@@ -82,12 +82,13 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 - **`ButlerOutput`**(ce→手机,`sid`=butlerSid,`targetPhoneId`=owner,payload 密文 = JSON + `\n`):cc 吐的每个 SDKMessage 原样转发——`system/init`(就绪)、`assistant`(内容块:text 人话 / tool_use 工具调用)、`user`(含 tool_result)、`result`(一轮完)。手机直接渲染(白盒:工具调用是结构化事件,不再解析文本信封)。
 - **额外 system 事件**(ce 造):
   - `{"type":"system","subtype":"butler_approval","reqId","tool","input"}`:写工具被 `canUseTool` 拦下 → 手机弹审批卡。
+  - `{"type":"system","subtype":"butler_approval_resolved","reqId","resolved":"denied"}`:ce 单方面结掉审批(15s 超时拒 / 管家退出)→ 手机把对应审批卡同步置「已拒绝」,免僵尸卡(显式 approve/deny 由手机发起、本地卡已先标好,不发此事件)。
   - `{"type":"system","subtype":"butler_exit","code":N}`:cc 进程退 → 手机转 `dead`。
   - `{"type":"system","subtype":"butler_nocc","code":-2|127}`:spawn claude 失败(未装/native 缺)→ 手机转 `nocc` + 安装提示。
 
 ### 7.3 生命周期(管家是 ce 侧长驻进程,同终端,扛过手机瞬时断连)
 
-- **phoneLeft / 中继断**:**不杀管家**(只清 E2E 通道 + 终端占用)。手机瞬时断连(后台/切应用致 WS 冻结重连)极常见,管家留活,手机重连后重新握手派生 phoneKeys、按 `owner=phoneId` 续接同一 cc(保留对话历史)。
+- **phoneLeft / 中继断**:**不杀管家**(只清 E2E 通道 + 终端占用)。手机瞬时断连(后台/切应用致 WS 冻结重连)极常见,管家留活,手机重连后重新握手派生 phoneKeys、按 `owner=phoneId` 续接同一 cc(保留对话历史)。**孤儿回收**:phoneLeft 同时挂 6h 计时(`markPhoneLeft`),6h 内手机重连(握手 `markPhoneBack`)取消;到期未归则 `stopAllForPhone` 回收——免「移除服务器后不再回来」致 cc 常驻泄漏。
 - **复用**:`butlerStart` 先 `sidForPhone(srcPhone)` 查同 owner 活管家 → 命中则返回其 sid(接回带历史上下文的 cc),不二次 spawn。
 - **真死**:cc 进程退 / ce 整体重启 → 管家没了(进程死)→ 手机端超时或 `butler_exit` → 重开 respawn。
 - **多手机**:管家 `owner`=发起 `butlerStart` 的 phoneId;`ButlerOutput` 只定向该 phone(同终端占用语义);一机一管家。

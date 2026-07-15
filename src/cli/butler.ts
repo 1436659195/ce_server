@@ -18,6 +18,9 @@ import { makeButlerTools, type ToolDeps } from './butler-tools'
 const BUTLER_CWD = '/tmp/ce-butler-cwd'
 /** 写类工具(非 allowedTools)走手机审批;15s 不答 → 自动拒。 */
 const APPROVAL_TIMEOUT_MS = 15000
+/** 孤儿管家回收:phoneLeft 后该手机 6h 不回来 → 回收其管家(免「移除服务器」后 ce 端 cc 常驻泄漏)。
+ *  6h 兼顾「杀 app 过夜后重开仍复用上下文」;6h 内重连由 markPhoneBack 取消计时。 */
+const RECLAIM_MS = 6 * 60 * 60 * 1000
 /**
  * 启动即喂的首条消息。★ 必要:SDK 的 query 在 prompt 为空队列时【不会 boot cc、不发 system/init】
  * (探针实测:空队列 70s 零事件;seed 一条后 init 1.1s 到)。所以 start 时必须 seed 一条触发 cc 启动。
@@ -90,6 +93,8 @@ const READ_TOOLS = new Set(['mcp__ce-butler__list_terminals', 'mcp__ce-butler__r
 
 export class ButlerManager {
   private procs = new Map<string, ButlerProc>()
+  /** 孤儿回收计时:phoneId → 计时器。phoneLeft 起计时、重连(markPhoneBack)清。 */
+  private reclaimTimers = new Map<string, ReturnType<typeof setTimeout>>()
   constructor(private readonly opts: ButlerOpts) {}
 
   /** 启动/复用一个管家(按 owner 一机一管家)。返回 butlerSid。 */
@@ -157,9 +162,25 @@ export class ButlerManager {
       Buffer.from(JSON.stringify({ type: 'system', subtype: 'butler_approval', reqId, tool: toolName, input }) + '\n', 'utf8'),
     )
     return new Promise((resolve) => {
-      const timer = setTimeout(() => { if (proc.approvals.delete(reqId)) resolve({ behavior: 'deny', message: '审批超时(15s 未答)' }) }, APPROVAL_TIMEOUT_MS)
+      // 超时拒时【同步通知手机】:否则手机侧审批卡不知、变僵尸卡(用户后点「允许」显示「已发送」
+      //   但 ce 早已 delete、cc 实际拿到的是拒绝)。resolved=denied 让手机卡置「已拒绝」。
+      const timer = setTimeout(() => {
+        if (proc.approvals.delete(reqId)) {
+          this.sendApprovalResolved(proc, reqId, 'denied')
+          resolve({ behavior: 'deny', message: '审批超时(15s 未答)' })
+        }
+      }, APPROVAL_TIMEOUT_MS)
       proc.approvals.set(reqId, { input, resolve, timer })
     })
+  }
+
+  /** 回灌审批结果给手机(超时 / 管家退出时 ce 单方面结掉 pending → 手机卡须同步,免僵尸卡)。
+   *  显式 approve/deny 不走这——那是手机发起、本地卡已先标好。 */
+  private sendApprovalResolved(proc: ButlerProc, reqId: string, resolved: 'approved' | 'denied'): void {
+    this.opts.onOutput(
+      proc.sid, proc.owner,
+      Buffer.from(JSON.stringify({ type: 'system', subtype: 'butler_approval_resolved', reqId, resolved }) + '\n', 'utf8'),
+    )
   }
 
   /** 手机审批响应(ButlerStdin 来)→ 解对应 pending。 */
@@ -187,7 +208,12 @@ export class ButlerManager {
     this.procs.delete(proc.sid)
     proc.stopping = true
     proc.queue.close()
-    for (const [, a] of proc.approvals) { clearTimeout(a.timer); a.resolve({ behavior: 'deny', message: '管家退出' }) }
+    // pending 审批随管家退出一并结掉 + 同步通知手机(否则手机卡变僵尸)。
+    for (const [rid, a] of proc.approvals) {
+      clearTimeout(a.timer)
+      this.sendApprovalResolved(proc, rid, 'denied')
+      a.resolve({ behavior: 'deny', message: '管家退出' })
+    }
     proc.approvals.clear()
     this.opts.onExit(proc.sid, proc.owner, code)
   }
@@ -209,6 +235,30 @@ export class ButlerManager {
   }
   hasForPhone(phoneId: string): boolean { return this.sidForPhone(phoneId) !== null }
   get size(): number { return this.procs.size }
+
+  /** phoneLeft:手机断连 → 给其管家挂 6h 回收计时(防「移除服务器」后孤儿 cc 常驻泄漏)。
+   *  手机瞬时断连(后台/切应用致 WS 冻结)极常见,故不立即杀;6h 内重连(markPhoneBack)取消。
+   *  手机重连后会 butlerStart 复用同一 cc(保留上下文),前提是计时未到期。 */
+  markPhoneLeft(phoneId: string): void {
+    if (!this.hasForPhone(phoneId)) return
+    if (this.reclaimTimers.has(phoneId)) return
+    const t = setTimeout(() => {
+      this.reclaimTimers.delete(phoneId)
+      if (this.hasForPhone(phoneId)) {
+        this.stopAllForPhone(phoneId)
+        console.log(`[ce:butler] phone ${phoneId} ${Math.round(RECLAIM_MS / 60000)}min 未归,回收其管家(免孤儿常驻)`)
+      }
+    }, RECLAIM_MS)
+    this.reclaimTimers.set(phoneId, t)
+  }
+  /** 手机重连(握手)→ 取消该 phone 的回收计时(管家续用、保留上下文)。 */
+  markPhoneBack(phoneId: string): void {
+    const t = this.reclaimTimers.get(phoneId)
+    if (t) {
+      clearTimeout(t)
+      this.reclaimTimers.delete(phoneId)
+    }
+  }
 }
 
 // 仅测用导出(单测验 InputQueue 的有序 + close 收尾)。
