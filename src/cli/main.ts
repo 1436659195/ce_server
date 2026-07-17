@@ -23,6 +23,8 @@ import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { ButlerManager } from './butler'
+import { ApprovalDispatcher } from './approval'
+import { generateHooksConfig, handleHookBody } from './cc-hooks'
 import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
@@ -202,6 +204,26 @@ async function resolveClaudeBin(): Promise<string> {
   return 'claude'
 }
 
+/**
+ * 写 ~/.ce/cc-settings.json(Claude Code hooks 配置,指向 ce 本地 hook 端点)+ 打印启动指引。
+ * ce **不 spawn claude**:CC 由用户在终端里起 —— 这样 CC 可被电脑开 Jupyter Lab 接管(同终端同 CC),
+ * 与管家(ce 托管 Agent SDK)区分。ce 只提供 hooks 配置 + 审批/转发管道。
+ */
+function writeCcSettings(port: number): void {
+  const url = `http://127.0.0.1:${port}/hook`
+  const cfg = generateHooksConfig({ url })
+  try {
+    const ceDir = join(homedir(), '.ce')
+    mkdirSync(ceDir, { recursive: true })
+    writeFileSync(join(ceDir, 'cc-settings.json'), JSON.stringify(cfg, null, 2))
+    console.log('[ce] 已生成 CC hooks 配置:~/.ce/cc-settings.json')
+    console.log('[ce] 启动 CC 移动审查:在终端里跑  claude --settings ~/.ce/cc-settings.json')
+    console.log('[ce]   (PreToolUse 写/执行类 → 手机审批;PostToolUse → 手机审查事件)')
+  } catch {
+    /* 写失败→忽略(用户可手抄 hooks 配置;审查功能可选,不影响终端/文件/管家) */
+  }
+}
+
 async function main(): Promise<void> {
   const relayUrl = arg('relay') ?? loadConfig().relay
   if (!relayUrl) {
@@ -265,6 +287,68 @@ async function main(): Promise<void> {
   })
   let qrPrinted = false
   let reconnectDelay = 2000
+
+  // ── CC 移动审查楔子(M25 通用审批 + M26 CC hooks 本地接收器)───────────────────────
+  // CC 跑在被控机终端里(非 ce 托管),ce 写 hooks 配置指向本地端点:
+  //   PreToolUse(写/执行类)→ blocking 等手机审批;PostToolUse(全部)→ 即发事件给手机渲染。
+  // 通用(dispatcher / AgentEvent / resolveApproval RPC)= agent 无关;CC 专属(hooks 配置/解析)= cc-hooks.ts。
+  /** 广播一条 AgentEvent 给该 ce 上所有已配对手机。
+   *  v1 审查楔子:事件/审批请求不定向单机 —— 该 ce 上所有授权手机都可见(多手机任一可审/批,先到先得)。 */
+  function broadcastAgentEvent(plaintext: Uint8Array, sid?: string): void {
+    for (const [phoneId, info] of phoneKeys) {
+      sendFrame({ type: FrameType.AgentEvent, sid, targetPhoneId: phoneId, payload: seal(info.sharedKey, plaintext) })
+    }
+  }
+  const approvals = new ApprovalDispatcher({
+    // 审批请求 → 包成 AgentEvent 广播(PreToolUse 事件 = 手机审批卡数据源:tool+input 即够渲染)。
+    onPending: (req) =>
+      broadcastAgentEvent(
+        enc.encode(
+          JSON.stringify({ kind: 'PreToolUse', reqId: req.reqId, terminalId: req.terminalId, tool: req.tool, input: req.input }),
+        ),
+      ),
+    // resolved(手机决策 / 超时 / cancelAll)→ 广播通知,手机同步/清卡(多手机下他机卡也清)。
+    onResolved: (reqId, resolved) =>
+      broadcastAgentEvent(enc.encode(JSON.stringify({ kind: 'approval_resolved', reqId, resolved }))),
+    // 55s < CC PreToolUse hook 默认 60s 超时:ce 先于 CC 结掉,手机卡不僵尸、hook 不被 CC 强杀成 block。
+    timeoutMs: 55_000,
+  })
+
+  // CC hooks 本地接收器:Bun.serve 监听空闲端口,curl POST /hook → handleHookBody。
+  // listen(0) 让 OS 分配端口(避免固定端口被占),拿到实际端口后写进 hooks 配置;只听 127.0.0.1(hook
+  // 命令在本机跑,审批端点绝不应对外暴露)。启动失败不致命:审查功能不可用,终端/文件/管家照常。
+  try {
+    const hookServer = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      async fetch(req) {
+        if (req.method !== 'POST') return new Response('method not allowed', { status: 405 })
+        const raw = await req.text()
+        // PreToolUse → approvals.request 阻塞 55s 等手机 → 回 permissionDecision;
+        // 其余 → 广播 AgentEvent 即发 → 回空放行。非法 body → 回空(绝不卡 CC)。
+        const resp = await handleHookBody(raw, {
+          requestApproval: (ev) => approvals.request(undefined, ev.tool ?? 'unknown', ev.input ?? {}),
+          emitEvent: (ev) =>
+            broadcastAgentEvent(
+              enc.encode(
+                JSON.stringify({ kind: ev.hook, tool: ev.tool, input: ev.input, sessionId: ev.sessionId, cwd: ev.cwd }),
+              ),
+            ),
+        })
+        return new Response(JSON.stringify(resp), { headers: { 'content-type': 'application/json' } })
+      },
+    })
+    const hookPort = hookServer.port
+    if (hookPort !== undefined) {
+      console.log(`[ce] CC hooks 接收器监听 127.0.0.1:${hookPort}(PreToolUse 审批 / PostToolUse 转发)`)
+      writeCcSettings(hookPort)
+    }
+    process.on('SIGINT', () => {
+      try { hookServer.stop() } catch { /* 已停 */ }
+    })
+  } catch (e) {
+    console.warn('[ce] CC hooks 接收器启动失败(审查功能不可用,终端/文件/管家不受影响):', (e as Error).message)
+  }
 
   function sendFrame(f: Frame): void {
     ws?.send(dec.decode(encodeFrame(f)))
@@ -596,6 +680,13 @@ async function main(): Promise<void> {
           } else if (req.op === 'butlerStop' && req.sid) {
             butlers.stop(req.sid)
             resp = { ok: true }
+          } else if (req.op === 'resolveApproval' && (req as { reqId?: string }).reqId) {
+            // 手机人审回传:解对应 pending 审批(通用,agent 无关)。decision 缺省 deny。
+            // 未命中也回 ok(幂等:超时后迟到的响应 / 别的手机先解过)。
+            const reqId = (req as { reqId?: string }).reqId!
+            const decision = (req as { decision?: 'allow' | 'deny' }).decision
+            const hit = approvals.resolve(reqId, decision === 'allow' ? 'allow' : 'deny')
+            resp = { ok: true, data: { resolved: hit } }
           } else {
             resp = await handleRpc(jupyter, req)
           }
@@ -673,6 +764,7 @@ async function main(): Promise<void> {
       console.log(`[ce] 中继断开,${reconnectDelay}ms 后重连`)
       phoneKeys.clear() // 中继断了:所有 phone 通道失效,重连后手机重新握手派生
       terminalOwner.clear() // 占用随连接重置(手机重连后重新 attach/tryAcquire)
+      approvals.cancelAll('deny') // 挂起的 hook 审批全拒:手机此刻不可达,deny 让 CC 早结(不干等 55s 超时)
       // 【不杀管家】(同 phoneLeft 理由:管家是 ce 侧长驻进程)。中继重连后手机也重连,管家按 owner 续接;
       //   ce 若整体重启则进程死、管家自然没了,手机端会超时→重开 respawn(useButler.open 见 dead 即重建)。
       setTimeout(connect, reconnectDelay)

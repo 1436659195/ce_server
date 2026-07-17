@@ -92,3 +92,61 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 - **复用**:`butlerStart` 先 `sidForPhone(srcPhone)` 查同 owner 活管家 → 命中则返回其 sid(接回带历史上下文的 cc),不二次 spawn。
 - **真死**:cc 进程退 / ce 整体重启 → 管家没了(进程死)→ 手机端超时或 `butler_exit` → 重开 respawn。
 - **多手机**:管家 `owner`=发起 `butlerStart` 的 phoneId;`ButlerOutput` 只定向该 phone(同终端占用语义);一机一管家。
+
+## 8. AgentEvent 帧(ce→手机,agent 结构化事件;CC 审查楔子用)
+
+`FrameType.AgentEvent = 7`(**新增,加在 enum 末尾**,不破坏 0-6)。ce→手机,载荷密文 = agent 事件 JSON。
+**ce 当哑管道**:hub 只转发、不解析事件语义(CC hooks 格式等 agent 专属知识在 ce CLI 的 hooks 层 + 手机插件,不在中继)。
+
+- 用途:CC 跑在被控机终端里,hooks(PreToolUse / PostToolUse)捕获结构化事件 → ce CLI 包成 AgentEvent 帧发中继 → hub 透传 → 手机 CC 审查插件渲染(审批卡 / diff)。
+- 路由:同 TermOutput —— cli→phone,按 `targetPhoneId` 定向或广播;hub 零信任只转发密文。
+- 载荷(JSON,密文):`{ kind:'PreToolUse'|'PostToolUse'|'Result'|..., tool?, input?, ... }`(具体 schema 由 ce CLI hooks 层 + 手机插件约定,中继不关心)。
+- **此帧编号必须与手机端 `ce-platform/src/core/connection/relay/frame.ts` 同步**:0-6 一致,AgentEvent=7(改 enum 数字 = 破坏互通)。
+
+## 9. 通用审批派发(blocking approval round-trip,**非 CC 专属**)
+
+被控机上某 agent(如终端里跑的 CC)要做写操作、需人工放行 → **blocking 审批**。ce 当通用哑管道:
+`ApprovalDispatcher`(`src/cli/approval.ts`)只管 reqId 配对 + 超时 + 取消,**不知「CC / PreToolUse / diff」**。agent 专属
+知识住 `cc-hooks.ts` + 手机插件。审批请求/响应仍是 E2E 加密帧内 JSON,中继只转密文。
+
+**复用现成帧,零新帧类型**(对齐 §8 + §5 RPC):
+
+1. **ce→手机 审批请求** = `AgentEvent` 帧(=7),载荷密文 JSON:`{ kind:'PreToolUse', reqId, terminalId?, tool, input }`。
+   - PreToolUse 本就是 agent 事件 —— 审批请求即「带 reqId 的 PreToolUse 事件」。手机插件据 `tool`+`input` 渲染审批卡
+     (如 Write → 读旧文件算 diff;Bash → 显示命令)。`reqId` 是 ce 生成、用于回程配对。
+2. **手机→ce 审批响应** = `RPCReq` 帧(=2),载荷密文 JSON:`{ op:'resolveApproval', reqId, decision:'allow'|'deny' }`。
+   - ce 内联处理(同 `listTerminals`/`butlerStart`,需 dispatcher 上下文、非 JupyterClient):`approvals.resolve(reqId, decision)`。
+   - ce 回 `RPCResp { ok:true, data:{ resolved:boolean } }`。`resolved:false` = 未命中(幂等:超时后迟到 / 别的手机先解过)→ 不报错。
+3. **ce→手机 resolved 通知** = `AgentEvent` 帧,载荷:`{ kind:'approval_resolved', reqId, resolved:'approved'|'denied' }`。
+   - ce 在**任何**结掉 pending 时发(手机人审 resolve / 超时 / cancelAll)。用途:多手机共连时,**没决策的那台手机**
+     仍挂着的审批卡要同步清掉(发起方本地卡已先标、收到是幂等 no-op)。
+
+**超时 / 取消**(防 hook 永久挂起):
+- dispatcher 默认 55s 未答 → 自动 deny + 发 `approval_resolved{denied}`。55s < CC PreToolUse hook 默认 60s 超时:ce 先于 CC 结掉,
+  手机卡不僵尸、hook 不被 CC 强杀成 block。
+- **中继断**(`ws.on('close')`):`approvals.cancelAll('deny')` —— 手机此刻不可达,全拒让 agent 早结(不干等 55s)。重连后新审批重来。
+
+**`trustWindowSec`(信任窗口)**:手机可能带「允许 N 秒内同类免再问」→ 这是**手机插件侧**缓存语义,ce 不持状态、不解析。
+回程 RPC 里可有 `trustWindowSec?` 字段,ce 透传忽略(未来若要 ce 端缓存再加,目前 YAGNI)。
+
+## 10. CC hooks 层(CC 专属知识住 ce CLI 这层;CLI 编排,非中继)
+
+CC(Claude Code)跑在被控机**终端里**(非 ce 托管进程 —— 区别于管家 butler 的 Agent SDK)。ce 在用户启动 `claude` **前**把
+hooks 配置写到 `~/.ce/cc-settings.json`,指向 ce 的本地 hook 接收端点。CC 触发 hook → `curl` 把事件 JSON POST 给 ce →
+ce 按 §9 / §8 处理。**ce 不 spawn claude**:CC 由用户在终端起(可被电脑开 Jupyter Lab 接管、同终端同 CC)。
+
+- **hooks 配置生成**(`generateHooksConfig`,`src/cli/cc-hooks.ts`):写 `.claude/settings.json` 形态 ——
+  `PreToolUse`(matcher = `Write|Edit|MultiEdit|NotebookEdit|Bash`,写/执行类需审批;读类 Read/Grep/Glob 不拦截,对齐管家 READ_TOOLS)
+  + `PostToolUse`(matcher = `''`,全转发)。hook 命令 = `curl -s --data-binary @- -X POST http://127.0.0.1:<port>/hook`
+  (读 stdin = CC hook 事件 JSON;stdout = ce 响应体 → PreToolUse 时即 permissionDecision,CC 据此 allow/deny)。
+- **hook 接收器**(`main.ts` 用 `Bun.serve`,只听 `127.0.0.1`、`port:0` 让 OS 分配空闲端口):
+  - `PreToolUse` → `handleHookBody` 调 `approvals.request()`(§9,阻塞 55s 等手机)→ 回 CC 期望的
+    `{ hookSpecificOutput:{ hookEventName:'PreToolUse', permissionDecision:'allow'|'deny', permissionDecisionReason? } }`。
+  - 其余(PostToolUse 等)→ 包成 AgentEvent(§8)即发广播 → 回 `{}`(CC 放行)。
+  - 非法 body → 回 `{}`(绝不卡 CC)。
+- **CC hook stdin schema**(`parseHookEvent`):`{ hook_event_name, tool_name?, tool_input?, session_id?, cwd? }` → 归一化
+  `{ hook, tool?, input?, sessionId?, cwd? }`。`hook_event_name` 缺失 → null(放行)。
+- **边界**:本层知「CC 的 hook stdin 字段、CC 期望的 permissionDecision 响应体」。换 codex/opencode 只换本文件的
+  解析/响应格式,`ApprovalDispatcher`(§9)+ AgentEvent(§8)+ 中继零透传不动 —— 这正是「ce 当哑管道、agent 知识住边缘」。
+- **手机端对齐**:`PreToolUse` 的 `tool`+`input` 走 §8 AgentEvent 给手机插件渲染(M27 CC 审查插件);审批回程走 §9 `resolveApproval`。
+  手机端 frame.ts 只需认 AgentEvent=7(已在 §8 对齐),**无新帧**。

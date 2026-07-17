@@ -19,6 +19,7 @@ export enum FrameType {
   Control, // 控制帧(配对确认、resize、ping)
   ButlerStdin, // 手机→ce:管家 cc 的 stdin(stream-json user 帧字节)
   ButlerOutput, // ce→手机:管家 cc 的 stdout/stderr 字节
+  AgentEvent, // 7 ce→手机:agent 结构化事件(CC hooks 等,通用);hub 零信任透传、不解析;编号与手机端 ce-platform 同步
 }
 
 export interface Frame {

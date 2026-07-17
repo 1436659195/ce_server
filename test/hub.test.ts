@@ -182,3 +182,25 @@ test('phone 断且 cli 不在线 → 不抛(无 phoneLeft 可发)', () => {
   hub.onClose(cli.ws) // cli 先断
   expect(() => hub.onClose(p1.ws)).not.toThrow() // phone 再断,无 cli 可通知,不抛
 })
+
+// ── AgentEvent(CC 审查楔子,spec §8)─────────────────────────────────────────
+// hub 是零信任哑管道:agent 事件帧与其他 cli→phone 帧一样透传,hub 不解析事件语义。
+test('AgentEvent 帧 cli→phone 透传(hub 不解析 agent 事件语义)', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const phone = fakeWs()
+  const { sid, token } = hub.register('c1', cli.ws)
+  hub.joinPhone(sid, token, phone.ws, 'p1')
+  const frame = encodeFrameStr({
+    type: FrameType.AgentEvent,
+    sid: 't1',
+    payload: new Uint8Array([1, 2, 3]), // 密文,hub 不解密
+  })
+  hub.onMessage(cli.ws, frame)
+  expect(phone.sent).toEqual([frame]) // 原样透传
+  expect(cli.sent).toEqual([]) // 不回弹发送方
+})
+
+test('AgentEvent wire 编号=7(与手机端 ce-platform 同步,改了就破坏互通)', () => {
+  expect(FrameType.AgentEvent).toBe(7)
+})
