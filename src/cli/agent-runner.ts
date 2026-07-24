@@ -106,8 +106,8 @@ interface AgentProc {
 }
 
 export interface AgentRunnerOpts {
-  /** SDK 事件 → 手机(回调;main.ts 接到后加密成 AgentEvent 帧发给 owner)。 */
-  onEvent: (owner: string, event: AgentEvent) => void
+  /** SDK 事件 → 手机(回调;main.ts 接到后加密成 AgentEvent 帧发给 owner)。带 sid 让手机 demux 多 CC tab。 */
+  onEvent: (owner: string, sid: string, event: AgentEvent) => void
   onExit: (sid: string, owner: string, code: number | null) => void
   /** resolveClaudeBin() 结果;SDK 经 pathToClaudeCodeExecutable 复用系统 claude(连带 auth)。 */
   claudeBin: string
@@ -123,16 +123,11 @@ export class AgentRunner {
   private reclaimTimers = new Map<string, ReturnType<typeof setTimeout>>()
   constructor(private readonly opts: AgentRunnerOpts) {}
 
-  /** 启动/复用一个 agent 会话(按 owner 一机一个)。返回 sid(形如 cc-xxxx)。懒启动:仅注册,
-   *  首条 writeStdin 才真起 query(免 BOOTSTRAP「就绪」噪声)。 */
-  /** 启动/复用 agent 会话。rel = 用户在文件栏选的子目录(jupyter root_dir 相对,去前导 /);
-   *  cwd = opts.cwd(jupyter root_dir)+ rel。rel 空 → root_dir。 */
+  /** 启动一个 agent 会话(每次新建 sid —— 一机可多 CC,按 session 区分,**不复用**)。返回 sid(形如 cc-xxxx)。
+   *  懒启动:仅注册,首条 writeStdin 才真起 query(免 BOOTSTRAP「就绪」噪声)。
+   *  rel = 用户在文件栏选的子目录(jupyter root_dir 相对,去前导 /);cwd = opts.cwd(jupyter root_dir)+ rel。rel 空 → root_dir。
+   *  sidForPhone 保留给 markPhoneLeft/stopAllForPhone 用(按 owner 遍历,对多 agent 仍正确)。 */
   start(owner: string, rel?: string): string {
-    const existing = this.sidForPhone(owner)
-    if (existing) {
-      console.log(`[ce:agent-runner] 复用现有 agent sid=${existing} (owner=${owner})`)
-      return existing
-    }
     const sid = `cc-${randomBytes(4).toString('hex')}`
     const cwd = rel ? path.resolve(this.opts.cwd, rel) : this.opts.cwd
     this.procs.set(sid, { sid, owner, cwd, queue: new InputQueue(), approvals: new Map(), started: false, stopping: false })
@@ -181,7 +176,7 @@ export class AgentRunner {
       for await (const msg of conversation) {
         if (proc.stopping) break
         const events = mapSdkMessageToEvents(msg)
-        for (const ev of events) this.opts.onEvent(proc.owner, ev)
+        for (const ev of events) this.opts.onEvent(proc.owner, proc.sid, ev)
         console.log(`[ce:agent-runner] ${proc.sid} SDK msg type=${(msg as { type?: string }).type} → ${events.length} 事件已推`)
       }
       console.log(`[ce:agent-runner] ${proc.sid} 对话流正常结束`)
@@ -218,7 +213,7 @@ export class AgentRunner {
   ): Promise<{ behavior: 'allow'; updatedInput: Record<string, unknown> } | { behavior: 'deny'; message: string }> {
     const reqId = randomBytes(4).toString('hex')
     console.log(`[ce:agent-runner] ${proc.sid} 发 approval-request reqId=${reqId} tool=${toolName} → 等手机审批(无超时)`)
-    this.opts.onEvent(proc.owner, { kind: 'approval-request', reqId, callId, tool: toolName, input })
+    this.opts.onEvent(proc.owner, proc.sid, { kind: 'approval-request', reqId, callId, tool: toolName, input })
     return new Promise((resolve) => {
       proc.approvals.set(reqId, { input, resolve })
     })
@@ -231,7 +226,7 @@ export class AgentRunner {
       if (a) {
         console.log(`[ce:agent-runner] ${proc.sid} 收到手机审批 reqId=${reqId} → ${allow ? 'allow' : 'deny'}`)
         proc.approvals.delete(reqId)
-        this.opts.onEvent(proc.owner, { kind: 'approval-resolved', reqId, resolved: allow ? 'approved' : 'denied' })
+        this.opts.onEvent(proc.owner, proc.sid, { kind: 'approval-resolved', reqId, resolved: allow ? 'approved' : 'denied' })
         a.resolve(allow ? { behavior: 'allow', updatedInput: a.input } : { behavior: 'deny', message: '用户拒绝' })
         return true
       }
@@ -253,7 +248,7 @@ export class AgentRunner {
     proc.stopping = true
     proc.queue.close()
     for (const [rid, a] of proc.approvals) {
-      this.opts.onEvent(proc.owner, { kind: 'approval-resolved', reqId: rid, resolved: 'denied' })
+      this.opts.onEvent(proc.owner, proc.sid, { kind: 'approval-resolved', reqId: rid, resolved: 'denied' })
       a.resolve({ behavior: 'deny', message: 'agent 退出' })
     }
     proc.approvals.clear()
@@ -274,6 +269,18 @@ export class AgentRunner {
   /** 列所有 agent sid(listTerminals 用:让手机能恢复 cc session)。 */
   sids(): string[] {
     return [...this.procs.keys()]
+  }
+  /** 列某 phone 的所有 agent(sid + jupyter 相对 cwd)—— listTerminals 用:按 owner 过滤(防他机 cc 串入)
+   *  + 补 cwd 给手机 restore(不再硬编码 '/')。cwd 转 jupyter 相对(去 root 前缀 + 前导 /),与手机 createTerminal 传的格式一致。 */
+  forPhone(phoneId: string): { sid: string; cwd: string }[] {
+    const root = this.opts.cwd
+    const out: { sid: string; cwd: string }[] = []
+    for (const p of this.procs.values()) {
+      if (p.owner !== phoneId) continue
+      const rel = p.cwd === root ? '/' : p.cwd.startsWith(root + '/') ? '/' + p.cwd.slice(root.length + 1) : '/'
+      out.push({ sid: p.sid, cwd: rel })
+    }
+    return out
   }
 
   /** phoneLeft:6h 回收计时(防「移除服务器」后孤儿 cc 常驻泄漏;瞬时断连不立即杀)。 */

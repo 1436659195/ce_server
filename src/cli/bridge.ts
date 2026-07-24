@@ -60,6 +60,8 @@ export interface RemoteTerminalInfo {
   name: string
   lastActivityAt: number | null
   managed: boolean
+  /** 启动目录(jupyter 相对路径,带前导 /);cc agent 由 ce 补返(让手机 restore 不硬编码 /),jupyter 终端无此字段。 */
+  cwd?: string
 }
 
 /**

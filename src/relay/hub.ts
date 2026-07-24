@@ -16,7 +16,14 @@ interface Session {
   phones: Map<RelayWS, string>
   phoneBuffer: string[] // 无 phone 在线时,cli 发来的消息暂存;首个 phone 连上即补发给它
   cliBuffer: string[] // cli 断线时,phone 发来的消息暂存(防御性;cli 通常常驻)
+  // 定向帧(targetPhoneId 指定)在目标 phone 离线时的 per-phone 缓冲(治「锁屏丢回复」)。
+  // key=phoneId,value=待补发的原始 wire 字符串。phone 重连(joinPhone)补发 + 清空。
+  // 加上限(DIRECTED_BUFFER_MAX)防长任务 + 长断连 OOM,超了丢最早。
+  directedBuffer: Map<string, string[]>
 }
+
+/** per-phone 定向帧缓冲上限(条数):防长任务 + 长断连 OOM。AgentEvent 帧 ~1KB,500 条约 0.5MB/phone。 */
+const DIRECTED_BUFFER_MAX = 500
 
 interface PersistEntry {
   sid: string
@@ -96,7 +103,7 @@ export class Hub {
     const token = entry.token
     let s = this.sessions.get(sid)
     if (!s) {
-      s = { sid, token, cli, phones: new Map(), phoneBuffer: [], cliBuffer: [] }
+      s = { sid, token, cli, phones: new Map(), phoneBuffer: [], cliBuffer: [], directedBuffer: new Map() }
       this.sessions.set(sid, s)
     } else {
       s.cli = cli // ce 重连:更新 socket
@@ -118,10 +125,23 @@ export class Hub {
    * phone 连入:校验 token 后绑定(多 phone 共连);绑定前 cli 缓冲的消息补发给该 phone。
    * phoneId 为手机持久身份(来自 URL query),用于 cli→phone 定向与 phone→cli 来源标注。
    * token 错返回 false。
+   *
+   * **同 phoneId 重连踢旧**(治「杀 app 重开 → RPC 超时」):phoneId 持久,手机杀进程后重开用同一
+   * phoneId 重连,但旧 WS 可能仍在 s.phones(TCP 关闭检测慢 / 前台服务保活)。若不踢:
+   *  ① cli→phone 按 phoneId 定向时 for-loop 先命中【死的旧 WS】(Map 插入序,旧在前)→ oldWs.send
+   *     静默失败 + return → 新手机收不到 RPCResp → 15s 超时(首次无旧 WS 故正常)。
+   *  ② 旧 WS 迟到的 onClose 会发 phoneLeft(phoneId)→ ce 清掉同 phoneId 的【新】E2E 通道。
+   * 故 joinPhone 先删同 phoneId 的旧 WS + 其 wsMeta,再绑新的:onClose(旧)成 no-op,路由只命中新 WS。
    */
   joinPhone(sid: string, token: string, phone: RelayWS, phoneId: string): boolean {
     const s = this.sessions.get(sid)
     if (!s || s.token !== token) return false
+    for (const [ws, pid] of s.phones) {
+      if (pid === phoneId && ws !== phone) {
+        s.phones.delete(ws)
+        this.wsMeta.delete(ws) // 连带删 meta:旧 WS 迟到 onClose → wsMeta 无它 → no-op,不发 phoneLeft
+      }
+    }
     s.phones.set(phone, phoneId)
     this.wsMeta.set(phone, { sid, role: 'phone', phoneId })
     for (const m of s.phoneBuffer) {
@@ -132,6 +152,19 @@ export class Hub {
       }
     }
     s.phoneBuffer = []
+    // 补发该 phone 离线期间缓冲的定向帧(AgentEvent=claude 回复/审批 等,治「锁屏丢回复」)。
+    // 按 phoneId 精确取(不会泄露给他机 phone),补发后清空。
+    const pending = s.directedBuffer.get(phoneId)
+    if (pending) {
+      for (const m of pending) {
+        try {
+          phone.send(m)
+        } catch {
+          /* 客户端 ws 已关 */
+        }
+      }
+      s.directedBuffer.delete(phoneId)
+    }
     return true
   }
 
@@ -161,7 +194,12 @@ export class Hub {
             return
           }
         }
-        // 目标 phone 不在线:丢弃(瞬态竞态;按 targetPhoneId 缓冲会泄露给后来的非目标 phone,YAGNI)
+        // 目标 phone 不在线:按 targetPhoneId 缓冲(per-phoneId 隔离,只补发给本人,不泄露给他机),
+        // joinPhone 时补发。治「手机锁屏/切后台断连 → claude 回复/审批丢失」(AgentEvent/RPCResp 都是定向帧)。
+        const buf = s.directedBuffer.get(targetPhoneId) ?? []
+        buf.push(data)
+        if (buf.length > DIRECTED_BUFFER_MAX) buf.shift() // 超上限丢最早,防长任务+长断连 OOM
+        s.directedBuffer.set(targetPhoneId, buf)
       } else {
         // 广播给所有 phone;无 phone 在线则缓冲(首个 phone 连上补发)
         if (s.phones.size > 0) {

@@ -204,3 +204,83 @@ test('AgentEvent 帧 cli→phone 透传(hub 不解析 agent 事件语义)', () =
 test('AgentEvent wire 编号=7(与手机端 ce-platform 同步,改了就破坏互通)', () => {
   expect(FrameType.AgentEvent).toBe(7)
 })
+
+// 治「杀 app 重开 → RPC 超时」:phoneId 持久,手机重连用同一 phoneId,但旧 WS 可能残留。
+// joinPhone 必须踢掉同 phoneId 的旧 WS,否则 cli→phone 按 phoneId 定向会先命中死的旧 WS。
+test('同 phoneId 重连踢旧 WS:cli 按 phoneId 定向只到新 WS,旧 WS 收不到', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const oldPhone = fakeWs()
+  const newPhone = fakeWs()
+  const { sid, token } = hub.register('c1', cli.ws)
+  hub.joinPhone(sid, token, oldPhone.ws, 'p1') // 首次连(旧 WS)
+  hub.joinPhone(sid, token, newPhone.ws, 'p1') // 重连(同 phoneId,新 WS)
+
+  // cli 按 phoneId=p1 定向发一条(模拟 ce 回 RPCResp)
+  const frame = new TextDecoder().decode(
+    encodeFrame({ type: FrameType.RPCResp, targetPhoneId: 'p1', reqId: 'r1', payload: new Uint8Array([1, 2]) }),
+  )
+  hub.onMessage(cli.ws, frame)
+
+  expect(newPhone.sent).toEqual([frame]) // ★ 新 WS 收到
+  expect(oldPhone.sent).toEqual([]) // ★ 旧 WS 不收(否则新手机 RPC 超时)
+})
+
+test('同 phoneId 重连后:旧 WS 迟到 onClose 不发 phoneLeft(免 ce 误清新通道)', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const oldPhone = fakeWs()
+  const newPhone = fakeWs()
+  const { sid, token } = hub.register('c1', cli.ws)
+  hub.joinPhone(sid, token, oldPhone.ws, 'p1')
+  hub.joinPhone(sid, token, newPhone.ws, 'p1') // 踢掉旧 WS(连带 wsMeta)
+
+  hub.onClose(oldPhone.ws) // 旧 WS 此时才被 TCP 检测到关闭
+  // cli 不应收到 phoneLeft(否则 ce 会清掉同 phoneId 的新 E2E 通道)
+  expect(cli.sent.every((m) => !m.includes('phoneLeft'))).toBe(true)
+  // 新 phone 仍能正常收定向消息
+  const frame = new TextDecoder().decode(
+    encodeFrame({ type: FrameType.RPCResp, targetPhoneId: 'p1', reqId: 'r1', payload: new Uint8Array() }),
+  )
+  hub.onMessage(cli.ws, frame)
+  expect(newPhone.sent).toEqual([frame])
+})
+
+// 治「锁屏/切后台断连 → claude 回复/审批丢失」:定向帧(AgentEvent/RPCResp 带 targetPhoneId)在目标
+// phone 离线时缓冲,重连(joinPhone)补发。旧实现直接丢弃,故锁屏后看不到 claude 回复。
+test('定向帧 phone 离线时缓冲,重连补发(治锁屏丢回复)', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const phone = fakeWs()
+  const { sid, token } = hub.register('c1', cli.ws)
+  hub.joinPhone(sid, token, phone.ws, 'p1')
+  hub.onClose(phone.ws) // phone 离线(锁屏/断连)→ 从 phones 移除
+  // cli 发定向 AgentEvent 给 p1 → p1 不在线 → 缓冲(旧实现会丢)
+  const frame = new TextDecoder().decode(
+    encodeFrame({ type: FrameType.AgentEvent, targetPhoneId: 'p1', payload: new Uint8Array([1, 2, 3]) }),
+  )
+  hub.onMessage(cli.ws, frame)
+  expect(phone.sent).toEqual([]) // 旧 phone 已断,没收到
+  // phone 重连(同 phoneId)→ 补发缓冲的定向帧
+  const phone2 = fakeWs()
+  hub.joinPhone(sid, token, phone2.ws, 'p1')
+  expect(phone2.sent).toHaveLength(1)
+  const got = decodeFrame(new TextEncoder().encode(phone2.sent[0]))
+  expect(got.type).toBe(FrameType.AgentEvent)
+  expect(got.targetPhoneId).toBe('p1')
+})
+
+test('定向帧缓冲有上限:超 DIRECTED_BUFFER_MAX(500)丢最早(防长任务+长断连 OOM)', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const { sid, token } = hub.register('c1', cli.ws)
+  for (let i = 0; i < 510; i++) {
+    const f = new TextDecoder().decode(
+      encodeFrame({ type: FrameType.AgentEvent, targetPhoneId: 'p1', payload: new Uint8Array([i % 256]) }),
+    )
+    hub.onMessage(cli.ws, f) // phone 从未连 → 全缓冲到 directedBuffer['p1']
+  }
+  const phone = fakeWs()
+  hub.joinPhone(sid, token, phone.ws, 'p1')
+  expect(phone.sent.length).toBe(500) // 超上限丢最早 10 条,恰好 500
+})

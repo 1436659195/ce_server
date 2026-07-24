@@ -152,18 +152,38 @@ function toLoopback(url: string): string {
   return url.replace(/:\/\/localhost\b/, '://127.0.0.1')
 }
 
-/** 解析 Jupyter:显式 > 探测 > 引导装 > 启动。 */
+/** 取 url 的 port(无/非法 → '')。用于在同机多 jupyter 里按 port 匹配。 */
+function portOf(url: string): string {
+  try {
+    return new URL(url).port
+  } catch {
+    return ''
+  }
+}
+
+/** 从本机 jupyter 探测结果挑 root_dir(OS 路径)。Jupyter Contents API 不暴露 root_dir,
+ *  只有 `jupyter server list` 输出的 `:: /path` 才是 OS 路径 → 必须靠 detectServers。
+ *  按 port 匹配同机唯一 jupyter;无 port 或不匹配 → 取第一个;空 → fallback process.cwd()。 */
+function pickRoot(servers: { url: string; root: string }[], url: string): string {
+  const port = portOf(url)
+  const byPort = port ? servers.find((s) => portOf(s.url) === port) : undefined
+  return (byPort ?? servers[0])?.root ?? process.cwd()
+}
+
+/** 解析 Jupyter:显式 > 探测 > 引导装 > 启动。返回 root(jupyter root_dir OS 路径,CC 对话 cwd 的 base)。 */
 async function resolveJupyter(
   relayUrl: string
-): Promise<{ baseUrl: string; token: string; stop?: () => void }> {
+): Promise<{ baseUrl: string; token: string; root: string; stop?: () => void }> {
   const explicitUrl = arg('jupyter')
   const explicitToken = arg('jupyter-token')
-  if (explicitUrl && explicitToken) return { baseUrl: toLoopback(explicitUrl), token: explicitToken }
-
   const existing = await detectServers()
+  if (explicitUrl && explicitToken) {
+    // 显式 url/token;root 从本机探测结果取(API 不暴露 root_dir,只有 server list 输出有 OS 路径)。
+    return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root: pickRoot(existing, explicitUrl) }
+  }
   if (existing.length > 0) {
     console.log(`[ce] 探测到 Jupyter:${existing[0].url}(root ${existing[0].root})`)
-    return { baseUrl: toLoopback(existing[0].url), token: existing[0].token }
+    return { baseUrl: toLoopback(existing[0].url), token: existing[0].token, root: existing[0].root }
   }
   console.log('[ce] 未探测到 Jupyter')
   // 自装 Jupyter 前先拦 Python:没 Python 就给指引 + 退出,绝不拖到 pip 报错。
@@ -180,7 +200,8 @@ async function resolveJupyter(
   console.log('[ce] 启动 Jupyter...')
   const { server, stop } = await launchJupyter()
   console.log(`[ce] 已启动 Jupyter:${server.url}`)
-  return { baseUrl: toLoopback(server.url), token: server.token, stop }
+  const live = await detectServers() // 启动后再探一次拿 root_dir
+  return { baseUrl: toLoopback(server.url), token: server.token, root: pickRoot(live, server.url), stop }
 }
 
 /** 探测一个能跑的 claude 二进制。机器上可能装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
@@ -189,7 +210,7 @@ async function resolveJupyter(
 async function resolveClaudeBin(): Promise<string> {
   const explicit = arg('claude-bin')
   if (explicit) return explicit
-  for (const c of ['/usr/bin/claude', '/usr/local/bin/claude', 'claude']) {
+  for (const c of ['claude', '/usr/local/bin/claude', '/usr/bin/claude']) {
     try {
       // timeout 6 防 npx-stub 触发安装挂起;要含版本号且无 native binary 报错才算可用。
       const { stdout } = await pExecFile('sh', ['-c', `timeout 6 "${c}" --version 2>&1`], { timeout: 8000 })
@@ -234,7 +255,7 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
-  const { baseUrl, token, stop } = await resolveJupyter(relayUrl)
+  const { baseUrl, token, root, stop } = await resolveJupyter(relayUrl)
   if (stop) process.on('SIGINT', stop)
 
   // --insecure:容忍自签证书(bun 下 ws 的 rejectUnauthorized 不生效,改设环境变量)
@@ -289,11 +310,11 @@ async function main(): Promise<void> {
   // CC 对话 agent-runner(Agent SDK,「通用口子」):一机一个 cc 会话,跑在 ce 启动目录(= 用户项目)。
   // 与 butler 同源模式但独立(管家是终端监督,CC 对话是项目 coding;两者不共用 proc)。事件走 AgentEvent 帧。
   const agentRunner = new AgentRunner({
-    onEvent: (owner, event) =>
-      encryptThenSend(FrameType.AgentEvent, enc.encode(JSON.stringify(event)), { targetPhoneId: owner }),
+    onEvent: (owner, sid, event) =>
+      encryptThenSend(FrameType.AgentEvent, enc.encode(JSON.stringify(event)), { sid, targetPhoneId: owner }),
     onExit: (sid, _owner, code) => console.log(`[ce:agent-runner] ${sid} 退出(code=${code})`),
     claudeBin,
-    cwd: process.cwd(),
+    cwd: root, // jupyter root_dir(OS 路径):CC 对话 cwd 的 base,手机传的相对路径相对它拼
   })
   let qrPrinted = false
   let reconnectDelay = 2000
@@ -501,18 +522,17 @@ async function main(): Promise<void> {
         try {
           const notice = JSON.parse(dec.decode(raw as Uint8Array)) as { type?: string; phoneId?: string }
           if (notice.type === 'phoneLeft' && notice.phoneId) {
-            phoneKeys.delete(notice.phoneId) // E2E 通道失效(安全:断连后该 phone 密钥不可再用于解密)
+            // 【保留 phoneKeys(sharedKey)】:让 ce 在手机离线期间仍能加密推 AgentEvent 帧 → 中继 per-phone
+            //   缓冲 → 手机重连补发(治「锁屏丢回复」)。sharedKey 配对时建立、持久,重连复用同一把,保留无安全风险
+            //   (中继零信任只转密文、不解密)。重连握手时 phoneKeys 被同 key 覆盖,无残留。
             for (const [tname, owner] of terminalOwner) {
               if (owner === notice.phoneId) terminalOwner.delete(tname) // 终端占用随连接重置
             }
-            // 【不杀管家】。管家是 ce 侧长驻进程,和终端一样——手机瞬时断连(后台/切应用致 WS 冻结重连)极常见,
-            // 此时杀管家会让手机重连后接到一个已死的 sid(stop 不发 butler_exit)→ 发消息无响应、120s 超时
-            // (这正是「接着上次的」开管家后超时的根因)。管家留活,手机重连后重新握手派生 phoneKeys、按
-            // owner=phoneId 续接同一 cc(下次 butlerStart 也由 sidForPhone 复用接回)。
-            // 但「移除服务器后不再回来」会孤儿 cc 常驻泄漏 → 挂 6h 回收计时(重连由 markPhoneBack 取消)。
+            // 【不杀管家/agent】。手机瞬时断连(后台/切应用致 WS 冻结重连)极常见,此时杀进程会让重连后接到
+            //   已死 sid → 发消息无响应。留活,重连后续接同一会话。「移除服务器不回来」→ 6h 回收计时兜底(重连取消)。
             butlers.markPhoneLeft(notice.phoneId)
             agentRunner.markPhoneLeft(notice.phoneId)
-            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道与终端占用(管家/agent 保留,6h 不归则回收)`)
+            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},终端占用已清(管家/agent 留活,sharedKey 保留供中继缓冲补发,6h 不归则回收)`)
           }
         } catch {
           /* 真正的非法帧 → 忽略 */
@@ -614,9 +634,10 @@ async function main(): Promise<void> {
             }))
             // CC 对话 agent 会话(cc-*)不是 Jupyter 终端 → 补进列表让手机恢复(标 managed=true,
             //   occupiedBy=null;手机按持久化的 per-sid type:'cc' 套用,渲染走对话组件而非 xterm)。
-            for (const sid of agentRunner.sids()) {
-              if (!terminals.some((t) => t.name === sid)) {
-                terminals.push({ name: sid, lastActivityAt: Date.now(), managed: true, occupiedBy: null })
+            //   按 owner 过滤(只返本机 cc,防他机串入)+ 补 cwd(手机 restore 不再硬编码 '/')。
+            for (const a of agentRunner.forPhone(srcPhone)) {
+              if (!terminals.some((t) => t.name === a.sid)) {
+                terminals.push({ name: a.sid, lastActivityAt: Date.now(), managed: true, occupiedBy: null, cwd: a.cwd })
               }
             }
             resp = { ok: true, data: { terminals } }
@@ -672,10 +693,10 @@ async function main(): Promise<void> {
           } else if (req.op === 'createTerminal') {
             const termType = (req as { type?: string }).type
             if (termType === 'cc') {
-              // CC 对话:起 ce 端 Agent SDK runner(不开 Jupyter 终端、不 parse TUI)。一机一个 cc 会话,
-              // 复用同 sid(手机重连/重开接回带历史上下文)。返 sid(形如 cc-xxxx)作「终端名」——
-              // 手机据它路由 stdin(TermStdin cc- 分支) + 渲染对话组件(type:'cc')。
-              const sid = agentRunner.sidForPhone(srcPhone) ?? agentRunner.start(srcPhone, (req as { cwd?: string }).cwd)
+              // CC 对话:起 ce 端 Agent SDK runner(不开 Jupyter 终端、不 parse TUI)。一机可多 CC(各目录独立),
+              // 每次 createTerminal 新建一个 agent(不复用)。返 sid(形如 cc-xxxx)作「终端名」——
+              // 手机据它路由 stdin(TermStdin cc- 分支)+ demux agentEvents(帧带 sid)+ 渲染对话组件(type:'cc')。
+              const sid = agentRunner.start(srcPhone, (req as { cwd?: string }).cwd)
               console.log(`[ce] createTerminal(cc) → agentRunner sid=${sid} (phone=${srcPhone})`)
               resp = { ok: true, data: { name: sid } }
             } else {

@@ -95,13 +95,36 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 
 ## 8. AgentEvent 帧(ce→手机,agent 结构化事件;CC 审查楔子用)
 
-`FrameType.AgentEvent = 7`(**新增,加在 enum 末尾**,不破坏 0-6)。ce→手机,载荷密文 = agent 事件 JSON。
-**ce 当哑管道**:hub 只转发、不解析事件语义(CC hooks 格式等 agent 专属知识在 ce CLI 的 hooks 层 + 手机插件,不在中继)。
+`FrameType.AgentEvent = 7`(**加在 enum 末尾**,不破坏 0-6)。ce→手机,载荷密文 = agent 事件 JSON。
+**ce 当哑管道**:hub 只转发、不解析事件语义(agent 专属知识在 ce CLI 的 runner/hooks 层 + 手机插件,不在中继)。
 
-- 用途:CC 跑在被控机终端里,hooks(PreToolUse / PostToolUse)捕获结构化事件 → ce CLI 包成 AgentEvent 帧发中继 → hub 透传 → 手机 CC 审查插件渲染(审批卡 / diff)。
-- 路由:同 TermOutput —— cli→phone,按 `targetPhoneId` 定向或广播;hub 零信任只转发密文。
-- 载荷(JSON,密文):`{ kind:'PreToolUse'|'PostToolUse'|'Result'|..., tool?, input?, ... }`(具体 schema 由 ce CLI hooks 层 + 手机插件约定,中继不关心)。
+- **CC 对话走 AgentRunner**(`src/cli/agent-runner.ts`,§8.1):ce 用 `@anthropic-ai/claude-agent-sdk` 的 `query()`
+  在被控机跑 claude(**不开终端、不 parse TUI**;参考 Happy Coder),把 SDKMessage 映射成下面的结构化事件。
+  手机 CC 对话窗口订阅 → 归约成 4 类消息渲染。这是 CC 对话的正式后端(治旧版「终端跑 claude + strip ANSI 乱码」)。
+- **另一条路:CC hooks**(§10,终端里跑的 claude + hooks 审批):仍保留,事件走同一 AgentEvent 帧(旧 kind)。
+- 路由:cli→phone,按 `targetPhoneId` 定向(AgentRunner)或广播(cc-hooks);hub 零信任只转发密文。
+- **载荷(JSON,密文)—— AgentRunner 产的结构化事件**(权威契约见 `src/shared/agent-events.ts`,
+  与手机 `ce-platform/src/plugins/cc-review/events.ts` 一致):
+  - `{ kind:'turn-start' }` / `{ kind:'turn-end', status:'completed'|'failed', durationMs? }` —— 一轮生命周期。
+  - `{ kind:'text', text }` / `{ kind:'thinking', text }` —— assistant 文本 / 思考(折叠)。
+  - `{ kind:'tool-call-start', callId, tool, input }` —— 工具调用开始(callId = SDK tool_use_id)。
+  - `{ kind:'tool-call-end', callId, result?, isError? }` —— 工具结果(同 callId 配对)。
+  - `{ kind:'approval-request', reqId, callId, tool, input }` —— canUseTool blocking 审批(同 callId 挂工具卡)。
+  - `{ kind:'approval-resolved', reqId, resolved:'approved'|'denied' }` —— 审批结掉(超时/人审/他机先解)。
+  - 向前兼容兜底 `{ kind:string, ... }`:ce 加新 kind 不破老插件(手机 reducer 忽略未知 kind)。
 - **此帧编号必须与手机端 `ce-platform/src/core/connection/relay/frame.ts` 同步**:0-6 一致,AgentEvent=7(改 enum 数字 = 破坏互通)。
+
+### 8.1 AgentRunner(ce 端通用 agent-runner,「口子」)
+
+`src/cli/agent-runner.ts` —— 一机一个 cc 会话(SDK `query()` + 永不结束的 InputQueue → 多轮长驻;跨手机瞬时重连存活)。
+- **懒启动**:首条 `writeStdin`(手机用户消息)才 boot query(免 BOOTSTRAP「就绪」噪声;空队列 cc 不启动,butler 踩过)。
+- **canUseTool 单门**:读类(Read/Grep/Glob/LS/WebSearch/WebFetch/TodoWrite)直接放行;其余 → `approval-request`(§9)问手机;
+  allow 必须回灌 `updatedInput`(否则 SDK ZodError,butler 踩过)。
+- **SDKMessage→AgentEvent 映射**(`mapSdkMessageToEvents`,纯函数,单测覆盖):assistant text/thinking/tool_use →
+  text/thinking/tool-call-start;user tool_result → tool-call-end;result → turn-end;system/status/噪声忽略。
+- **路由接线**(`main.ts`):`createTerminal{type:'cc'}` → `agentRunner.start`(返 `cc-xxxx` sid,非 Jupyter 终端);
+  `TermStdin{sid:cc-*}` → `writeStdin`(剥手机为 exec 加的 `\r`);`resolveApproval` 先查 agent-runner 再查旧 dispatcher;
+  `listTerminals` 补 cc sid 让手机恢复;`deleteTerminal`/`detachTerminal` 对 cc sid 调 `stop`;phoneLeft/Back 镜像孤儿回收。
 
 ## 9. 通用审批派发(blocking approval round-trip,**非 CC 专属**)
 
