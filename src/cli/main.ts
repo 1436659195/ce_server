@@ -23,6 +23,7 @@ import { detectServers } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { ButlerManager } from './butler'
+import { AgentRunner } from './agent-runner'
 import { ApprovalDispatcher } from './approval'
 import { generateHooksConfig, handleHookBody } from './cc-hooks'
 import { TermBuffers } from './term-buffers'
@@ -285,6 +286,15 @@ async function main(): Promise<void> {
     },
     claudeBin,
   })
+  // CC 对话 agent-runner(Agent SDK,「通用口子」):一机一个 cc 会话,跑在 ce 启动目录(= 用户项目)。
+  // 与 butler 同源模式但独立(管家是终端监督,CC 对话是项目 coding;两者不共用 proc)。事件走 AgentEvent 帧。
+  const agentRunner = new AgentRunner({
+    onEvent: (owner, event) =>
+      encryptThenSend(FrameType.AgentEvent, enc.encode(JSON.stringify(event)), { targetPhoneId: owner }),
+    onExit: (sid, _owner, code) => console.log(`[ce:agent-runner] ${sid} 退出(code=${code})`),
+    claudeBin,
+    cwd: process.cwd(),
+  })
   let qrPrinted = false
   let reconnectDelay = 2000
 
@@ -501,7 +511,8 @@ async function main(): Promise<void> {
             // owner=phoneId 续接同一 cc(下次 butlerStart 也由 sidForPhone 复用接回)。
             // 但「移除服务器后不再回来」会孤儿 cc 常驻泄漏 → 挂 6h 回收计时(重连由 markPhoneBack 取消)。
             butlers.markPhoneLeft(notice.phoneId)
-            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道与终端占用(管家保留,6h 不归则回收)`)
+            agentRunner.markPhoneLeft(notice.phoneId)
+            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},已清其 E2E 通道与终端占用(管家/agent 保留,6h 不归则回收)`)
           }
         } catch {
           /* 真正的非法帧 → 忽略 */
@@ -566,6 +577,7 @@ async function main(): Promise<void> {
           const phoneId = srcPhone ?? `anon-${randId(8)}`
           phoneKeys.set(phoneId, { sharedKey, name })
           butlers.markPhoneBack(phoneId) // 手机(重)连 → 取消其孤儿回收计时(管家续用、保留上下文)
+          agentRunner.markPhoneBack(phoneId)
           console.log(`[ce] 手机配对 phoneId=${phoneId}${name ? ` name=${name}` : ''},E2E 通道建立`)
         } catch {
           /* 非法帧 */
@@ -600,68 +612,84 @@ async function main(): Promise<void> {
                 ? (phoneKeys.get(terminalOwner.get(t.name)!)?.name ?? null)
                 : null,
             }))
+            // CC 对话 agent 会话(cc-*)不是 Jupyter 终端 → 补进列表让手机恢复(标 managed=true,
+            //   occupiedBy=null;手机按持久化的 per-sid type:'cc' 套用,渲染走对话组件而非 xterm)。
+            for (const sid of agentRunner.sids()) {
+              if (!terminals.some((t) => t.name === sid)) {
+                terminals.push({ name: sid, lastActivityAt: Date.now(), managed: true, occupiedBy: null })
+              }
+            }
             resp = { ok: true, data: { terminals } }
           } else if (req.op === 'deleteTerminal' && (req as { name?: string }).name) {
             // 手机「关闭终端」:关 ce 端 terminado + Jupyter DELETE,否则杀 app 重开又恢复回来
             const termName = (req as { name?: string }).name!
-            const tws = terms.get(termName)
-            if (tws) {
-              try {
-                tws.close()
-              } catch {
-                /* 已关 */
+            if (termName.startsWith('cc-')) {
+              // CC 对话 agent 会话:停 agent-runner(非 Jupyter 终端,无 terminado/DELETE)
+              agentRunner.stop(termName)
+              resp = { ok: true }
+            } else {
+              const tws = terms.get(termName)
+              if (tws) {
+                try {
+                  tws.close()
+                } catch {
+                  /* 已关 */
+                }
+                terms.delete(termName)
               }
-              terms.delete(termName)
+              terminalOwner.delete(termName) // 释放占用(终端已删,owner 无意义)
+              try {
+                await fetch(`${baseUrl}/api/terminals/${encodeURIComponent(termName)}`, {
+                  method: 'DELETE',
+                  headers: { Authorization: `Token ${token}` },
+                })
+              } catch {
+                /* 尽力删,失败不阻塞(至多留服务端孤儿终端) */
+              }
+              resp = { ok: true }
             }
-            terminalOwner.delete(termName) // 释放占用(终端已删,owner 无意义)
-            try {
-              await fetch(`${baseUrl}/api/terminals/${encodeURIComponent(termName)}`, {
-                method: 'DELETE',
-                headers: { Authorization: `Token ${token}` },
-              })
-            } catch {
-              /* 尽力删,失败不阻塞(至多留服务端孤儿终端) */
-            }
-            resp = { ok: true }
           } else if (req.op === 'detachTerminal' && (req as { name?: string }).name) {
             // 手机「移除」(软):只关 ce 端 terminado WS、不 Jupyter DELETE。
             // → terms map 移除该 name → 下次 listTerminals managed=false → 杀 app 重开不自动恢复;
             //   Jupyter 终端仍在(GET /api/terminals 仍返回)→「+」面板可见、可重新接管。
             const termName = (req as { name?: string }).name!
-            const tws = terms.get(termName)
-            if (tws) {
-              try {
-                tws.close()
-              } catch {
-                /* 已关 */
+            if (termName.startsWith('cc-')) {
+              agentRunner.stop(termName) // CC agent 软移除 = 停(无「Jupyter 终端保留」语义)
+              resp = { ok: true }
+            } else {
+              const tws = terms.get(termName)
+              if (tws) {
+                try {
+                  tws.close()
+                } catch {
+                  /* 已关 */
+                }
+                terms.delete(termName)
               }
-              terms.delete(termName)
+              terminalOwner.delete(termName) // 软移除也释放占用:别人可从「+」面板重新接管
+              resp = { ok: true }
             }
-            terminalOwner.delete(termName) // 软移除也释放占用:别人可从「+」面板重新接管
-            resp = { ok: true }
           } else if (req.op === 'createTerminal') {
-            // 新建终端:Jupyter 分配的新 name 必空闲 → 创建者即 owner(先到先得天然满足)。
-            // 成功后【不】在此 eager 开 terminado WS。此时 ce 还不知道手机的列宽,一旦开 WS,
-            // terminado 就按默认 80×24 起进程、PowerShell banner 按 80 列打印;等手机
-            // mount→fit→syncSize 的 resize 晚到再 set_size,Windows conpty 对这种「晚到的 resize」
-            // 会整屏 re-serialize,把用户敲入的第一个命令错位打到 banner 行(PSReadLine 此时还没
-            // 就绪,光回显不执行)、并在下方留一个空的新 prompt——中继连 Windows「第一个命令错位」
-            // 即此。直连无此问题:直连是手机自己开 WS 并在 ws.onopen 里立即 set_size(PTY 起步即
-            // 正确列宽,无晚到 resize)。
-            // 改懒开以对齐直连:手机首条 resize(useTerminals.attachXterm 的 nextTick fit+syncSize,
-            // 兜底由 tunnel onReady 的 syncSize)到 ce 时,上面 Control-resize 分支自会 ensureTerm
-            // 开 WS(并 tryAcquire 标 owner),并把 set_size 缓冲到 open 后立即补发——set_size 抵达
-            // 时机与直连 ws.onopen 的 set_size 完全一致。stdin(TermStdin)分支同样懒开兜底,故此处
-            // 不预开也安全。
-            // (旧注释担心不预开会「停正在连接、要点输入才蹦出」——那是因为当时手机 mount 后不发
-            //  resize;现已由 attachXterm/onReady 可靠发 resize,懒开不再卡。)
-            resp = await handleRpc(jupyter, req)
-            if (
-              resp.ok &&
-              resp.data &&
-              typeof (resp.data as { name?: string }).name === 'string'
-            ) {
-              terminalOwner.set((resp.data as { name: string }).name, srcPhone)
+            const termType = (req as { type?: string }).type
+            if (termType === 'cc') {
+              // CC 对话:起 ce 端 Agent SDK runner(不开 Jupyter 终端、不 parse TUI)。一机一个 cc 会话,
+              // 复用同 sid(手机重连/重开接回带历史上下文)。返 sid(形如 cc-xxxx)作「终端名」——
+              // 手机据它路由 stdin(TermStdin cc- 分支) + 渲染对话组件(type:'cc')。
+              const sid = agentRunner.sidForPhone(srcPhone) ?? agentRunner.start(srcPhone, (req as { cwd?: string }).cwd)
+              console.log(`[ce] createTerminal(cc) → agentRunner sid=${sid} (phone=${srcPhone})`)
+              resp = { ok: true, data: { name: sid } }
+            } else {
+              // 普通终端:Jupyter 分配的新 name 必空闲 → 创建者即 owner(先到先得天然满足)。
+              // 成功后【不】在此 eager 开 terminado WS(懒开:等手机首条 resize/stdin 才开,对齐直连,
+              // 治「晚到 resize 致 Windows 第一个命令错位」——详见 git 历史)。
+              resp = await handleRpc(jupyter, req)
+              if (
+                resp.ok &&
+                resp.data &&
+                typeof (resp.data as { name?: string }).name === 'string'
+              ) {
+                terminalOwner.set((resp.data as { name: string }).name, srcPhone)
+              }
             }
           } else if (req.op === 'butlerStart') {
             // AI 管家:ce 用 SDK query 起 cc,回 butlerSid;手机据此收发 ButlerStdin/ButlerOutput。skill 由手机传。
@@ -681,11 +709,11 @@ async function main(): Promise<void> {
             butlers.stop(req.sid)
             resp = { ok: true }
           } else if (req.op === 'resolveApproval' && (req as { reqId?: string }).reqId) {
-            // 手机人审回传:解对应 pending 审批(通用,agent 无关)。decision 缺省 deny。
-            // 未命中也回 ok(幂等:超时后迟到的响应 / 别的手机先解过)。
+            // 手机人审回传。先查 agent-runner 的 pending(CC 对话 SDK 审批,带 callId);未命中再走旧
+            // cc-hooks dispatcher(终端 CC hooks 审批)。两路都未命中也回 ok(幂等:超时迟到 / 他机先解)。
             const reqId = (req as { reqId?: string }).reqId!
-            const decision = (req as { decision?: 'allow' | 'deny' }).decision
-            const hit = approvals.resolve(reqId, decision === 'allow' ? 'allow' : 'deny')
+            const allow = (req as { decision?: 'allow' | 'deny' }).decision === 'allow'
+            const hit = agentRunner.resolveApproval(reqId, allow) || approvals.resolve(reqId, allow ? 'allow' : 'deny')
             resp = { ok: true, data: { resolved: hit } }
           } else {
             resp = await handleRpc(jupyter, req)
@@ -709,6 +737,15 @@ async function main(): Promise<void> {
         case FrameType.TermStdin: {
           const name = frame.sid
           if (!name) break
+          const text = dec.decode(plaintext)
+          if (name.startsWith('cc-')) {
+            // CC 对话 stdin → agent-runner InputQueue(首条触发 SDK query boot)。
+            // 剥手机为终端 exec 自动 append 的 \r(cc 是自然语言消息,非终端命令,不要 \r)。
+            const ccText = text.replace(/\r+$/, '')
+            console.log(`[ce] TermStdin(cc) sid=${name} len=${ccText.length} → agentRunner`)
+            agentRunner.writeStdin(name, ccText)
+            break
+          }
           // 占用校验:懒开 WS 时按先到先得裁决;别人占用的终端其 stdin 不转发,并给 loser 发
           // attachDenied(race 反馈:loser 可能已本地建会话,需回滚 + 提示)。
           const acq = tryAcquire(terminalOwner, name, srcPhone)
@@ -717,7 +754,7 @@ async function main(): Promise<void> {
             break
           }
           const tws = ensureTerm(name)
-          tws.send(JSON.stringify(['stdin', dec.decode(plaintext)])) // ensureTerm 自缓冲(CONNECTING 时)
+          tws.send(JSON.stringify(['stdin', text])) // ensureTerm 自缓冲(CONNECTING 时)
           break
         }
         case FrameType.ButlerStdin: {
