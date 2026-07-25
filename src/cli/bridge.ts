@@ -85,8 +85,24 @@ export async function handleRpc(client: JupyterClient, req: RpcRequest): Promise
     switch (req.op) {
       case 'listDir':
         return { ok: true, data: await client.listDir(req.path ?? '/') }
-      case 'readFile':
-        return { ok: true, data: await client.readFile(req.path ?? '/') }
+      case 'readFile': {
+        // 护栏:content 超 2MB 不带回 —— 否则 JSON.stringify(中文 \uXXXX 转义放大 ~6 倍)+ encode + 加密
+        // 三个大 buffer 同存,会撑爆 ce 进程 OOM(曾崩于此)。手机端据 size/tooLarge 显「文件过大」,
+        // 跟客户端 MAX_FILE_BYTES 语义一致。下载仍走 readFileRange 分段,不受影响。
+        const MAX_READFILE_BYTES = 2 * 1024 * 1024
+        const data = (await client.readFile(req.path ?? '/')) as {
+          content?: string
+          size?: number
+          format?: string
+          mimetype?: string
+          type?: string
+        }
+        const size = typeof data.size === 'number' ? data.size : (data.content?.length ?? 0)
+        if (size > MAX_READFILE_BYTES) {
+          return { ok: true, data: { ...data, content: '', tooLarge: true, size } }
+        }
+        return { ok: true, data }
+      }
       case 'createTerminal':
         return { ok: true, data: await client.createTerminal(req.cwd ?? '/') }
       case 'createDir':

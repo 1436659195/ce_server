@@ -39,6 +39,35 @@ test('listDir 路由到 client.listDir 且透传 path', async () => {
   expect(got).toBe('/x')
 })
 
+test('readFile 小文件(≤2MB)正常回 content', async () => {
+  const client: JupyterClient = {
+    ...noopClient,
+    async readFile() {
+      return { type: 'file', content: 'hello', size: 5, format: 'text', mimetype: 'text/plain' }
+    },
+  }
+  const res = await handleRpc(client, { op: 'readFile', path: '/a.txt' })
+  expect(res).toEqual({
+    ok: true,
+    data: { type: 'file', content: 'hello', size: 5, format: 'text', mimetype: 'text/plain' },
+  })
+})
+
+test('readFile 超 2MB 不带 content、标 tooLarge(防 ce 序列化 OOM)', async () => {
+  const client: JupyterClient = {
+    ...noopClient,
+    async readFile() {
+      return { type: 'file', content: 'x'.repeat(3_000_000), size: 3_000_000, format: 'text' }
+    },
+  }
+  const res = await handleRpc(client, { op: 'readFile', path: '/big.txt' })
+  expect(res.ok).toBe(true)
+  const data = res.data as { tooLarge: boolean; content: string; size: number }
+  expect(data.tooLarge).toBe(true)
+  expect(data.content).toBe('')
+  expect(data.size).toBe(3_000_000)
+})
+
 test('createTerminal 路由且透传 cwd', async () => {
   let got = ''
   const client: JupyterClient = {
