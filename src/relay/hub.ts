@@ -152,7 +152,7 @@ export class Hub {
       }
     }
     s.phoneBuffer = []
-    // 补发该 phone 离线期间缓冲的定向帧(AgentEvent=claude 回复/审批 等,治「锁屏丢回复」)。
+    // 补发该 phone 离线期间缓冲的定向帧(AgentEvent/RPCResp 等,治「锁屏丢回复」)。
     // 按 phoneId 精确取(不会泄露给他机 phone),补发后清空。
     const pending = s.directedBuffer.get(phoneId)
     if (pending) {
@@ -195,7 +195,7 @@ export class Hub {
           }
         }
         // 目标 phone 不在线:按 targetPhoneId 缓冲(per-phoneId 隔离,只补发给本人,不泄露给他机),
-        // joinPhone 时补发。治「手机锁屏/切后台断连 → claude 回复/审批丢失」(AgentEvent/RPCResp 都是定向帧)。
+        // joinPhone 时补发。治「手机锁屏/切后台断连 → 定向帧丢失」(AgentEvent/RPCResp 都是定向帧)。
         const buf = s.directedBuffer.get(targetPhoneId) ?? []
         buf.push(data)
         if (buf.length > DIRECTED_BUFFER_MAX) buf.shift() // 超上限丢最早,防长任务+长断连 OOM
