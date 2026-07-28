@@ -34,6 +34,32 @@ bash scripts/build-binaries.sh
 
 把 `dist/` 上传到中继的下载目录,被控机就能 `curl|sh` 拉到最新版。
 
+## 中继上补齐 `dist/`(让 `curl|sh` 能装 ce)
+
+中继只做转发、不依赖二进制;但被控机用 `curl|sh` 安装时要从中继 `/dl/` 下载 ce。
+若 `http://<中继>:8606/dl/ce-linux-x64` 返回 **404**,说明中继机上 `dist/` 没编译 —— 在**中继机本身**上跑:
+
+1. 定位 ce-server 根目录(含 `scripts/build-binaries.sh`):
+   ```bash
+   ps -ef | grep relay/main.ts | grep -v grep        # 看中继进程,推断目录
+   find / -type f -name build-binaries.sh 2>/dev/null
+   ```
+   `cd` 进该目录。
+2. 编译:
+   ```bash
+   bash scripts/build-binaries.sh
+   # → dist/ce-{linux,darwin,windows}-{x64,arm64}[.exe] + sha256.txt(共 ~410M)
+   ```
+3. 验证(**不用重启中继** —— 它每次请求都现读 `dist/`,编译完立刻生效):
+   ```bash
+   curl -sI http://localhost:8606/dl/ce-linux-x64 | grep -i content-length   # 期望 90 多 MB
+   curl -sI http://localhost:8606/dl/sha256.txt | head -1                     # 期望 HTTP/1.1 200
+   ```
+
+**排错**:
+- `bun build --compile --target=...` 报错 → 多半 bun 太旧,`bun upgrade` 后重试。
+- 没有 `scripts/`(只拷了部分源码)→ 重新 `git clone https://github.com/1436659195/ce_server.git`,在新目录编译,把 `dist/` 拷到中继读取的位置(看第 1 步推断的目录)。
+
 ## 测试
 
 ```sh
