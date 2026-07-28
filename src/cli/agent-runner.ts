@@ -92,6 +92,9 @@ export function mapSdkMessageToEvents(msg: SDKMessage): AgentEvent[] {
 
 interface Approval {
   input: Record<string, unknown>
+  /** 触发审批的工具名 + callId(补显卡片要用;原 approval-request 推过,断线丢后靠这俩重建)。 */
+  tool: string
+  callId: string
   resolve: (v: { behavior: 'allow'; updatedInput: Record<string, unknown> } | { behavior: 'deny'; message: string }) => void
 }
 interface AgentProc {
@@ -215,7 +218,7 @@ export class AgentRunner {
     console.log(`[ce:agent-runner] ${proc.sid} 发 approval-request reqId=${reqId} tool=${toolName} → 等手机审批(无超时)`)
     this.opts.onEvent(proc.owner, proc.sid, { kind: 'approval-request', reqId, callId, tool: toolName, input })
     return new Promise((resolve) => {
-      proc.approvals.set(reqId, { input, resolve })
+      proc.approvals.set(reqId, { input, tool: toolName, callId, resolve })
     })
   }
 
@@ -281,6 +284,29 @@ export class AgentRunner {
       out.push({ sid: p.sid, cwd: rel })
     }
     return out
+  }
+
+  /** 列某 phone 所有 pending 审批(审批卡断线加固 · 方案B):手机重连后拉取断线期间丢失的
+   *  approval-request,补显卡片。按 owner 过滤(防他机 pending 串入)。返回渲染所需的
+   *  {sid,reqId,callId,tool,input};resolve 句柄绝不外泄(防误调 + 序列化安全)。 */
+  pendingApprovalsForPhone(phoneId: string): { sid: string; reqId: string; callId: string; tool: string; input: Record<string, unknown> }[] {
+    const out: { sid: string; reqId: string; callId: string; tool: string; input: Record<string, unknown> }[] = []
+    for (const p of this.procs.values()) {
+      if (p.owner !== phoneId) continue
+      for (const [reqId, a] of p.approvals) {
+        out.push({ sid: p.sid, reqId, callId: a.callId, tool: a.tool, input: a.input })
+      }
+    }
+    return out
+  }
+
+  /** 把某 phone 的 pending 审批重发为 approval-request 事件(审批卡断线加固 · 甲方案):
+   *  手机重连后 ce 经 agentEvents 流补发,手机 tunnel 晚订阅缓冲兜底 race + 插件 reducer 幂等去重。
+   *  复用 pendingApprovalsForPhone(按 owner 过滤);逐条 onEvent(owner=same phone, sid=agent sid)。 */
+  replayPendingApprovals(phoneId: string): void {
+    for (const p of this.pendingApprovalsForPhone(phoneId)) {
+      this.opts.onEvent(phoneId, p.sid, { kind: 'approval-request', reqId: p.reqId, callId: p.callId, tool: p.tool, input: p.input })
+    }
   }
 
   /** phoneLeft:6h 回收计时(防「移除服务器」后孤儿 cc 常驻泄漏;瞬时断连不立即杀)。 */

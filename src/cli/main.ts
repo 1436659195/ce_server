@@ -598,6 +598,9 @@ async function main(): Promise<void> {
           phoneKeys.set(phoneId, { sharedKey, name })
           butlers.markPhoneBack(phoneId) // 手机(重)连 → 取消其孤儿回收计时(管家续用、保留上下文)
           agentRunner.markPhoneBack(phoneId)
+          // 审批卡断线加固(甲方案):手机重连 → 把该 phone 的 pending approval-request 经
+          //   agentEvents 流补发(手机 tunnel 晚订阅缓冲兜底 race + 插件 reducer 幂等去重)。
+          agentRunner.replayPendingApprovals(phoneId)
           console.log(`[ce] 手机配对 phoneId=${phoneId}${name ? ` name=${name}` : ''},E2E 通道建立`)
         } catch {
           /* 非法帧 */
