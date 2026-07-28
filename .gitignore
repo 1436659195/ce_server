@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build output(编译二进制,部署时上传到中继 /dl/)
+dist/
+
+# Runtime state(含会话 token,绝不进 git)
+relay-state.json
+relay-state.json.bak-*
+
+# CE 本地身份/配置(运行时生成,含密钥)
+identity.json
+.ce/
+
+# Logs
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
