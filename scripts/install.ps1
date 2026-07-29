@@ -1,8 +1,7 @@
-# Coding Everywhere —— Windows 一行命令安装器。
-# 用户用法:  irm http://<中继>:8606/install.ps1 | iex
-# 下方 $relay 变量由中继 serve 本脚本时按请求 Host 注入(如 ws://101.132.161.59:8606)。
+# Coding Everywhere —— Windows 一行命令安装器(脚本 + 二进制都从 GitHub 拉,与中继无关)。
+# 用户用法:  irm https://raw.githubusercontent.com/1436659195/ce_server/main/scripts/install.ps1 | iex
+# 下载与中继解耦:ce 从 GitHub Releases 下;中继地址由 ce 首跑交互选(官方/自建/第三方),本脚本不写 config。
 $ErrorActionPreference = 'Stop'
-$relay = '__RELAY_URL__'
 
 function Ask-Yes($msg) {
   $a = Read-Host "$msg [y/N]"
@@ -33,12 +32,11 @@ if ($needPython) {
   $pythonInstalled = $false
   try { python --version 2>$null | Out-Null; if ($LASTEXITCODE -eq 0) { $pythonInstalled = $true } } catch {}
   if (-not $pythonInstalled) {
-    $httpRelay = $relay -replace '^ws','http'
     Write-Host "[install] winget 装 Python 失败(winget 退出码 $wingetExit,装完后仍检测不到 python)" -ForegroundColor Red
     Write-Host "[install] 请手动装 Python 3.12:" -ForegroundColor Red
     Write-Host "     到 https://www.python.org/downloads/ 下载(安装时勾 'Add to PATH')" -ForegroundColor Red
     Write-Host "[install] 装好后【重新打开】PowerShell,重新执行本命令:" -ForegroundColor Red
-    Write-Host "     irm $httpRelay/install.ps1 | iex" -ForegroundColor Red
+    Write-Host "     irm https://raw.githubusercontent.com/1436659195/ce_server/main/scripts/install.ps1 | iex" -ForegroundColor Red
     return
   }
 }
@@ -47,9 +45,9 @@ if ($needPython) {
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\ce'
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 $exe = Join-Path $installDir 'ce.exe'
-$dlBase = $relay -replace '^ws','http'
-$dlUrl = "$dlBase/dl/ce-windows-x64.exe"
-$shaUrl = "$dlBase/dl/sha256.txt"
+$dlBase = 'https://github.com/1436659195/ce_server/releases/latest/download'
+$dlUrl = "$dlBase/ce-windows-x64.exe"
+$shaUrl = "$dlBase/sha256.txt"
 if (Test-Path $exe) {
   $remoteHash = $null
   try {
@@ -70,10 +68,9 @@ if (Test-Path $exe) {
   Invoke-WebRequest -Uri $dlUrl -OutFile $exe
 }
 
-# ③ 写 config.json(ce 启动读它,不必每次带 --relay)
+# ③ ce 首跑交互选中继(官方/自建/第三方)后自写 ~/.ce/config.json,本脚本不再写(下载与中继解耦)。
 $ceDir = Join-Path $env:USERPROFILE '.ce'
 New-Item -ItemType Directory -Force -Path $ceDir | Out-Null
-@{ relay = $relay } | ConvertTo-Json | Set-Content (Join-Path $ceDir 'config.json')
 
 # ④ 注册 ce 到用户 PATH(新终端里 ce 命令生效)
 $userPath = [Environment]::GetEnvironmentVariable('Path','User')

@@ -1,9 +1,37 @@
 # ce-server
 
-Coding Everywhere 的服务端(Bun + TypeScript)。两个角色:
+Coding Everywhere 的**服务端**(Bun + TypeScript)。本仓库含**两个独立角色**,分别部署在不同机器:
 
-- **`src/relay/`** — 中继:部署在公网,手机 ↔ 被控机 ce 之间加密帧的中转 + 二进制静态下载。**纯转发、不解密**(E2E 加密在两端),很轻。
-- **`src/cli/`** — 被控机 ce:跑在被控电脑,连中继 + 本地 Jupyter + Claude SDK(CC 移动审查)。
+| 角色 | 代码 | 跑在哪 | 职责 |
+|---|---|---|---|
+| **中继 relay** | `src/relay/` | 公网服务器 | 手机 ↔ ce 之间加密帧的中转。**纯转发、不解密**(E2E 加密在两端,中继没密钥)。 |
+| **被控机 ce** | `src/cli/` | 被控电脑 | 连中继 + 本地 Jupyter + Claude SDK(CC 移动审查 / AI 管家)。 |
+
+> 手机 App 是**另一个仓库**(`ce-platform`),不在本仓库。
+
+## 拓扑:谁连谁、ce 从哪下
+
+```
+                      GitHub Releases
+                 ── ce 二进制的唯一下载渠道 ──
+                           │  install.sh / install.ps1 + ce 二进制都从 GitHub 拉
+                           ▼
+  ┌────────────┐  WS 加密帧  ┌──────────────┐  WS 加密帧  ┌──────────────┐
+  │  被控机 ce  │◄───────────►│   中继 relay  │◄───────────►│   手机 App    │
+  │  (src/cli) │             │  (src/relay)  │             │ (ce-platform) │
+  └────────────┘             └──────────────┘             └──────────────┘
+        │
+        │ 本地 REST / WS
+        ▼
+   本地 Jupyter + Claude SDK
+```
+
+**下载与中继已解耦(本仓库最近的关键改动)**
+
+- **ce 二进制只有一个下载渠道:GitHub Releases**。安装脚本和二进制都从 GitHub 拉,**跟中继无关**。
+- **中继回归纯转发**:不再 serve 二进制或安装脚本(`/dl/*`、`/install.*` 已移除,一律 404)。HTTP 层只剩 `/lan.py`(同 WiFi 局域网直连模式的脚本)。
+- **为什么这么分**:未来中继会有很多个(官方 / 自建 / 第三方),但下载渠道只该有一个。剥离后,用户装 ce 时**不需要先知道任何中继地址** —— 中继在 ce 首跑时再选。
+- **手机侧无需改动**:二维码里带中继地址(`r` 字段),手机连的是二维码指定的那个中继,天然支持任意中继。
 
 ## 部署中继(公网服务器)
 
@@ -13,57 +41,53 @@ bun install
 bun run src/relay/main.ts --port=8606 --state=relay-state.json
 ```
 
-中继轻量(实测 ~60MB 内存、几乎不吃 CPU),2C2G 的入门服务器绰绰有余。手机和被控机都连这个公网地址(`ws://你的中继:8606`)。
+- 中继很轻(实测 ~60MB 内存、几乎不吃 CPU),2C2G 入门服务器够用。
+- 手机和被控机都连这个公网地址:`ws://你的中继:8606`。
+- 中继**不需要 `dist/`、不需要二进制** —— 它只转发。
+- 可选 TLS:`--tls-cert=... --tls-key=...`(走 `wss://`)。
+- `--state=<file>` 存 `cid → sid/token` 映射:中继重启后 ce 重连仍拿到同一 sid,手机的配对码长期有效、不必重扫。
 
 ## 部署被控机 ce
 
-**源码直跑**(开发/自测):
+**给被控机用户(无需 clone 本仓库)—— 一行装,详见 [INSTALL.md](INSTALL.md):**
+```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/1436659195/ce_server/main/scripts/install.sh | sh
+# Windows PowerShell
+irm https://raw.githubusercontent.com/1436659195/ce_server/main/scripts/install.ps1 | iex
+```
+装好后 **ce 首跑交互选中继**(官方 / 自建 / 第三方),连上即弹二维码。**安装时不需要中继地址。**
+
+**源码直跑(开发 / 自测):**
 ```sh
 bun install
-bun run src/cli/main.ts --relay=ws://<中继>:8606 --jupyter=http://localhost:8888
+bun run src/cli/main.ts --relay=ws://<中继>:8606
+#   --jupyter=url --jupyter-token=t 可选;不传则 ce 自动探测 / 引导装本地 Jupyter
 ```
 
-**一行装二进制**(给被控机用户,无需 clone 本仓库):见 [INSTALL.md](INSTALL.md)。
+**ce 选中继的优先级**(只有 `--relay` 和 config 都没给时才弹问,选完存 `~/.ce/config.json`):
+```
+--relay=<url>   >   ~/.ce/config.json 的 relay   >   首跑交互选择   >   官方默认(OFFICIAL_RELAY)
+```
+> 官方默认在 `src/cli/config.ts` 的 `OFFICIAL_RELAY` —— **★ 发布前必须填真实地址**(仓库里是占位符 `ws://OFFICIAL_RELAY_PLACEHOLDER:8606`)。
 
-## 编译分发二进制
+## 编译与发布
 
 ```sh
 bash scripts/build-binaries.sh
-# → dist/ce-{linux,darwin,windows}-{x64,arm64}[.exe](单文件,无运行时依赖)
+# → dist/ce-{linux,darwin,windows}-{x64,arm64}[.exe] + sha256.txt(单文件二进制,无运行时依赖)
 ```
 
-把 `dist/` 上传到中继的下载目录,被控机就能 `curl|sh` 拉到最新版。
-
-## 中继上补齐 `dist/`(让 `curl|sh` 能装 ce)
-
-中继只做转发、不依赖二进制;但被控机用 `curl|sh` 安装时要从中继 `/dl/` 下载 ce。
-若 `http://<中继>:8606/dl/ce-linux-x64` 返回 **404**,说明中继机上 `dist/` 没编译 —— 在**中继机本身**上跑:
-
-1. 定位 ce-server 根目录(含 `scripts/build-binaries.sh`):
-   ```bash
-   ps -ef | grep relay/main.ts | grep -v grep        # 看中继进程,推断目录
-   find / -type f -name build-binaries.sh 2>/dev/null
-   ```
-   `cd` 进该目录。
-2. 编译:
-   ```bash
-   bash scripts/build-binaries.sh
-   # → dist/ce-{linux,darwin,windows}-{x64,arm64}[.exe] + sha256.txt(共 ~410M)
-   ```
-3. 验证(**不用重启中继** —— 它每次请求都现读 `dist/`,编译完立刻生效):
-   ```bash
-   curl -sI http://localhost:8606/dl/ce-linux-x64 | grep -i content-length   # 期望 90 多 MB
-   curl -sI http://localhost:8606/dl/sha256.txt | head -1                     # 期望 HTTP/1.1 200
-   ```
-
-**排错**:
-- `bun build --compile --target=...` 报错 → 多半 bun 太旧,`bun upgrade` 后重试。
-- 没有 `scripts/`(只拷了部分源码)→ 重新 `git clone https://github.com/1436659195/ce_server.git`,在新目录编译,把 `dist/` 拷到中继读取的位置(看第 1 步推断的目录)。
+**发布 checklist:**
+1. 填 `src/cli/config.ts` 的 `OFFICIAL_RELAY`(真实官方中继 `ws://host:port`)。
+2. `bash scripts/build-binaries.sh` 产出 `dist/*`。
+3. 把 `dist/` 下所有文件作为 **GitHub Release assets** 上传(`gh release create <tag> dist/*`,或走 CI)。
+   → 安装脚本从 `https://github.com/1436659195/ce_server/releases/latest/download` 拉 `ce-<平台>` + `sha256.txt`(按 sha256 判更新)。
 
 ## 测试
 
 ```sh
-bun test            # 全量
+bun test                             # 全量
 bun test test/agent-runner.test.ts   # 单文件
 ```
 
@@ -71,8 +95,9 @@ bun test test/agent-runner.test.ts   # 单文件
 
 ```
 src/
-├── relay/   中继(hub + server + session 管理)
-├── cli/     被控机 ce(主流程 main.ts + agent-runner + bridge + jupyter)
-└── shared/  共享(加密 crypto + 帧 frame + 事件 agent-events)
-scripts/     install.sh / build-binaries.sh 等
+├── relay/   中继(hub + server,纯转发 + session 管理)
+├── cli/     被控机 ce(main.ts 主流程 + agent-runner + bridge + jupyter + config + butler + cc-hooks)
+└── shared/  两端共享的 wire 协议(crypto + frame + agent-events + spec.md)
+scripts/     install.sh / install.ps1(GitHub 下载)/ build-binaries.sh / lan.py(局域网直连)
+test/        单测(hub / relay / config / lan-route / agent-runner / butler / …)
 ```

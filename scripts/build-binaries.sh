@@ -1,6 +1,7 @@
 #!/bin/sh
 # 编译 ce 的四个平台单文件二进制(Bun --compile,无运行时依赖)。
-# 产物在 ce-server/dist/ce-{linux,darwin,windows}-{x64,arm64}[.exe](gitignored;部署时上传到中继 /dl/)。
+# 产物在 ce-server/dist/ce-{linux,darwin,windows}-{x64,arm64}[.exe](gitignored;作为 GitHub Release assets 上传,
+# 用户经 install.sh/ps1 从 https://github.com/1436659195/ce_server/releases/latest/download 拉)。
 # 参考 Ollama 分发模型:一个文件、无运行时,curl|sh 即用。
 set -e
 cd "$(dirname "$0")/.." # → ce-server/

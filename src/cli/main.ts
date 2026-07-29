@@ -32,7 +32,7 @@ import { tryAcquire } from './ownership'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
-import { loadConfig } from './config'
+import { loadConfig, saveRelay, resolveRelaySources, OFFICIAL_RELAY } from './config'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 
 const enc = new TextEncoder()
@@ -59,6 +59,44 @@ async function askYesNo(msg: string): Promise<boolean> {
   try {
     const a = await new Promise<string>((r) => rl.question(`${msg} [y/N] `, r))
     return /^[yY]/.test(a.trim())
+  } finally {
+    rl.close()
+  }
+}
+
+/**
+ * 首跑交互选中继(仅当 --relay 与 config.json 都没指定时,由 main 调用)。
+ * 下载与中继解耦后,中继地址不再由安装脚本注入 —— 用户运行时选:
+ *   有 TTY → 菜单([1]官方默认 / 粘贴自建或第三方 ws:// 地址);选自建/第三方 → saveRelay 持久化(下次免问)。
+ *   无 TTY(headless / systemd 自启)→ 不卡住等输入,回退官方默认(返回 undefined → resolveRelaySources 落 OFFICIAL_RELAY)。
+ * 选官方 → 不持久化,让默认始终跟 OFFICIAL_RELAY 常量(发布前改地址即时生效)。
+ */
+async function promptRelayChoice(): Promise<string | undefined> {
+  if (!process.stdin.isTTY) {
+    console.log(`[ce] 未配置中继,且无交互终端,使用官方中继:${OFFICIAL_RELAY}`)
+    console.log('[ce] (自建/第三方中继可用 --relay=ws://... 或写 ~/.ce/config.json 指定)')
+    return undefined
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  try {
+    const ans = await new Promise<string>((r) =>
+      rl.question(
+        `\n[ce] 请选择中继:\n  [1] 官方中继 ${OFFICIAL_RELAY} (默认)\n  [2] 自建 / 第三方中继:粘贴 ws:// 地址\n请输入序号或直接粘贴地址 (回车=官方): `,
+        r,
+      ),
+    )
+    const trimmed = ans.trim()
+    if (!trimmed || trimmed === '1') {
+      console.log(`[ce] 使用官方中继:${OFFICIAL_RELAY}`)
+      return undefined
+    }
+    if (!/^wss?:\/\//.test(trimmed)) {
+      console.error(`[ce] 无效中继地址 "${trimmed}"(需 ws:// 或 wss:// 开头),改用官方 ${OFFICIAL_RELAY}`)
+      return undefined
+    }
+    saveRelay(trimmed)
+    console.log(`[ce] 已选中继并保存到 ~/.ce/config.json:${trimmed}`)
+    return trimmed
   } finally {
     rl.close()
   }
@@ -110,7 +148,7 @@ async function commandExists(name: string): Promise<boolean> {
  * 【重开终端】重跑一行安装器,然后退出。务必在 `pip install jupyterlab` 之前拦下——
  * 否则会拖到 pip 才报错,用户只看到“pip 退出码 1”,不知道根因是没装 Python。
  */
-async function ensurePythonOrExit(relayUrl: string): Promise<void> {
+async function ensurePythonOrExit(): Promise<void> {
   const isWin = process.platform === 'win32'
   const cmd = isWin ? 'python' : 'python3'
   let hasPython = true
@@ -121,14 +159,13 @@ async function ensurePythonOrExit(relayUrl: string): Promise<void> {
   }
   if (hasPython) return
 
-  const httpBase = relayUrl.replace(/^ws/, 'http')
   console.error('[ce] 未检测到 Python。Coding Everywhere 需要 Python 才能运行 Jupyter。')
   if (isWin) {
     console.error('[ce] 请先安装(任选其一):')
     console.error('     winget install Python.Python.3.12')
     console.error('     或到 https://www.python.org/downloads/ 下载(安装时勾选 “Add to PATH”)')
     console.error('[ce] 安装完成后,请【重新打开】PowerShell,重新执行一行安装命令:')
-    console.error(`     irm ${httpBase}/install.ps1 | iex`)
+    console.error(`     irm https://raw.githubusercontent.com/1436659195/ce_server/main/scripts/install.ps1 | iex`)
   } else {
     const isMac = process.platform === 'darwin'
     const hasBrew = await commandExists('brew')
@@ -141,7 +178,7 @@ async function ensurePythonOrExit(relayUrl: string): Promise<void> {
     else if (isMac) console.error('     请先装 Homebrew(brew.sh)后 brew install python')
     else console.error('     请用系统包管理器安装 python3 和 pip')
     console.error('[ce] 安装完成后,请【重新打开】终端,重新执行一行安装命令:')
-    console.error(`     curl -fsSL ${httpBase}/install.sh | sh`)
+    console.error(`     curl -fsSL https://raw.githubusercontent.com/1436659195/ce_server/main/scripts/install.sh | sh`)
   }
   process.exit(1)
 }
@@ -171,9 +208,7 @@ function pickRoot(servers: { url: string; root: string }[], url: string): string
 }
 
 /** 解析 Jupyter:显式 > 探测 > 引导装 > 启动。返回 root(jupyter root_dir OS 路径,CC 对话 cwd 的 base)。 */
-async function resolveJupyter(
-  relayUrl: string
-): Promise<{ baseUrl: string; token: string; root: string; stop?: () => void }> {
+async function resolveJupyter(): Promise<{ baseUrl: string; token: string; root: string; stop?: () => void }> {
   const explicitUrl = arg('jupyter')
   const explicitToken = arg('jupyter-token')
   const existing = await detectServers()
@@ -187,7 +222,7 @@ async function resolveJupyter(
   }
   console.log('[ce] 未探测到 Jupyter')
   // 自装 Jupyter 前先拦 Python:没 Python 就给指引 + 退出,绝不拖到 pip 报错。
-  await ensurePythonOrExit(relayUrl)
+  await ensurePythonOrExit()
   const r = await ensureJupyter(realJupyterDeps())
   if (r === 'cancelled') {
     console.error('[ce] 未安装 Jupyter,无法继续。手动装:pip install jupyterlab -i https://pypi.tuna.tsinghua.edu.cn/simple')
@@ -247,15 +282,15 @@ function writeCcSettings(port: number): void {
 }
 
 async function main(): Promise<void> {
-  const relayUrl = arg('relay') ?? loadConfig().relay
-  if (!relayUrl) {
-    console.error('用法:ce --relay=ws://relay.yourserver[:port] [--jupyter=url --jupyter-token=t]')
-    console.error('（或先运行一行安装器: curl -fsSL http://<relay>/install.sh | sh）')
-    console.error('（Windows: irm http://<relay>/install.ps1 | iex）')
-    process.exit(1)
-  }
+  // 选中继:--relay flag > config.json > 首跑交互选 > 官方默认。下载已挪到 GitHub,
+  // 中继地址不再由安装脚本注入 —— 用户运行时选(官方/自建/第三方),自建/第三方选完持久化。
+  const flagRelay = arg('relay')
+  const configRelay = loadConfig().relay
+  // 仅当 flag 与 config 都没指定时才弹问(已配置的用户每次不被打扰)
+  const choice = flagRelay || configRelay ? undefined : await promptRelayChoice()
+  const relayUrl = resolveRelaySources({ flag: flagRelay, configRelay, choice })
 
-  const { baseUrl, token, root, stop } = await resolveJupyter(relayUrl)
+  const { baseUrl, token, root, stop } = await resolveJupyter()
   if (stop) process.on('SIGINT', stop)
 
   // --insecure:容忍自签证书(bun 下 ws 的 rejectUnauthorized 不生效,改设环境变量)

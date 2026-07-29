@@ -21,17 +21,10 @@ const statePath =
   process.argv.find((a) => a.startsWith('--state='))?.split('=')[1] ??
   join(process.cwd(), 'relay-state.json')
 const hub = new Hub(statePath)
+// ce 二进制下载已挪到 GitHub Releases,中继不再 serve /dl/*、/install.* —— 只留 /lan.py(局域网直连模式)。
 const { server, close } = createRelayServer(hub, {
   cert: tlsCert && tlsKey ? tlsCert : undefined,
   key: tlsCert && tlsKey ? tlsKey : undefined,
-  ceExePath: join(here, '..', '..', 'dist', 'ce-windows-x64.exe'),
-  installScriptPath: join(here, '..', '..', 'scripts', 'install.ps1'),
-  ceLinuxX64Path: join(here, '..', '..', 'dist', 'ce-linux-x64'),
-  ceLinuxArm64Path: join(here, '..', '..', 'dist', 'ce-linux-arm64'),
-  ceDarwinX64Path: join(here, '..', '..', 'dist', 'ce-darwin-x64'),
-  ceDarwinArm64Path: join(here, '..', '..', 'dist', 'ce-darwin-arm64'),
-  sha256Path: join(here, '..', '..', 'dist', 'sha256.txt'),
-  installShPath: join(here, '..', '..', 'scripts', 'install.sh'),
   lanPyPath: join(here, '..', '..', 'scripts', 'lan.py'),
 })
 server.listen(port, () => {

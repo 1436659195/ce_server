@@ -1,20 +1,21 @@
 #!/bin/sh
-# ce 安装器(curl|sh,Ollama 式)。一行安装:
-#   curl -fsSL http://<中继>:8606/install.sh | sh
-# 中继地址由中继 serve 本脚本时注入 __RELAY_URL__ 占位符,用户无需填。
+# ce 安装器(curl|sh,Ollama 式)。一行安装(脚本 + 二进制都从 GitHub 拉,与中继无关):
+#   curl -fsSL https://raw.githubusercontent.com/1436659195/ce_server/main/scripts/install.sh | sh
+#
+# 下载与中继解耦:ce 二进制从 GitHub Releases 下;中继地址由 ce 首跑交互选(官方/自建/第三方),
+# 不再由本脚本写入。故本脚本只管「下 ce + 起 ce」,不碰中继。
 #
 # 三层:
-#   ① 探测平台 → 下对应二进制 → 装(本脚本)
-#   ② ce 首跑时自探 jupyter server list(在 ce 里,不在此)
+#   ① 探测平台 → 从 GitHub 下对应二进制 → 装(本脚本)
+#   ② ce 首跑交互选中继 + 自探 jupyter server list(在 ce 里,不在此)
 #   ③ 缺 Jupyter 则引导(在 ce 里)
 #
 # 防呆(对齐 install.ps1):
 #   A. ce 已在跑 → 复用其连接码,不起新进程(唯一 ce,免端口冲突/重复配对)
-#   B. ce 已装且与中继同 sha256 → 跳过下载(免每次重下 91MB;hash 比 size 可靠)
+#   B. ce 已装且与 GitHub 同 sha256 → 跳过下载(免每次重下 91MB;hash 比 size 可靠)
 set -e
 
-RELAY='__RELAY_URL__'
-DOWNLOAD_BASE=$(printf '%s' "$RELAY" | sed 's/^ws/http/')
+DOWNLOAD_BASE='https://github.com/1436659195/ce_server/releases/latest/download'
 INSTALL_DIR="${CE_INSTALL_DIR:-/usr/local/bin}"
 FALLBACK_DIR="$HOME/.local/bin"
 BINARY_NAME="ce"
@@ -38,7 +39,7 @@ detect_platform() {
 }
 
 PLATFORM=$(detect_platform) || exit 1
-URL="${DOWNLOAD_BASE}/dl/${BINARY_NAME}-${PLATFORM}"
+URL="${DOWNLOAD_BASE}/${BINARY_NAME}-${PLATFORM}"
 echo "[install] 平台 ${PLATFORM} → ${URL}"
 
 # 检测 python3（软引导）
@@ -82,12 +83,12 @@ else
 fi
 TARGET="${TARGET_DIR}/${BINARY_NAME}"
 
-# 防呆 B:ce 已装且与中继同 sha256 → 跳过下载(免每次重下 91MB)。
-# hash 比 size 可靠:同 size 不同内容也能检出(根治 size 巧合相同的漏更新)。
-# 下 /dl/sha256.txt 取对应平台 hash;拿不到(中继旧版/网络)→ 当作需下载,安全 fallback。
+# 防呆 B:ce 已装且与 GitHub 同 sha256 → 跳过下载(免每次重下 91MB)。
+# hash 比 size 可靠:同 size 不同内容也能检出。下 GitHub 的 sha256.txt 取本平台 hash;
+# 拿不到(GitHub 抽风/网络)→ 当作需下载,安全 fallback。
 SKIP_DOWNLOAD=0
 if [ -x "$TARGET" ]; then
-  REMOTE_HASH=$(curl -fsSL "$DOWNLOAD_BASE/dl/sha256.txt" 2>/dev/null | awk -v p="ce-$PLATFORM" '$2==p{print $1;exit}')
+  REMOTE_HASH=$(curl -fsSL "$DOWNLOAD_BASE/sha256.txt" 2>/dev/null | awk -v p="ce-$PLATFORM" '$2==p{print $1;exit}')
   LOCAL_HASH=$(sha256sum "$TARGET" 2>/dev/null | awk '{print $1}')
   [ -z "$LOCAL_HASH" ] && LOCAL_HASH=$(shasum -a 256 "$TARGET" 2>/dev/null | awk '{print $1}')  # macOS 无 sha256sum
   if [ -n "$REMOTE_HASH" ] && [ -n "$LOCAL_HASH" ] && [ "$REMOTE_HASH" = "$LOCAL_HASH" ]; then
@@ -114,13 +115,6 @@ if [ "$SKIP_DOWNLOAD" = 0 ]; then
     xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
   fi
 fi
-
-# 写 ~/.ce/config.json (relay)
-CE_DIR="$HOME/.ce"
-mkdir -p "$CE_DIR"
-CONFIG="$CE_DIR/config.json"
-printf '{"relay":"%s"}\n' "$RELAY" > "$CONFIG"
-echo "[install] 已写入配置: $CONFIG"
 
 # 提示 PATH
 case ":$PATH:" in
@@ -161,6 +155,6 @@ EOF
   fi
 fi
 
-# 启动 ce (前台,接回 tty)
+# 启动 ce (前台,接回 tty)。ce 首跑会交互问选中继(官方/自建/第三方),选完存 ~/.ce/config.json。
 echo "[install] 启动 ce..."
 exec "$TARGET" </dev/tty
