@@ -5,6 +5,11 @@ import type { Socket } from 'node:net'
 import { WebSocketServer, WebSocket } from 'ws'
 import { Hub, type RelayWS } from './hub'
 
+/** 把 install.ps1 模板里的 __RELAY_URL__ 替换成实际中继 ws 地址(按请求 Host 注入)。纯函数,可单测。 */
+export function renderInstallScript(template: string, relayWs: string): string {
+  return template.replaceAll('__RELAY_URL__', relayWs)
+}
+
 /**
  * 把 Hub(纯逻辑)接到真实 WebSocket 上。
  *
@@ -14,22 +19,53 @@ import { Hub, type RelayWS } from './hub'
  *
  * 之后 cli/phone 互发的消息都经 Hub 透传(零信任,不解析负载)。
  * 传 opts.cert+key 则上 TLS(wss);否则明文 ws(本地/开发)。
- *
- * 下载已与中继解耦:ce 二进制从 GitHub Releases 下,中继回归纯转发。
- * HTTP 层只剩一个静态路由 /lan.py(同 WiFi 局域网直连模式的脚本,纯静态无占位);其余 404。
  */
 export function createRelayServer(
   hub: Hub,
   opts?: {
     cert?: string
     key?: string
+    ceExePath?: string
+    installScriptPath?: string
+    ceLinuxX64Path?: string
+    ceLinuxArm64Path?: string
+    ceDarwinX64Path?: string
+    ceDarwinArm64Path?: string
+    sha256Path?: string
+    installShPath?: string
     lanPyPath?: string
   }
 ): { server: Server; close: () => Promise<void> } {
-  // HTTP 只剩 /lan.py(局域网直连模式脚本);其余 404。ce 二进制下载已挪到 GitHub Releases。
-  // ws upgrade 由下方 WebSocketServer({server}) 接管,与 http requestListener 不冲突。
+  // 静态下载路由:/install.ps1 + /install.sh(注入 __RELAY_URL__)、/lan.py(纯静态,无占位)、/dl/ce-{windows-x64.exe,linux-x64,linux-arm64};其余 404。
+  // ws upgrade 仍由下方 WebSocketServer({server}) 接管,与 http requestListener 不冲突。
   const requestListener = (req: IncomingMessage, res: ServerResponse): void => {
+    const host = req.headers.host ?? 'localhost'
+    const relayWs = `ws://${host}`
     const path = new URL(req.url ?? '/', 'http://relay').pathname
+    if (path === '/install.ps1' && opts?.installScriptPath) {
+      try {
+        const body = renderInstallScript(readFileSync(opts.installScriptPath, 'utf8'), relayWs)
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
+      } catch {
+        res.writeHead(500)
+        res.end('install.ps1 不可读')
+      }
+      return
+    }
+    if (path === '/install.sh' && opts?.installShPath) {
+      try {
+        const body = renderInstallScript(readFileSync(opts.installShPath, 'utf8'), relayWs)
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
+      } catch {
+        res.writeHead(500)
+        res.end('install.sh 不可读')
+      }
+      return
+    }
     if (path === '/lan.py' && opts?.lanPyPath) {
       try {
         const body = readFileSync(opts.lanPyPath, 'utf8')
@@ -39,6 +75,104 @@ export function createRelayServer(
       } catch {
         res.writeHead(500)
         res.end('lan.py 不可读')
+      }
+      return
+    }
+    if (path === '/dl/ce-windows-x64.exe' && opts?.ceExePath) {
+      try {
+        const buf = readFileSync(opts.ceExePath)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce.exe 不可读')
+      }
+      return
+    }
+    if (path === '/dl/ce-linux-x64' && opts?.ceLinuxX64Path) {
+      try {
+        const buf = readFileSync(opts.ceLinuxX64Path)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce-linux-x64 不可读')
+      }
+      return
+    }
+    if (path === '/dl/ce-linux-arm64' && opts?.ceLinuxArm64Path) {
+      try {
+        const buf = readFileSync(opts.ceLinuxArm64Path)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce-linux-arm64 不可读')
+      }
+      return
+    }
+    if (path === '/dl/ce-darwin-x64' && opts?.ceDarwinX64Path) {
+      try {
+        const buf = readFileSync(opts.ceDarwinX64Path)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce-darwin-x64 不可读')
+      }
+      return
+    }
+    if (path === '/dl/ce-darwin-arm64' && opts?.ceDarwinArm64Path) {
+      try {
+        const buf = readFileSync(opts.ceDarwinArm64Path)
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', buf.length)
+        if (req.method === 'HEAD') {
+          // 防呆 B(install.sh)用 HEAD 拿 Content-Length 比对本地 size;不回 body 免浪费带宽
+          res.end()
+          return
+        }
+        res.end(buf)
+      } catch {
+        res.writeHead(404)
+        res.end('ce-darwin-arm64 不可读')
+      }
+      return
+    }
+    if (path === '/dl/sha256.txt' && opts?.sha256Path) {
+      // 聚合 sha256 清单(install.sh/ps1 据此判更新,比 size 比对可靠:同 size 不同内容也检出)
+      try {
+        const body = readFileSync(opts.sha256Path, 'utf8')
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
+      } catch {
+        res.writeHead(404)
+        res.end('sha256.txt 不可读')
       }
       return
     }
