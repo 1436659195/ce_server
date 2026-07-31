@@ -25,8 +25,8 @@ test('多个占位都替换', () => {
 
 test('install.sh 模板的 __RELAY_URL__ 注入', () => {
   const template = "RELAY='__RELAY_URL__'\ndownload $RELAY"
-  const out = renderInstallScript(template, 'ws://my-relay:8700')
-  expect(out).toContain("RELAY='ws://my-relay:8700'")
+  const out = renderInstallScript(template, 'ws://my-relay:8606')
+  expect(out).toContain("RELAY='ws://my-relay:8606'")
   expect(out).not.toContain('__RELAY_URL__')
 })
 

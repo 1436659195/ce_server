@@ -6,11 +6,11 @@ import { Hub } from './hub'
 // 静态下载文件路径(中继以 bun 脚本模式跑,import.meta.url 解析正常;src/relay/ → dist|scripts/)。
 const here = fileURLToPath(new URL('.', import.meta.url))
 
-// 端口:--port=NNNN 或 RELAY_PORT 环境变量,默认 8700
+// 端口:--port=NNNN 或 RELAY_PORT 环境变量,默认 8606
 const portArg = process.argv.find((a) => a.startsWith('--port='))
 const port = portArg
   ? Number(portArg.split('=')[1])
-  : Number(process.env.RELAY_PORT ?? 8700)
+  : Number(process.env.RELAY_PORT ?? 8606)
 
 const tlsCert = process.argv.find((a) => a.startsWith('--tls-cert='))?.split('=')[1]
 const tlsKey = process.argv.find((a) => a.startsWith('--tls-key='))?.split('=')[1]
