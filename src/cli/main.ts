@@ -286,7 +286,7 @@ async function main(): Promise<void> {
   //   --pairing-mode=open 退回旧的「明文 phonePub 即配对」(过渡兼容)。白名单持久 ~/.ce/authorized-phones.json。
   const pairingMode = (arg('pairing-mode') ?? 'pin') as PairingMode
   const authorized = loadAuthorized()
-  const currentPin = pairingMode === 'pin' ? randomPin() : ''
+  const currentPin = pairingMode === 'pin' ? (arg('pin') ?? randomPin()) : ''
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
