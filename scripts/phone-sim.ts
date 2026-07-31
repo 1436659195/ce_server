@@ -2,8 +2,8 @@
  * phone-sim —— 调试用「假手机」。连中继 → 握手 → 收 AgentEvent → 回 resolveApproval。
  * 复用 ce-server 的 crypto/frame/ws(与真手机同原语 → E2E 互通)。验证 ce→中继→手机 审批 round-trip。
  *
- * 用法:bun run scripts/phone-sim.ts
- *   收到 PreToolUse 自动 allow 回传;60s 后退出。
+ * 用法:bun run scripts/phone-sim.ts [--pin=NNNNNN]
+ *   收到 PreToolUse 自动 allow 回传;60s 后退出。--pin:ce pin 模式首次配对所需。
  */
 import WebSocket from 'ws'
 import { readFileSync } from 'node:fs'
@@ -25,10 +25,11 @@ const phoneId = 'phone-sim-' + Math.random().toString(36).slice(2, 8)
 
 const ws = new WebSocket(`${code.r}/${code.s}?token=${code.t}&phoneId=${phoneId}`)
 ws.on('open', () => {
-  // 握手:明文 Control{ phonePub(b64), id, n } —— ce 据此派生 sharedKey 存进 phoneKeys
-  const payload = enc.encode(JSON.stringify({ k: b64(phoneKp.publicKey), id: phoneId, n: 'phone-sim' }))
+  // 握手:明文 Control{ phonePub(b64), id, n, pin? } —— ce pin 模式下据 pin 校验首次配对
+  const pin = process.argv.find((a) => a.startsWith('--pin='))?.slice(6)
+  const payload = enc.encode(JSON.stringify({ k: b64(phoneKp.publicKey), id: phoneId, n: 'phone-sim', ...(pin ? { pin } : {}) }))
   ws.send(dec.decode(encodeFrame({ type: FrameType.Control, payload })))
-  console.log(`[phone-sim] 已连中继 sid=${code.s.slice(0, 8)}… phoneId=${phoneId},握手已发,等 AgentEvent…`)
+  console.log(`[phone-sim] 已连中继 sid=${code.s.slice(0, 8)}… phoneId=${phoneId},握手已发${pin ? '(带 pin)' : '(无 pin)'},等 AgentEvent…`)
 })
 ws.on('message', (raw) => {
   let frame: Frame

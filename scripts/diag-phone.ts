@@ -5,7 +5,7 @@
  * (不碰用户正在用的终端,避免 tryAcquire 抢占),脚本化"断开 → 重连 → resize",
  * 把【重连后收到的每一段字节】原样 dump(ANSI 转义可见),判断重画是"光标归位覆盖"还是"裸追加"。
  *
- * 用法:bun ce-server/scripts/diag-phone.ts
+ * 用法:bun ce-server/scripts/diag-phone.ts [--pin=NNNNNN]
  *   配对码自动从 ~/.ce/connection-code.json 读(r/s/k/t)。
  */
 import WebSocket from 'ws'
@@ -28,6 +28,8 @@ const RELAY = QR.r
 const SID = QR.s
 const CLI_PUB = unb64(QR.k)
 const TOKEN = QR.t
+// 配对 PIN(ce pin 模式首次配对需要;--pin=NNNNNN,缺则不带)
+const PIN = process.argv.find((a) => a.startsWith('--pin='))?.slice(6)
 
 /** 把字节渲染成可读:转义/控制符命名,可打印原样。便于看"光标归位 vs 追加"。 */
 function annotate(bytes: Uint8Array): string {
@@ -71,7 +73,7 @@ class FakePhone {
         // 握手:明文送 phonePub。ce 收到不可解密的 Control → 当握手 → 派生 sharedKey 存 phoneKeys。
         this.ws!.send(dec.decode(encodeFrame({
           type: FrameType.Control,
-          payload: enc.encode(JSON.stringify({ k: b64(this.kp.publicKey), id: phoneId, n: 'diag' })),
+          payload: enc.encode(JSON.stringify({ k: b64(this.kp.publicKey), id: phoneId, n: 'diag', ...(PIN ? { pin: PIN } : {}) })),
         })))
         resolve()
       })

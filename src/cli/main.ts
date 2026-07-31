@@ -29,6 +29,7 @@ import { generateHooksConfig, handleHookBody } from './cc-hooks'
 import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
+import { loadAuthorized, addAuthorized, authorize, type PairingMode } from './pairing'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
@@ -49,6 +50,11 @@ const unb64 = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, 'base64')
 /** 随机十六进制 id(老 hub 未注入 sourcePhoneId 时,握手生成匿名 phoneId 用)。 */
 function randId(n = 8): string {
   return randomBytes(n).toString('hex')
+}
+
+/** 6 位数字配对 PIN(ce 启动生成一次;pin 模式下新手机首次连接需在 App 输入)。 */
+function randomPin(): string {
+  return String(Math.floor(Math.random() * 900000) + 100000)
 }
 
 const pExecFile = promisify(execFile)
@@ -276,6 +282,11 @@ async function main(): Promise<void> {
   // 多手机共连:每台手机一条独立 E2E 通道(phoneId → 派生 sharedKey + 显示名)。
   // 握手按 frame.sourcePhoneId(hub 注入)分通道;加密按 targetPhoneId、解密按 sourcePhoneId 寻路。
   const phoneKeys = new Map<string, { sharedKey: Uint8Array; name: string }>()
+  // 握手认证:pin 模式下新手机首次连接须带正确 PIN 才入白名单,已授权 phoneId 重连放行;
+  //   --pairing-mode=open 退回旧的「明文 phonePub 即配对」(过渡兼容)。白名单持久 ~/.ce/authorized-phones.json。
+  const pairingMode = (arg('pairing-mode') ?? 'pin') as PairingMode
+  const authorized = loadAuthorized()
+  const currentPin = pairingMode === 'pin' ? randomPin() : ''
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
@@ -508,6 +519,7 @@ async function main(): Promise<void> {
       /* 渲染失败→只给连接码 */
     }
     console.log('连接码(手动粘贴): ' + qrPayload + '\n')
+    if (pairingMode === 'pin') console.log(`[ce] 配对 PIN(新手机首次连接在 App 输入): ${currentPin}\n`)
   }
 
   // 在已注册的 ws 上接主消息循环(握手 + rpc + stdin + resize)
@@ -579,29 +591,37 @@ async function main(): Promise<void> {
             /* 解密失败 → 落到下面当握手 phonePub 处理 */
           }
         }
-        // 当作握手 phonePub(明文):{ k: phonePub(b64), n?: name } 或兼容老格式(纯 b64 公钥)
+        // 当作握手 phonePub(明文):{ k, n?, pin? } 或兼容老格式(纯 b64 公钥,无 pin)
         try {
           const text = dec.decode(frame.payload).trim()
-          let phonePubB64: string
+          let phonePubB64 = ''
           let name = ''
+          let framePin: string | undefined
           if (text.startsWith('{')) {
-            const obj = JSON.parse(text) as { k?: string; n?: string }
+            const obj = JSON.parse(text) as { k?: string; n?: string; pin?: string }
             if (!obj.k || typeof obj.k !== 'string') throw new Error('handshake json missing k')
             phonePubB64 = obj.k
             name = obj.n ?? ''
+            framePin = obj.pin
           } else {
             phonePubB64 = text // 老格式:纯 b64 公钥
           }
-          const phonePub = unb64(phonePubB64)
-          const sharedKey = sharedSecret(cliPriv, phonePub)
           const phoneId = srcPhone ?? `anon-${randId(8)}`
+          // 认证门禁:open 模式直放;pin 模式下白名单内 phoneId 放行,否则需正确 PIN 首次配对。
+          const auth = authorize({ mode: pairingMode, phoneId, authorized, pin: framePin, currentPin })
+          if (!auth.allow) {
+            console.log(`[ce] 拒绝配对 phoneId=${phoneId}(pin 模式:非白名单且 PIN 错/缺)`)
+            return
+          }
+          if (auth.pair) addAuthorized(phoneId)
+          const sharedKey = sharedSecret(cliPriv, unb64(phonePubB64))
           phoneKeys.set(phoneId, { sharedKey, name })
           butlers.markPhoneBack(phoneId) // 手机(重)连 → 取消其孤儿回收计时(管家续用、保留上下文)
           agentRunner.markPhoneBack(phoneId)
           // 审批卡断线加固(甲方案):手机重连 → 把该 phone 的 pending approval-request 经
           //   agentEvents 流补发(手机 tunnel 晚订阅缓冲兜底 race + 插件 reducer 幂等去重)。
           agentRunner.replayPendingApprovals(phoneId)
-          console.log(`[ce] 手机配对 phoneId=${phoneId}${name ? ` name=${name}` : ''},E2E 通道建立`)
+          console.log(`[ce] 手机配对 phoneId=${phoneId}${name ? ` name=${name}` : ''}${auth.pair ? '(新配对)' : '(白名单)'},E2E 通道建立`)
         } catch {
           /* 非法帧 */
         }
