@@ -48,6 +48,21 @@ test('中继静态路由：/install.sh 返回注入后的脚本', async () => {
   }
 })
 
+test('install.sh 注入用 publicUrl(优先于请求 Host,防伪造)', async () => {
+  const hub = new Hub()
+  const scriptPath = join(import.meta.dir, '..', 'scripts', 'install.sh')
+  const { server, close } = createRelayServer(hub, { installShPath: scriptPath, publicUrl: 'ws://real-relay:8606' })
+  const port = await listenPort(server)
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/install.sh`)
+    const body = await resp.text()
+    expect(body).toContain('ws://real-relay:8606')
+    expect(body).not.toContain('127.0.0.1') // publicUrl 优先,不用请求 Host
+  } finally {
+    await close()
+  }
+})
+
 test('中继静态路由：/lan.py 返回纯静态脚本(无占位注入)', async () => {
   const hub = new Hub()
   const lanPyPath = join(import.meta.dir, '..', 'scripts', 'lan.py')

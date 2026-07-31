@@ -14,6 +14,9 @@ const port = portArg
 
 const tlsCert = process.argv.find((a) => a.startsWith('--tls-cert='))?.split('=')[1]
 const tlsKey = process.argv.find((a) => a.startsWith('--tls-key='))?.split('=')[1]
+// 对外中继地址(--public-url 或 RELAY_PUBLIC_URL):install 脚本注入用它,防 Host 头伪造。不配则回退请求 Host。
+const publicUrl =
+  process.argv.find((a) => a.startsWith('--public-url='))?.split('=')[1] ?? process.env.RELAY_PUBLIC_URL
 
 // cid→sid/token 持久映射文件:中继重启后 ce 重连仍复用同一 sid(手机配对码长期有效)。
 // --state=<path> 可覆盖,默认 ./relay-state.json。
@@ -33,6 +36,7 @@ const { server, close } = createRelayServer(hub, {
   sha256Path: join(here, '..', '..', 'dist', 'sha256.txt'),
   installShPath: join(here, '..', '..', 'scripts', 'install.sh'),
   lanPyPath: join(here, '..', '..', 'scripts', 'lan.py'),
+  publicUrl,
 })
 server.listen(port, () => {
   console.log(`[relay] listening on :${port}${tlsCert ? ' (wss/TLS)' : ' (ws)'}`)

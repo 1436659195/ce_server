@@ -34,13 +34,14 @@ export function createRelayServer(
     sha256Path?: string
     installShPath?: string
     lanPyPath?: string
+    publicUrl?: string // 对外中继 ws 地址(防 Host 头注入 install 脚本);不配则回退请求 Host
   }
 ): { server: Server; close: () => Promise<void> } {
   // 静态下载路由:/install.ps1 + /install.sh(注入 __RELAY_URL__)、/lan.py(纯静态,无占位)、/dl/ce-{windows-x64.exe,linux-x64,linux-arm64};其余 404。
   // ws upgrade 仍由下方 WebSocketServer({server}) 接管,与 http requestListener 不冲突。
   const requestListener = (req: IncomingMessage, res: ServerResponse): void => {
     const host = req.headers.host ?? 'localhost'
-    const relayWs = `ws://${host}`
+    const relayWs = opts?.publicUrl ?? `ws://${host}`
     const path = new URL(req.url ?? '/', 'http://relay').pathname
     if (path === '/install.ps1' && opts?.installScriptPath) {
       try {
@@ -196,12 +197,32 @@ export function createRelayServer(
     socket.on('close', () => sockets.delete(socket))
   })
 
+  // 注册限流:每 IP 每分钟上限,防匿名 cid 刷爆 cidToEntry/state(正常 ce 重连复用 cid,远低于上限)。
+  const REGISTER_MAX = 20
+  const registerHits = new Map<string, { t: number; n: number }>()
+  const allowRegister = (ip: string): boolean => {
+    const now = Date.now()
+    const e = registerHits.get(ip)
+    if (!e || now - e.t > 60_000) {
+      registerHits.set(ip, { t: now, n: 1 })
+      return true
+    }
+    e.n++
+    return e.n <= REGISTER_MAX
+  }
+
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     const u = new URL(req.url ?? '/', 'http://relay')
     const path = u.pathname.replace(/\/+$/, '') // 去尾斜杠:'/' → ''
     const token = u.searchParams.get('token') ?? ''
 
     if (path === '' || path === '/register') {
+      // 注册限流:防匿名 cid 刷。正常 ce 重连复用 cid,远低于上限。
+      const ip = req.socket.remoteAddress ?? '?'
+      if (!allowRegister(ip)) {
+        ws.send(JSON.stringify({ type: 'error', reason: '注册过于频繁,稍后再试' }), () => ws.close())
+        return
+      }
       // cli 注册:带 cid(机器标识)→ 中继按 cid 复用持久 sid/token(ce/中继重启后手机配对码仍有效)。
       // 旧 ce 无 cid → 临时匿名(每次新 sid,退化为旧行为)。
       const cid = u.searchParams.get('cid') ?? 'anon-' + Math.random().toString(36).slice(2, 12)

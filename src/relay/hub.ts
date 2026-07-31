@@ -59,10 +59,21 @@ export class Hub {
   private wsMeta = new Map<RelayWS, { sid: string; role: 'cli' | 'phone'; phoneId?: string }>()
   private cidToEntry = new Map<string, PersistEntry>()
   private statePath: string | null
+  private readonly maxEntries: number
 
-  constructor(statePath?: string) {
+  constructor(statePath?: string, maxEntries = 1000) {
     this.statePath = statePath ?? null
+    this.maxEntries = maxEntries
     this.loadState()
+  }
+
+  /** cidToEntry 超上限淘汰最旧插入者(防匿名注册刷爆 state/内存)。 */
+  private pruneEntries(): void {
+    while (this.cidToEntry.size > this.maxEntries) {
+      const oldest = this.cidToEntry.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.cidToEntry.delete(oldest)
+    }
   }
 
   private loadState(): void {
@@ -97,6 +108,7 @@ export class Hub {
     if (!entry) {
       entry = { sid: randId(), token: randId(12) }
       this.cidToEntry.set(cid, entry)
+      this.pruneEntries()
       this.saveState()
     }
     const sid = entry.sid

@@ -12,6 +12,18 @@ function fakeWs() {
   return { ws, sent }
 }
 
+// cidToEntry LRU:超上限淘汰最旧(防匿名注册刷爆 state/内存)。
+test('cidToEntry 超上限淘汰最旧(maxEntries)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-'))
+  const hub = new Hub(join(dir, 's.json'), 3)
+  const sid1 = hub.register('c1', fakeWs().ws).sid
+  hub.register('c2', fakeWs().ws)
+  hub.register('c3', fakeWs().ws)
+  hub.register('c4', fakeWs().ws) // 超 3 → 淘汰最旧 c1
+  expect(hub.register('c1', fakeWs().ws).sid).not.toBe(sid1) // c1 被淘汰 → 重新分配新 sid
+  rmSync(dir, { recursive: true, force: true })
+})
+
 // 中继核心:cli 发的密文,phone 原样收到;反之亦然。中继不解析、不改负载(零信任)。
 test('register + joinPhone:cli → phone 转发密文', () => {
   const hub = new Hub()
