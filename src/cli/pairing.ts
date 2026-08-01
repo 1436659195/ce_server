@@ -35,6 +35,17 @@ export function addAuthorized(phoneId: string, path: string = PATH): void {
   }
 }
 
+/** 移除 phoneId(踢手机)并落盘。path 注入便于测试。 */
+export function removeAuthorized(phoneId: string, path: string = PATH): void {
+  const s = loadAuthorized(path)
+  s.delete(phoneId)
+  try {
+    writeFileSync(path, JSON.stringify([...s]))
+  } catch {
+    /* 写失败→仅内存有效 */
+  }
+}
+
 /** 门禁裁决。allow=可建 E2E 通道;pair=本次为首次配对(调用方据此 addAuthorized)。 */
 export function authorize(opts: {
   mode: PairingMode

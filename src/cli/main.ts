@@ -14,9 +14,9 @@
 import WebSocket from 'ws'
 import qrcode from 'qrcode'
 import { hostname, homedir } from 'node:os'
-import { writeFileSync, mkdirSync } from 'node:fs'
+import { writeFileSync, mkdirSync, unlinkSync, readFileSync, chmodSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, createHash } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
 import { detectServers } from './jupyter-detect'
@@ -29,19 +29,31 @@ import { generateHooksConfig, handleHookBody } from './cc-hooks'
 import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
-import { loadAuthorized, addAuthorized, authorize, type PairingMode } from './pairing'
+import { loadAuthorized, addAuthorized, removeAuthorized, authorize, type PairingMode } from './pairing'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
 import { loadConfig } from './config'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
+import { runConsole } from './console'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
 
+/** ce 版本(build 时 --define CE_VERSION 注入;dev 直跑为 'dev')。控制台「查版本」用。 */
+declare const CE_VERSION: string | undefined
+const VERSION = typeof CE_VERSION !== 'undefined' ? CE_VERSION : 'dev'
+
 function arg(name: string): string | undefined {
   const found = process.argv.find((a) => a.startsWith(`--${name}=`))
   return found ? found.slice(name.length + 3) : undefined
+}
+
+/** 探测当前平台 binary 名后缀(linux/darwin/windows + x64/arm64),自更新下载对应文件用。 */
+function detectPlatform(): string {
+  const os = process.platform === 'win32' ? 'windows' : process.platform
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
+  return `${os}-${arch}`
 }
 
 const b64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString('base64')
@@ -286,7 +298,7 @@ async function main(): Promise<void> {
   //   --pairing-mode=open 退回旧的「明文 phonePub 即配对」(过渡兼容)。白名单持久 ~/.ce/authorized-phones.json。
   const pairingMode = (arg('pairing-mode') ?? 'pin') as PairingMode
   const authorized = loadAuthorized()
-  const currentPin = pairingMode === 'pin' ? (arg('pin') ?? randomPin()) : ''
+  let currentPin = pairingMode === 'pin' ? (arg('pin') ?? randomPin()) : ''
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
@@ -356,6 +368,112 @@ async function main(): Promise<void> {
     timeoutMs: 55_000,
   })
 
+  /** 重启 daemon:spawn detached 新自己(带原参数)+ 当前进程优雅退出。更新/重启共用。 */
+  function restartDaemon(): void {
+    const args = process.argv.slice(2)
+    if (!args.includes('--daemon')) args.push('--daemon')
+    spawn(process.execPath, args, { detached: true, stdio: 'ignore', cwd: process.cwd() }).unref()
+    setTimeout(() => process.kill(process.pid, 'SIGINT'), 50) // 先回 Response 再退
+  }
+
+  /** 自更新:比 sha256 → 下载 → 验签 → 替换 binary → 重启。失败不替换(回滚安全)。 */
+  async function doUpdate(): Promise<{ ok: boolean; updated?: boolean; error?: string }> {
+    if (!relayUrl) return { ok: false, error: '无 relay 配置(无法检查更新)' }
+    const httpBase = relayUrl.replace(/^ws/, 'http')
+    const binaryName = `ce-${detectPlatform()}${process.platform === 'win32' ? '.exe' : ''}`
+    let remoteHash: string | undefined
+    try {
+      const txt = await (await fetch(`${httpBase}/dl/sha256.txt`)).text()
+      remoteHash = txt.split('\n').find((l) => l.includes(binaryName))?.trim().split(/\s+/)[0]
+    } catch {
+      return { ok: false, error: '取远端 sha256.txt 失败(中继可达?)' }
+    }
+    if (!remoteHash) return { ok: false, error: `远端清单无 ${binaryName}` }
+    const localHash = createHash('sha256').update(readFileSync(process.execPath)).digest('hex')
+    if (localHash === remoteHash) return { ok: true, updated: false }
+    const buf = new Uint8Array(await (await fetch(`${httpBase}/dl/${binaryName}`)).arrayBuffer())
+    if (createHash('sha256').update(buf).digest('hex') !== remoteHash) {
+      return { ok: false, error: '下载内容 sha256 不符(疑似篡改),已中止替换' }
+    }
+    const target = process.execPath
+    const tmp = `${target}.new`
+    writeFileSync(tmp, buf)
+    chmodSync(tmp, 0o755)
+    try {
+      renameSync(tmp, target)
+    } catch {
+      // Windows:运行中 exe 不可直接覆盖 → 先移走旧的
+      try { renameSync(target, `${target}.old`) } catch { /* 无旧 */ }
+      renameSync(tmp, target)
+    }
+    restartDaemon()
+    return { ok: true, updated: true }
+  }
+
+  /** /control/* 控制台 API(只本机 127.0.0.1)。复用 main 闭包状态,零重构。 */
+  async function controlRoute(req: Request, url: URL): Promise<Response> {
+    const json = (o: unknown, status = 200) =>
+      new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json' } })
+    const path = url.pathname
+    try {
+      if (path === '/control/state') {
+        return json({
+          running: true, pid: process.pid, version: VERSION,
+          relay: relayUrl, jupyter: baseUrl, pairingMode,
+          pin: currentPin,
+          phones: [...phoneKeys.entries()].map(([id, v]) => ({ id, name: v.name })),
+          paired: [...authorized],
+          wsConnected: ws?.readyState === WebSocket.OPEN,
+        })
+      }
+      if (path === '/control/stop') {
+        setTimeout(() => process.kill(process.pid, 'SIGINT'), 50) // 先回 Response,再优雅退出
+        return json({ ok: true })
+      }
+      if (path === '/control/restart') {
+        restartDaemon()
+        return json({ ok: true })
+      }
+      if (path === '/control/update') {
+        return json(await doUpdate())
+      }
+      if (path === '/control/pin' && req.method === 'POST') {
+        const { pin } = await req.json() as { pin?: string }
+        if (!pin || !/^\d{6}$/.test(pin)) return json({ ok: false, error: 'PIN 须 6 位数字' }, 400)
+        currentPin = pin
+        return json({ ok: true, pin: currentPin })
+      }
+      if (path === '/control/unpair' && req.method === 'POST') {
+        const { phoneId } = await req.json() as { phoneId?: string }
+        if (!phoneId) return json({ ok: false, error: '缺 phoneId' }, 400)
+        removeAuthorized(phoneId)
+        phoneKeys.delete(phoneId)
+        return json({ ok: true, paired: [...loadAuthorized()] })
+      }
+      if (path === '/control/logs') {
+        const n = Number(url.searchParams.get('n') ?? 80)
+        try {
+          const lines = readFileSync(join(homedir(), '.ce', 'ce.log'), 'utf8').split('\n').slice(-n).join('\n')
+          return json({ ok: true, lines })
+        } catch {
+          return json({ ok: true, lines: '(暂无日志文件)' })
+        }
+      }
+      if (path === '/control/doctor') {
+        const servers = await detectServers()
+        return json({
+          relay: { url: relayUrl, connected: ws?.readyState === WebSocket.OPEN },
+          jupyter: servers.length > 0 ? servers[0] : null,
+          claude: claudeBin,
+          config: loadConfig(),
+        })
+      }
+      return json({ error: 'not found' }, 404)
+    } catch (e) {
+      return json({ error: (e as Error).message }, 500)
+    }
+  }
+
   // CC hooks 本地接收器:Bun.serve 监听空闲端口,curl POST /hook → handleHookBody。
   // listen(0) 让 OS 分配端口(避免固定端口被占),拿到实际端口后写进 hooks 配置;只听 127.0.0.1(hook
   // 命令在本机跑,审批端点绝不应对外暴露)。启动失败不致命:审查功能不可用,终端/文件/管家照常。
@@ -364,6 +482,8 @@ async function main(): Promise<void> {
       port: 0,
       hostname: '127.0.0.1',
       async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname.startsWith('/control/')) return controlRoute(req, url)
         if (req.method !== 'POST') return new Response('method not allowed', { status: 405 })
         const raw = await req.text()
         // PreToolUse → approvals.request 阻塞 55s 等手机 → 回 permissionDecision;
@@ -384,9 +504,16 @@ async function main(): Promise<void> {
     if (hookPort !== undefined) {
       console.log(`[ce] CC hooks 接收器监听 127.0.0.1:${hookPort}(PreToolUse 审批 / PostToolUse 转发)`)
       writeCcSettings(hookPort)
+      // 记 daemon 元信息:控制台据此发现并连上控制端点;退出时清理(避免留 stale 指向)。
+      try {
+        const ceDir = join(homedir(), '.ce')
+        mkdirSync(ceDir, { recursive: true })
+        writeFileSync(join(ceDir, 'daemon.json'), JSON.stringify({ port: hookPort, pid: process.pid, version: VERSION, startAt: Date.now() }))
+      } catch { /* 写失败→控制台发现不了,不致命 */ }
     }
     process.on('SIGINT', () => {
       try { hookServer.stop() } catch { /* 已停 */ }
+      try { unlinkSync(join(homedir(), '.ce', 'daemon.json')) } catch { /* 已不在 */ }
     })
   } catch (e) {
     console.warn('[ce] CC hooks 接收器启动失败(审查功能不可用,终端/文件/管家不受影响):', (e as Error).message)
@@ -857,7 +984,22 @@ async function main(): Promise<void> {
   connect()
 }
 
-main().catch((e) => {
-  console.error('[ce] 启动失败:', (e as Error).message)
-  process.exit(1)
-})
+// 入口分叉:--daemon 跑守护进程(main);否则跑控制台 TUI(console.ts)。
+// daemon 加全局错误兜底:小意外记日志不退,严重错误退出(由控制台/系统拉起)+清 stale daemon.json。
+if (process.argv.includes('--daemon')) {
+  process.on('unhandledRejection', (r) => console.error('[ce] ⚠ unhandledRejection(已兜底,不退出):', r))
+  process.on('uncaughtException', (e) => {
+    console.error('[ce] ✗ uncaughtException(将退出,由控制台/系统拉起):', e)
+    try { unlinkSync(join(homedir(), '.ce', 'daemon.json')) } catch { /* */ }
+    process.exit(1)
+  })
+  main().catch((e) => {
+    console.error('[ce] 启动失败:', (e as Error).message)
+    process.exit(1)
+  })
+} else {
+  runConsole().catch((e) => {
+    console.error('[ce] 控制台错误:', (e as Error).message)
+    process.exit(1)
+  })
+}
