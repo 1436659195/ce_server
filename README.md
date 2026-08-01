@@ -7,13 +7,36 @@ Coding Everywhere 的服务端(Bun + TypeScript)。两个角色:
 
 ## 部署中继(公网服务器)
 
+**一键启动(推荐)**:配置存 `.env`,用 `start.sh` 管理,无需记一长串参数。
+
 ```sh
 git clone <本仓库> && cd ce-server
 bun install
-bun run src/relay/main.ts --port=8606 --state=relay-state.json
+cp .env.example .env       # 复制配置模板
+vi .env                     # 填:RELAY_STATE_KEY(密钥)/ RELAY_PUBLIC_URL(对外地址)等
+./start.sh                  # 启动(后台,日志进 relay.log)
 ```
 
-中继轻量(实测 ~60MB 内存、几乎不吃 CPU),2C2G 的入门服务器绰绰有余。手机和被控机都连这个公网地址(`ws://你的中继:8606`)。
+`start.sh` 常用命令:
+
+| 命令 | 作用 |
+|---|---|
+| `./start.sh` | 启动 |
+| `./start.sh stop` | 停止(优雅退出) |
+| `./start.sh restart` | 重启 |
+| `./start.sh status` | 看是否在跑 |
+| `./start.sh logs` | 实时看日志(Ctrl+C 退出查看,不影响中继) |
+
+> `.env` 含密钥,已在 `.gitignore` 里(不进 git);各项含义见 `.env.example` 注释。
+
+**或手动启动**(不用脚本,直接 bun):
+
+```sh
+RELAY_STATE_KEY=<密钥> bun run src/relay/main.ts \
+  --port=8606 --public-url=ws://<公网地址>:8606
+```
+
+中继轻量(实测 ~60MB 内存、几乎不吃 CPU),2C2G 的入门服务器绰绰有余。手机和被控机都连这个公网地址。完整参数、安全机制、运维排障见 [docs/ops.md](docs/ops.md)。
 
 ## 部署被控机 ce
 

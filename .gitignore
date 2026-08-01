@@ -7,6 +7,10 @@ dist/
 # Runtime state(含会话 token,绝不进 git)
 relay-state.json
 relay-state.json.bak-*
+.relay.pid
+
+# 启动配置(含加密密钥,绝不进 git;模板见 .env.example)
+.env
 
 # CE 本地身份/配置(运行时生成,含密钥)
 identity.json
