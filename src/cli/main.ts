@@ -287,7 +287,7 @@ async function main(): Promise<void> {
   const cliPubB64 = b64(identity.publicKey)
   const cid = identity.cid
 
-  const jupyter = makeJupyterClient(baseUrl, token)
+  const jupyter = makeJupyterClient(baseUrl, token, root)
   const wsBase = baseUrl.replace(/^http/, 'ws')
 
   let ws: WebSocket | null = null

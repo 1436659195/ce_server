@@ -5,6 +5,8 @@
  * 终端流(TermStdin ↔ terminado WS)在 main.ts 接,因它带 WS 生命周期、需真实环境验。
  */
 
+import { join } from 'node:path'
+
 /** 本地 Jupyter 的 REST 调用抽象(ce 用 makeJupyterClient 实现;测试用 fake 注入)。 */
 export interface JupyterClient {
   createTerminal(cwd: string): Promise<{ name: string }> // POST /api/terminals {cwd}
@@ -151,15 +153,19 @@ async function fetchTimeout(url: string, init: RequestInit = {}, ms = 15000): Pr
 }
 
 /** 真实 JupyterClient:用 fetchTimeout 打本地 Jupyter 的 Contents / terminals REST(带超时)。 */
-export function makeJupyterClient(baseUrl: string, token: string): JupyterClient {
+export function makeJupyterClient(baseUrl: string, token: string, root: string): JupyterClient {
   const headers = { Authorization: `Token ${token}` }
   return {
     async createTerminal(cwd) {
-      const rel = cwd.replace(/^\/+/, '') // root_dir 相对;根 → ''
+      // cwd 是相对 jupyter root_dir 的逻辑路径(带前导 /,'/' = root_dir 本身;见 spec.md)。
+      // Jupyter Server 2.x 终端 API 只收【绝对路径】(相对/空 → HTTP 500 "Unhandled error"),
+      // 故拼成绝对(root + rel)再发。修前直发相对路径,2.x 必 500(创建终端失败:500)。
+      const rel = cwd.replace(/^\/+/, '')
+      const abs = join(root, rel || '.')
       const res = await fetchTimeout(`${baseUrl}/api/terminals`, {
         method: 'POST',
         headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cwd: rel }),
+        body: JSON.stringify({ cwd: abs }),
       })
       if (!res.ok) throw new Error(`创建终端失败:${res.status} ${res.statusText}`)
       return (await res.json()) as { name: string }
