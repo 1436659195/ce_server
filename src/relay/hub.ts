@@ -1,6 +1,38 @@
-import { randomBytes } from 'node:crypto'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
+import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { decodeFrame, encodeFrame } from '../shared/frame'
+
+/** state 加密格式版本(AES-256-GCM)。 */
+const STATE_CRYPTO_VERSION = 1
+
+/** 由口令派生 32B AES key。 */
+export function deriveStateKey(pass: string): Buffer {
+  return createHash('sha256').update(pass).digest()
+}
+
+/** 加密 state 明文 → JSON blob({v,iv,tag,data})。无 key → 返回原文(明文降级)。 */
+export function encryptState(plain: string, key: Buffer | null): string {
+  if (!key) return plain
+  const iv = randomBytes(12)
+  const c = createCipheriv('aes-256-gcm', key, iv)
+  const enc = Buffer.concat([c.update(plain, 'utf8'), c.final()])
+  return JSON.stringify({
+    v: STATE_CRYPTO_VERSION,
+    iv: iv.toString('base64'),
+    tag: c.getAuthTag().toString('base64'),
+    data: enc.toString('base64'),
+  })
+}
+
+/** 解密 encryptState 的 blob。无 key → 返回原文;非加密格式 → 抛(调用方回退明文)。 */
+export function decryptState(blob: string, key: Buffer | null): string {
+  if (!key) return blob
+  const o = JSON.parse(blob) as { v?: number; iv?: string; tag?: string; data?: string }
+  if (o.v !== STATE_CRYPTO_VERSION || !o.iv || !o.tag || !o.data) throw new Error('非加密 state blob')
+  const d = createDecipheriv('aes-256-gcm', key, Buffer.from(o.iv, 'base64'))
+  d.setAuthTag(Buffer.from(o.tag, 'base64'))
+  return Buffer.concat([d.update(Buffer.from(o.data, 'base64')), d.final()]).toString('utf8')
+}
 
 /** 中继需要的最小 WS 接口(只用 send)。真实 ws.WebSocket 满足;测试用假对象。 */
 export interface RelayWS {
@@ -60,11 +92,30 @@ export class Hub {
   private cidToEntry = new Map<string, PersistEntry>()
   private statePath: string | null
   private readonly maxEntries: number
+  private readonly stateKey: Buffer | null
 
-  constructor(statePath?: string, maxEntries = 1000) {
+  constructor(statePath?: string, maxEntries = 1000, stateKey?: Buffer | null) {
     this.statePath = statePath ?? null
     this.maxEntries = maxEntries
+    this.stateKey = stateKey ?? null
     this.loadState()
+  }
+
+  /** state 文件权限 0600(防其他用户读 token)。 */
+  private ensurePerms(): void {
+    if (this.statePath) {
+      try {
+        chmodSync(this.statePath, 0o600)
+      } catch {
+        /* 文件不存在 / 无权限 → 忽略 */
+      }
+    }
+  }
+
+  /** 轮换所有 token(手机需重新扫码);内存改 + 落盘。 */
+  rotateTokens(): void {
+    for (const e of this.cidToEntry.values()) e.token = randId(12)
+    this.saveState()
   }
 
   /** cidToEntry 超上限淘汰最旧插入者(防匿名注册刷爆 state/内存)。 */
@@ -80,18 +131,30 @@ export class Hub {
     if (!this.statePath) return
     try {
       if (existsSync(this.statePath)) {
-        const arr = JSON.parse(readFileSync(this.statePath, 'utf8')) as [string, PersistEntry][]
+        const raw = readFileSync(this.statePath, 'utf8')
+        // 有 key:尝试解密;失败(老明文文件)回退原样。无 key:明文。
+        let plain: string
+        try {
+          plain = decryptState(raw, this.stateKey)
+        } catch {
+          plain = raw
+        }
+        const arr = JSON.parse(plain) as [string, PersistEntry][]
         for (const [cid, e] of arr) this.cidToEntry.set(cid, e)
       }
     } catch {
       /* 损坏→空 */
     }
+    if (this.stateKey) this.saveState() // 有 key:把(可能的明文)state 迁移/重写为加密格式
+    this.ensurePerms()
   }
 
   private saveState(): void {
     if (!this.statePath) return
     try {
-      writeFileSync(this.statePath, JSON.stringify(Array.from(this.cidToEntry.entries())))
+      const plain = JSON.stringify(Array.from(this.cidToEntry.entries()))
+      writeFileSync(this.statePath, encryptState(plain, this.stateKey))
+      this.ensurePerms()
     } catch {
       /* 写失败→忽略(本次内存有效) */
     }

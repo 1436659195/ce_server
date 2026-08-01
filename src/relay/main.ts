@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRelayServer } from './server'
-import { Hub } from './hub'
+import { Hub, deriveStateKey } from './hub'
 
 // 静态下载文件路径(中继以 bun 脚本模式跑,import.meta.url 解析正常;src/relay/ → dist|scripts/)。
 const here = fileURLToPath(new URL('.', import.meta.url))
@@ -23,7 +23,18 @@ const publicUrl =
 const statePath =
   process.argv.find((a) => a.startsWith('--state='))?.split('=')[1] ??
   join(process.cwd(), 'relay-state.json')
-const hub = new Hub(statePath)
+// state 加密密钥(RELAY_STATE_KEY):有则 AES-256-GCM 加密落盘 token,无则明文(降级 + 告警)。
+const stateKey = process.env.RELAY_STATE_KEY ? deriveStateKey(process.env.RELAY_STATE_KEY) : null
+if (!stateKey) {
+  console.warn('[relay] ⚠ 未设 RELAY_STATE_KEY,relay-state.json 明文存 token(生产建议设)')
+}
+const hub = new Hub(statePath, 1000, stateKey)
+// --rotate:一次性维护,重置所有 token 后退出(手机需重新扫码)。
+if (process.argv.includes('--rotate')) {
+  hub.rotateTokens()
+  console.log('[relay] 所有 token 已轮换,手机需重新扫码配对')
+  process.exit(0)
+}
 const { server, close } = createRelayServer(hub, {
   cert: tlsCert && tlsKey ? tlsCert : undefined,
   key: tlsCert && tlsKey ? tlsKey : undefined,

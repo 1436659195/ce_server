@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { Hub } from '../src/relay/hub'
+import { Hub, encryptState, decryptState, deriveStateKey } from '../src/relay/hub'
 import { mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -11,6 +11,31 @@ function fakeWs() {
   const ws = { send: (d: string) => { sent.push(d) } }
   return { ws, sent }
 }
+
+// state 加密:round-trip + 篡改检出 + 无 key 明文降级。
+test('encryptState/decryptState: AES-256-GCM round-trip + 降级', () => {
+  const key = deriveStateKey('secret')
+  const plain = '[["c1",{"sid":"s","token":"t"}]]'
+  const enc = encryptState(plain, key)
+  expect(enc).not.toBe(plain) // 加密了
+  expect(decryptState(enc, key)).toBe(plain)
+  // 篡改密文 → GCM 完整性抛错
+  expect(() => decryptState(enc.replace(/"data":"[^"]*"/, '"data":"xx"'), key)).toThrow()
+  // 无 key → 明文降级(进出原样)
+  expect(encryptState(plain, null)).toBe(plain)
+  expect(decryptState(plain, null)).toBe(plain)
+})
+
+// 轮换:所有 token 变,旧 token 失效。
+test('rotateTokens: token 全换,旧 token 失效', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-'))
+  const hub = new Hub(join(dir, 's.json'))
+  const before = hub.register('c1', fakeWs().ws).token
+  hub.rotateTokens()
+  const after = hub.register('c1', fakeWs().ws).token // 同 cid 复用 → 拿到新 token
+  expect(after).not.toBe(before)
+  rmSync(dir, { recursive: true, force: true })
+})
 
 // cidToEntry LRU:超上限淘汰最旧(防匿名注册刷爆 state/内存)。
 test('cidToEntry 超上限淘汰最旧(maxEntries)', () => {
