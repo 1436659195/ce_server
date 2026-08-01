@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createServer } from 'node:net'
 import { parse as parsePath } from 'node:path'
 import type { JupyterServer } from './jupyter-detect'
 
@@ -19,8 +20,22 @@ export function parseLaunchUrl(output: string): { url: string; token: string } |
   }
 }
 
+/** 挑一个空闲端口(listen(0) 让 OS 分配→拿到→关掉)。避开 Jupyter `--port=0` 在某些环境(如本机
+ *  Jupyter 2.17)打印成 localhost:0 的毛病:ce 自选端口传给 Jupyter,它打印的 URL 就是对的。 */
+function pickFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const s = createServer()
+    s.unref()
+    s.on('error', reject)
+    s.listen(0, '127.0.0.1', () => {
+      const p = (s.address() as { port: number }).port
+      s.close(() => resolve(p))
+    })
+  })
+}
+
 /**
- * 启动一个本地 Jupyter(`python -m jupyterlab --no-browser --port=0`),等它打印 URL+token 后返回。
+ * 启动一个本地 Jupyter(`python -m jupyterlab --no-browser --port=<ce 自选空闲端口>`),等它打印 URL+token 后返回。
  * root_dir 设为宿主机根目录(Linux/Mac '/'、Windows 当前盘根):手机文件栏从根浏览整个文件系统,而非 ce 的 cwd。返回 stop() 退出杀进程。
  *
  * ⚠️ 走 `python -m jupyterlab` 而非 `jupyter lab`:Bun `--compile` 出的 Windows 二进制里 `shell:true`
@@ -36,10 +51,11 @@ export async function launchJupyter(
   // Windows 当前盘根)——让 Jupyter 服务整个文件系统,手机文件栏从根起浏览。
   // --ServerApp.allow_root=True:root 用户下 Jupyter 默认拒启(要 --allow-root),显式开(非 root 忽略无害)。
   const dir = rootDir ?? parsePath(process.cwd()).root
+  const port = await pickFreePort() // ce 自选端口传 Jupyter,避开 --port=0 在某些环境打印 localhost:0
   return new Promise((resolve, reject) => {
     const proc = spawn(
       'python',
-      ['-m', 'jupyterlab', '--no-browser', '--port=0', `--ServerApp.root_dir=${dir}`, '--ServerApp.allow_root=True'],
+      ['-m', 'jupyterlab', '--no-browser', `--port=${port}`, `--ServerApp.root_dir=${dir}`, '--ServerApp.allow_root=True'],
       {
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: true, // Windows 上靠 cmd 的 PATHEXT 解析 python.exe;其它平台无影响
