@@ -15,7 +15,7 @@ import WebSocket from 'ws'
 import qrcode from 'qrcode'
 import { hostname, homedir } from 'node:os'
 import { writeFileSync, mkdirSync, unlinkSync, readFileSync, chmodSync, renameSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, parse as parsePath } from 'node:path'
 import { randomBytes, createHash } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
@@ -33,7 +33,7 @@ import { loadAuthorized, addAuthorized, removeAuthorized, authorize, type Pairin
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
-import { loadConfig, saveWorkdir } from './config'
+import { loadConfig } from './config'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 import { runConsole } from './console'
 
@@ -189,7 +189,10 @@ function pickRoot(servers: { url: string; root: string }[], url: string): string
   return (byPort ?? servers[0])?.root ?? process.cwd()
 }
 
-/** 解析 Jupyter:显式 > 探测 > 引导装 > 启动。返回 root(jupyter root_dir OS 路径,CC 对话 cwd 的 base)。 */
+/** 解析 Jupyter:显式 > 探测(只复用 root 在根目录的)> 引导装 > 启动。
+ *  ce 的 jupyter 永远服务【宿主机根目录】(手机文件栏从根浏览整个文件系统)。
+ *  探测到的 jupyter 若 root 正好在根目录 → 复用;否则(无 / root 不在根目录,如本机 screen 开的 /data)→ 自启根目录的。
+ *  返回 root(jupyter root_dir OS 路径,CC 对话 cwd 的 base)。 */
 async function resolveJupyter(
   relayUrl: string
 ): Promise<{ baseUrl: string; token: string; root: string; stop?: () => void }> {
@@ -200,14 +203,14 @@ async function resolveJupyter(
     const existing = await detectServers()
     return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root: pickRoot(existing, explicitUrl) }
   }
-  const workdir = loadConfig().workdir
-  // 设了 workdir → 跳过外部探测自启(确保用 workdir);否则探测外部 > 自启默认根
-  const existing = workdir ? [] : await detectServers()
-  if (existing.length > 0) {
-    console.log(`[ce] 探测到 Jupyter:${existing[0].url}(root ${existing[0].root})`)
-    return { baseUrl: toLoopback(existing[0].url), token: existing[0].token, root: existing[0].root }
+  const osRoot = parsePath(process.cwd()).root // Linux/Mac '/',Windows 当前盘根 = ce 自启用的 root_dir
+  const existing = await detectServers()
+  const reuse = existing.find((s) => s.root === osRoot) // 只复用 root 正好在根目录的现成 jupyter
+  if (reuse) {
+    console.log(`[ce] 复用根目录 Jupyter:${reuse.url}(root ${reuse.root})`)
+    return { baseUrl: toLoopback(reuse.url), token: reuse.token, root: reuse.root }
   }
-  console.log('[ce] 未探测到 Jupyter' + (workdir ? `,用工作目录 ${workdir}` : ''))
+  console.log('[ce] 未发现根目录的 Jupyter,自启...')
   // 自装 Jupyter 前先拦 Python:没 Python 就给指引 + 退出,绝不拖到 pip 报错。
   await ensurePythonOrExit(relayUrl)
   const r = await ensureJupyter(realJupyterDeps())
@@ -220,10 +223,10 @@ async function resolveJupyter(
     process.exit(1)
   }
   console.log('[ce] 启动 Jupyter...')
-  const { server, stop } = await launchJupyter(workdir)
+  const { server, stop } = await launchJupyter() // 不传 rootDir → 默认宿主机根目录
   console.log(`[ce] 已启动 Jupyter:${server.url}`)
   const live = await detectServers() // 启动后再探一次拿 root_dir
-  return { baseUrl: toLoopback(server.url), token: server.token, root: workdir ?? pickRoot(live, server.url), stop }
+  return { baseUrl: toLoopback(server.url), token: server.token, root: pickRoot(live, server.url), stop }
 }
 
 /** 探测一个能跑的 claude 二进制。机器上可能装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
@@ -440,12 +443,6 @@ async function main(): Promise<void> {
       }
       if (path === '/control/update') {
         return json(await doUpdate())
-      }
-      if (path === '/control/workdir' && req.method === 'POST') {
-        const { workdir } = await req.json() as { workdir?: string }
-        saveWorkdir(workdir ?? '')
-        restartDaemon() // 存完重启 ce,新 ce 用 workdir 自启 jupyter(终端+CC 对话都切新目录)
-        return json({ ok: true, workdir: workdir || null })
       }
       if (path === '/control/pin' && req.method === 'POST') {
         const { pin } = await req.json() as { pin?: string }
