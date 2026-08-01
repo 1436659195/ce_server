@@ -1,0 +1,18 @@
+# CI:每次 push / PR 跑「类型检查 + 测试」,双绿才允许合并——堵「改坏代码没人拦」。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install
+      - run: bun run typecheck # = tsc --noEmit
+      - run: bun test

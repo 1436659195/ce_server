@@ -250,10 +250,20 @@ export function createRelayServer(
   function wire(ws: WebSocket): void {
     ws.on('message', (data) => {
       // 负载透传(本协议帧是 JSON 文本;二进制场景后续再评估)
-      hub.onMessage(ws as RelayWS, data.toString())
+      // try/catch:hub 源头已防脏数据,这里再兜一道——回调内任何漏网异常都不让其冒泡成
+      // uncaughtException 崩进程(殃及其他连接),记日志即止。
+      try {
+        hub.onMessage(ws as RelayWS, data.toString())
+      } catch (e) {
+        console.error('[relay] onMessage 异常(已兜底,不断连接):', e)
+      }
     })
     ws.on('close', () => {
-      hub.onClose(ws as RelayWS)
+      try {
+        hub.onClose(ws as RelayWS)
+      } catch (e) {
+        console.error('[relay] onClose 异常(已兜底):', e)
+      }
     })
   }
 

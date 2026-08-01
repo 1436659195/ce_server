@@ -57,3 +57,15 @@ server.listen(port, () => {
 process.on('SIGINT', () => {
   close().then(() => process.exit(0))
 })
+
+// 兜底①:Promise 漏接(最常见的「小意外带崩全场」源)→ 记日志,不退出,保住在用连接。
+process.on('unhandledRejection', (reason) => {
+  console.error('[relay] ⚠ unhandledRejection(已兜底,不退出):', reason)
+})
+
+// 兜底②:未捕获异常 → 进程状态可能已损坏,记日志后优雅退出,交 systemd 拉起(hub 源头已 try/catch,
+// 能到这里属罕见漏网;继续跑有数据错乱风险,故退出而非硬扛)。
+process.on('uncaughtException', (err) => {
+  console.error('[relay] ✗ uncaughtException(将退出,由 systemd 拉起):', err)
+  close().finally(() => process.exit(1))
+})
