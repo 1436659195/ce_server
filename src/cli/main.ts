@@ -42,7 +42,8 @@ const dec = new TextDecoder()
 
 /** ce 版本(build 时 --define CE_VERSION 注入;dev 直跑为 'dev')。控制台「查版本」用。 */
 declare const CE_VERSION: string | undefined
-const VERSION = typeof CE_VERSION !== 'undefined' ? CE_VERSION : 'dev'
+// 兜底两道:未注入(undefined)→ dev;注入了但异常短(<=1 字符,如曾经的 "v")→ 也回退 dev。
+const VERSION = typeof CE_VERSION !== 'undefined' && CE_VERSION.length > 1 ? CE_VERSION : 'dev'
 
 function arg(name: string): string | undefined {
   const found = process.argv.find((a) => a.startsWith(`--${name}=`))

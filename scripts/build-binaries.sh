@@ -7,9 +7,17 @@ cd "$(dirname "$0")/.." # → ce-server/
 
 mkdir -p dist
 ENTRY="src/cli/main.ts"
-# 版本号(注入 binary,控制台「查版本」用):取 package.json version,失败回退 dev。
-VERSION="v$(sed -n 's/.*"version"[[:space:]]*"\([^"]*\)".*/\1/p' package.json | head -1)"
-[ -z "$VERSION" ] && VERSION="vdev"
+# 版本号(注入 binary,控制台「查版本」用):取 package.json version。
+# 正则须含冒号:"version"[space]*:[space]*"值" —— 漏掉 : 会一行都匹配不上(曾导致注入 "v")。
+VER_RAW="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json | head -1)"
+# 必须校验【原始提取值】,不是带前缀的 VERSION:后者永远含 "v" 空不了。
+# 旧兜底 [ -z "$VERSION" ] 因此形同虚设 —— sed 一失败就静默注入 "v",曾导致面板显示「ce v」。
+# 改为:sed 没提到 version → 硬失败中止,绝不把坏版本号编进 binary。
+if [ -z "$VER_RAW" ]; then
+  echo "[build] 错误:无法从 package.json 提取 version,中止(避免注入坏版本号)" >&2
+  exit 1
+fi
+VERSION="v$VER_RAW"
 
 for target in bun-linux-x64 bun-linux-arm64 bun-darwin-x64 bun-darwin-arm64 bun-windows-x64; do
   name="ce-${target#bun-}" # bun-linux-x64 → ce-linux-x64
