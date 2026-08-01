@@ -21,3 +21,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# CodeGraph 本地索引(不进 git)
+.codegraph/
