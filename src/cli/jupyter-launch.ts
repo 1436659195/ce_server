@@ -29,15 +29,17 @@ export function parseLaunchUrl(output: string): { url: string; token: string } |
  * ⚠️ 需真实 Jupyter,由 main 烟测覆盖(无单测)。
  */
 export async function launchJupyter(
+  rootDir?: string,
   timeoutMs = 30000
 ): Promise<{ server: JupyterServer; stop: () => void }> {
-  // root_dir = 宿主机根目录:parse(cwd).root → Linux/Mac '/';Windows 当前盘根(如 'C:\')。
-  // 让 Jupyter 服务整个文件系统,手机文件栏从根起浏览(而非 ce 启动时的 cwd)。
-  const rootDir = parsePath(process.cwd()).root
+  // root_dir:传入则用(用户设的工作目录);否则宿主机根(parse(cwd).root → Linux/Mac '/',
+  // Windows 当前盘根)——让 Jupyter 服务整个文件系统,手机文件栏从根起浏览。
+  // --ServerApp.allow_root=True:root 用户下 Jupyter 默认拒启(要 --allow-root),显式开(非 root 忽略无害)。
+  const dir = rootDir ?? parsePath(process.cwd()).root
   return new Promise((resolve, reject) => {
     const proc = spawn(
       'python',
-      ['-m', 'jupyterlab', '--no-browser', '--port=0', `--ServerApp.root_dir=${rootDir}`],
+      ['-m', 'jupyterlab', '--no-browser', '--port=0', `--ServerApp.root_dir=${dir}`, '--ServerApp.allow_root=True'],
       {
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: true, // Windows 上靠 cmd 的 PATHEXT 解析 python.exe;其它平台无影响
@@ -62,7 +64,7 @@ export async function launchJupyter(
         proc.stdout?.off('data', onChunk)
         proc.stderr?.off('data', onChunk)
         resolve({
-          server: { url: parsed.url, token: parsed.token, root: rootDir },
+          server: { url: parsed.url, token: parsed.token, root: dir },
           stop: () => proc.kill(),
         })
       }

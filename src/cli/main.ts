@@ -33,7 +33,7 @@ import { loadAuthorized, addAuthorized, removeAuthorized, authorize, type Pairin
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
-import { loadConfig } from './config'
+import { loadConfig, saveWorkdir } from './config'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 import { runConsole } from './console'
 
@@ -194,16 +194,19 @@ async function resolveJupyter(
 ): Promise<{ baseUrl: string; token: string; root: string; stop?: () => void }> {
   const explicitUrl = arg('jupyter')
   const explicitToken = arg('jupyter-token')
-  const existing = await detectServers()
   if (explicitUrl && explicitToken) {
-    // 显式 url/token;root 从本机探测结果取(API 不暴露 root_dir,只有 server list 输出有 OS 路径)。
+    // 显式 url/token 最优先(用户明确指定外部 jupyter);root 从探测结果取(API 不暴露 root_dir)。
+    const existing = await detectServers()
     return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root: pickRoot(existing, explicitUrl) }
   }
+  const workdir = loadConfig().workdir
+  // 设了 workdir → 跳过外部探测自启(确保用 workdir);否则探测外部 > 自启默认根
+  const existing = workdir ? [] : await detectServers()
   if (existing.length > 0) {
     console.log(`[ce] 探测到 Jupyter:${existing[0].url}(root ${existing[0].root})`)
     return { baseUrl: toLoopback(existing[0].url), token: existing[0].token, root: existing[0].root }
   }
-  console.log('[ce] 未探测到 Jupyter')
+  console.log('[ce] 未探测到 Jupyter' + (workdir ? `,用工作目录 ${workdir}` : ''))
   // 自装 Jupyter 前先拦 Python:没 Python 就给指引 + 退出,绝不拖到 pip 报错。
   await ensurePythonOrExit(relayUrl)
   const r = await ensureJupyter(realJupyterDeps())
@@ -216,10 +219,10 @@ async function resolveJupyter(
     process.exit(1)
   }
   console.log('[ce] 启动 Jupyter...')
-  const { server, stop } = await launchJupyter()
+  const { server, stop } = await launchJupyter(workdir)
   console.log(`[ce] 已启动 Jupyter:${server.url}`)
   const live = await detectServers() // 启动后再探一次拿 root_dir
-  return { baseUrl: toLoopback(server.url), token: server.token, root: pickRoot(live, server.url), stop }
+  return { baseUrl: toLoopback(server.url), token: server.token, root: workdir ?? pickRoot(live, server.url), stop }
 }
 
 /** 探测一个能跑的 claude 二进制。机器上可能装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
@@ -436,6 +439,12 @@ async function main(): Promise<void> {
       }
       if (path === '/control/update') {
         return json(await doUpdate())
+      }
+      if (path === '/control/workdir' && req.method === 'POST') {
+        const { workdir } = await req.json() as { workdir?: string }
+        saveWorkdir(workdir ?? '')
+        restartDaemon() // 存完重启 ce,新 ce 用 workdir 自启 jupyter(终端+CC 对话都切新目录)
+        return json({ ok: true, workdir: workdir || null })
       }
       if (path === '/control/pin' && req.method === 'POST') {
         const { pin } = await req.json() as { pin?: string }

@@ -106,7 +106,7 @@ async function menu(d: DaemonInfo): Promise<void> {
       `中继 ${C.cyan}${st.relay}${C.reset}`,
       `Jupyter ${C.cyan}${st.jupyter}${C.reset}  模式 ${st.pairingMode}${pinPart}`,
     ])
-    const help = `${C.dim}[s]启 [x]停 [r]重启 [u]更新 [p]改PIN [w]白名单 [l]日志 [d]体检 [q]退出${C.reset}`
+    const help = `${C.dim}[s]启 [x]停 [r]重启 [u]更新 [p]改PIN [w]白名单 [j]工作目录 [l]日志 [d]体检 [q]退出${C.reset}`
     process.stdout.write(clr + panel + '\n' + help + '\n> ')
     const k = await readKey()
     if (k === 'q') { console.log('\n再见(daemon 继续后台跑)。'); return }
@@ -126,6 +126,13 @@ async function menu(d: DaemonInfo): Promise<void> {
       }
       if (k === 'p') await changePin(d)
       if (k === 'w') await whitelist(d)
+      if (k === 'j') {
+        const wd = await prompt('\n工作目录(jupyter root_dir,留空=恢复默认根): ')
+        const r = await api<{ ok: boolean }>(d, '/control/workdir', { method: 'POST', body: JSON.stringify({ workdir: wd }) })
+        console.log(r.ok ? C.green + `\n✓ 已${wd ? '设为 ' + wd : '清除'},ce 重启中...` + C.reset : C.red + '\n✗ 失败' + C.reset)
+        await sleep(2500)
+        const nd = info(); if (nd) d = nd
+      }
       if (k === 'l') await showLogs(d)
       if (k === 'd') await doctor(d)
     } catch (e) {
