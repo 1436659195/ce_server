@@ -12,9 +12,8 @@
  * ⚠️ 整合胶水,无单测;手测见 P3-5 清单(需真实中继 + Jupyter)。
  */
 import WebSocket from 'ws'
-import qrcode from 'qrcode'
 import { hostname, homedir } from 'node:os'
-import { writeFileSync, mkdirSync, unlinkSync, readFileSync, chmodSync, renameSync } from 'node:fs'
+import { writeFileSync, mkdirSync, unlinkSync, readFileSync, chmodSync, renameSync, appendFileSync } from 'node:fs'
 import { join, parse as parsePath } from 'node:path'
 import { randomBytes, createHash } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
@@ -31,11 +30,13 @@ import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
 import { loadAuthorized, addAuthorized, removeAuthorized, authorize, type PairingMode } from './pairing'
 import { spawn, execFile } from 'node:child_process'
+import { createServer } from 'node:net'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
 import { loadConfig } from './config'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 import { runConsole } from './console'
+import { renderQr } from './qr'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -44,6 +45,24 @@ const dec = new TextDecoder()
 declare const CE_VERSION: string | undefined
 // 兜底两道:未注入(undefined)→ dev;注入了但异常短(<=1 字符,如曾经的 "v")→ 也回退 dev。
 const VERSION = typeof CE_VERSION !== 'undefined' && CE_VERSION.length > 1 ? CE_VERSION : 'dev'
+
+/** daemon 单例锁端口(固定,本机独占):同一时刻只能一个 daemon bind = 机器级单例。
+ *  进程死(正常/被杀/崩溃)内核自动回收端口 → 不用手动清,比文件锁可靠(文件锁崩溃留残留)。 */
+const LOCK_PORT = 48731
+
+/** Jupyter 验活:任意 HTTP 响应(含 401)即活;连接被拒/超时 = 死。复用上次 Jupyter 前先验活。 */
+async function jupyterAlive(url: string, token: string): Promise<boolean> {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 3000)
+  try {
+    await fetch(`${url}/api/status`, { headers: { Authorization: `Token ${token}` }, signal: ctrl.signal })
+    return true
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 function arg(name: string): string | undefined {
   const found = process.argv.find((a) => a.startsWith(`--${name}=`))
@@ -90,7 +109,7 @@ function realJupyterDeps(): JupyterInstallDeps {
     // spawn 不了 jupyter.exe,但 spawn python.exe 正常(见 launchJupyter 注释)。pip show 退码 0=已装。
     hasJupyter: async () => {
       try {
-        await pExecFile('python', ['-m', 'pip', 'show', 'jupyterlab'], { shell: true })
+        await pExecFile('python', ['-m', 'pip', 'show', 'jupyterlab'], { shell: true, windowsHide: true })
         return true
       } catch {
         return false
@@ -105,7 +124,7 @@ function realJupyterDeps(): JupyterInstallDeps {
         const p = spawn(
           'python',
           ['-m', 'pip', 'install', 'jupyterlab', '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple', '--trusted-host', 'pypi.tuna.tsinghua.edu.cn'],
-          { shell: true, stdio: 'inherit' }
+          { shell: true, stdio: 'inherit', windowsHide: true }
         )
         p.on('close', (c) => (c === 0 ? resolve() : reject(new Error(`pip 退出码 ${c}`))))
         p.on('error', reject)
@@ -134,7 +153,7 @@ async function ensurePythonOrExit(relayUrl: string): Promise<void> {
   const cmd = isWin ? 'python' : 'python3'
   let hasPython = true
   try {
-    await pExecFile(cmd, ['--version'], { shell: true })
+    await pExecFile(cmd, ['--version'], { shell: true, windowsHide: true })
   } catch {
     hasPython = false
   }
@@ -204,6 +223,17 @@ async function resolveJupyter(
     return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root: pickRoot(existing, explicitUrl) }
   }
   const osRoot = parsePath(process.cwd()).root // Linux/Mac '/',Windows 当前盘根 = ce 自启用的 root_dir
+  // 优先复用上次自启的 Jupyter(daemon 重启不起新的 → 终端会话/终端名不丢,手机不会因换 Jupyter 而 404)。
+  // 比 detectServers 的 jupyter list 解析可靠(Windows 路径格式/大小写坑,正是之前没复用、反复起多个的根因)。
+  try {
+    const saved = JSON.parse(readFileSync(join(homedir(), '.ce', 'jupyter.json'), 'utf8')) as { url: string; token: string; root?: string }
+    if (saved.url && saved.token && (await jupyterAlive(saved.url, saved.token))) {
+      console.log(`[ce] 复用上次 Jupyter:${saved.url}`)
+      return { baseUrl: toLoopback(saved.url), token: saved.token, root: saved.root ?? osRoot }
+    }
+  } catch {
+    /* 无 jupyter.json 或验活失败 → 落到探测/自启 */
+  }
   const existing = await detectServers()
   const reuse = existing.find((s) => s.root === osRoot) // 只复用 root 正好在根目录的现成 jupyter
   if (reuse) {
@@ -223,10 +253,25 @@ async function resolveJupyter(
     process.exit(1)
   }
   console.log('[ce] 启动 Jupyter...')
-  const { server, stop } = await launchJupyter() // 不传 rootDir → 默认宿主机根目录
+  // onLog:把 Jupyter 的 stdout/stderr 持续接走写 ~/.ce/ce.log —— 既 drain pipe(防 Jupyter 被自己日志噎死),
+  // 又让控制台 [l] 能看到 Jupyter 输出供排障。
+  const { server, stop } = await launchJupyter(undefined, 30000, (chunk) => {
+    try {
+      appendFileSync(join(homedir(), '.ce', 'ce.log'), chunk)
+    } catch {
+      /* 写失败忽略 */
+    }
+  })
   console.log(`[ce] 已启动 Jupyter:${server.url}`)
   const live = await detectServers() // 启动后再探一次拿 root_dir
-  return { baseUrl: toLoopback(server.url), token: server.token, root: pickRoot(live, server.url), stop }
+  const root = pickRoot(live, server.url)
+  // 记忆自启的 Jupyter:daemon 重启时 resolveJupyter 开头读它 + 验活复用,不再起新的(终端会话不丢)。
+  try {
+    writeFileSync(join(homedir(), '.ce', 'jupyter.json'), JSON.stringify({ url: server.url, token: server.token, root }))
+  } catch {
+    /* 写失败 → 下次可能再起一个,不致命 */
+  }
+  return { baseUrl: toLoopback(server.url), token: server.token, root, stop }
 }
 
 /** 探测一个能跑的 claude 二进制。机器上可能装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
@@ -278,6 +323,17 @@ async function main(): Promise<void> {
     console.error('（或先运行一行安装器: curl -fsSL http://<relay>/install.sh | sh）')
     console.error('（Windows: irm http://<relay>/install.ps1 | iex）')
     process.exit(1)
+  }
+
+  // 尽早登记 daemon(pid + starting):让控制台立刻发现「daemon 已在启动」并耐心等就绪,
+  // 而不是 12s 等不到就绪 daemon.json 就误报失败、还重复 spawn 多个 daemon。
+  // (首次 resolveJupyter 要 pip install jupyterlab ~1-2 分钟,远超控制台原 12s 等待。)
+  try {
+    const ceDir0 = join(homedir(), '.ce')
+    mkdirSync(ceDir0, { recursive: true })
+    writeFileSync(join(ceDir0, 'daemon.json'), JSON.stringify({ pid: process.pid, port: null, starting: true, version: VERSION, startAt: Date.now() }))
+  } catch {
+    /* 写失败不阻塞启动 */
   }
 
   const { baseUrl, token, root, stop } = await resolveJupyter(relayUrl)
@@ -424,6 +480,11 @@ async function main(): Promise<void> {
     const path = url.pathname
     try {
       if (path === '/control/state') {
+        // 连接码:daemon 注册中继成功后 printQr 落盘 ~/.ce/connection-code.json;尚未注册则 null(控制台提示稍后再试)
+        let connectionCode: string | null = null
+        try {
+          connectionCode = readFileSync(join(homedir(), '.ce', 'connection-code.json'), 'utf8')
+        } catch { /* 文件还没写 */ }
         return json({
           running: true, pid: process.pid, version: VERSION,
           relay: relayUrl, jupyter: baseUrl, pairingMode,
@@ -431,6 +492,7 @@ async function main(): Promise<void> {
           phones: [...phoneKeys.entries()].map(([id, v]) => ({ id, name: v.name })),
           paired: [...authorized],
           wsConnected: ws?.readyState === WebSocket.OPEN,
+          connectionCode,
         })
       }
       if (path === '/control/stop') {
@@ -515,7 +577,7 @@ async function main(): Promise<void> {
       try {
         const ceDir = join(homedir(), '.ce')
         mkdirSync(ceDir, { recursive: true })
-        writeFileSync(join(ceDir, 'daemon.json'), JSON.stringify({ port: hookPort, pid: process.pid, version: VERSION, startAt: Date.now() }))
+        writeFileSync(join(ceDir, 'daemon.json'), JSON.stringify({ port: hookPort, pid: process.pid, starting: false, version: VERSION, startAt: Date.now() }))
       } catch { /* 写失败→控制台发现不了,不致命 */ }
     }
     process.on('SIGINT', () => {
@@ -612,6 +674,13 @@ async function main(): Promise<void> {
       // 旧 WS 的延迟 close 不应误清刚由新 WS 的 attach 设上的新 owner。
       if (terms.get(name) === tws) terminalOwner.delete(name)
     })
+    tws.on('error', (e) => {
+      // 终端 ws 连接失败(Jupyter 里没这个终端名 → upgrade 404;或 Jupyter 重启)必须兜底:
+      // ws 'error' 无 listener 会抛 uncaughtException → 拖崩整个 daemon → 重启换 Jupyter →
+      // 旧终端名全失效 → 手机再连又 404 → 再崩,死循环(daemon 反复重启的根因)。
+      console.error(`[ce] 终端 ws 错误 ${name}:`, (e as Error).message)
+      if (terms.get(name) === tws) terms.delete(name)
+    })
     terms.set(name, tws)
     return tws
   }
@@ -633,21 +702,9 @@ async function main(): Promise<void> {
     } catch {
       /* 写失败→忽略(install.ps1 退化为提示原窗口) */
     }
-    // 半块字符紧凑渲染(2 module 行合并成 1 行、1 字符/module;比 qrcode terminal 的 ANSI 2空格/module 小一半多)
+    // 半块字符紧凑渲染(抽到 qr.ts:2 module 行合并 1 行、1 字符/module;控制台 [c] 也复用同一渲染)
     try {
-      const qr = qrcode.create(qrPayload)
-      const size = qr.modules.size
-      let out = ''
-      for (let y = 0; y < size; y += 2) {
-        let line = ''
-        for (let x = 0; x < size; x++) {
-          const top = qr.modules.get(x, y)
-          const bot = y + 1 < size && qr.modules.get(x, y + 1)
-          line += top && bot ? '█' : top ? '▀' : bot ? '▄' : ' '
-        }
-        out += line + '\n'
-      }
-      console.log('\n' + out)
+      console.log('\n' + renderQr(qrPayload))
       console.log('用 App 扫码连接(或下方连接码粘码)')
     } catch {
       /* 渲染失败→只给连接码 */
@@ -994,15 +1051,24 @@ async function main(): Promise<void> {
 // 入口分叉:--daemon 跑守护进程(main);否则跑控制台 TUI(console.ts)。
 // daemon 加全局错误兜底:小意外记日志不退,严重错误退出(由控制台/系统拉起)+清 stale daemon.json。
 if (process.argv.includes('--daemon')) {
-  process.on('unhandledRejection', (r) => console.error('[ce] ⚠ unhandledRejection(已兜底,不退出):', r))
-  process.on('uncaughtException', (e) => {
-    console.error('[ce] ✗ uncaughtException(将退出,由控制台/系统拉起):', e)
-    try { unlinkSync(join(homedir(), '.ce', 'daemon.json')) } catch { /* */ }
-    process.exit(1)
+  // 单例锁:占固定端口。EADDRINUSE = 已有 daemon 在跑 → 静默退出,绝不重复起 Jupyter/抢中继 cid/割裂终端会话。
+  // 这是「机器级唯一 daemon」的硬保证 —— 无论用户敲几次 ce、daemon 崩几次重启,同一时刻永远只有一个。
+  const lock = createServer()
+  lock.once('error', () => {
+    console.log('[ce] 已有 daemon 在跑(单例锁端口占用),本进程退出')
+    process.exit(0)
   })
-  main().catch((e) => {
-    console.error('[ce] 启动失败:', (e as Error).message)
-    process.exit(1)
+  lock.listen(LOCK_PORT, '127.0.0.1', () => {
+    process.on('unhandledRejection', (r) => console.error('[ce] ⚠ unhandledRejection(已兜底,不退出):', r))
+    process.on('uncaughtException', (e) => {
+      console.error('[ce] ✗ uncaughtException(将退出,由控制台/系统拉起):', e)
+      try { unlinkSync(join(homedir(), '.ce', 'daemon.json')) } catch { /* */ }
+      process.exit(1)
+    })
+    main().catch((e) => {
+      console.error('[ce] 启动失败:', (e as Error).message)
+      process.exit(1)
+    })
   })
 } else {
   runConsole().catch((e) => {

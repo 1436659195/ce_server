@@ -45,7 +45,8 @@ function pickFreePort(): Promise<number> {
  */
 export async function launchJupyter(
   rootDir?: string,
-  timeoutMs = 30000
+  timeoutMs = 30000,
+  onLog?: (chunk: Buffer) => void,
 ): Promise<{ server: JupyterServer; stop: () => void }> {
   // root_dir:传入则用(用户设的工作目录);否则宿主机根(parse(cwd).root → Linux/Mac '/',
   // Windows 当前盘根)——让 Jupyter 服务整个文件系统,手机文件栏从根起浏览。
@@ -59,6 +60,7 @@ export async function launchJupyter(
       {
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: true, // Windows 上靠 cmd 的 PATHEXT 解析 python.exe;其它平台无影响
+        windowsHide: true, // Windows 下别弹 cmd 控制台窗口(否则用户误关窗口 = 杀掉 Jupyter)
       },
     )
     let buf = ''
@@ -79,6 +81,14 @@ export async function launchJupyter(
         clearTimeout(timer)
         proc.stdout?.off('data', onChunk)
         proc.stderr?.off('data', onChunk)
+        // 拿到 token 后必须继续接走 stdout/stderr:Jupyter 每个请求都打日志,不读会让 pipe buffer(~64KB)
+        // 填满 → Jupyter 阻塞在 write → 不响应请求(手机连不上、doctor 探测超时显示「未检测到」)。
+        // onLog 由 main 传入写 ~/.ce/ce.log(控制台 [l] 可看 Jupyter 卡死前最后输出);不传则纯 drain 丢弃。
+        const drain = (d2: Buffer): void => {
+          onLog?.(d2)
+        }
+        proc.stdout?.on('data', drain)
+        proc.stderr?.on('data', drain)
         resolve({
           server: { url: parsed.url, token: parsed.token, root: dir },
           stop: () => proc.kill(),

@@ -6,18 +6,20 @@
  * 配套:daemon 侧路由见 main.ts 的 controlRoute。
  */
 import { createInterface } from 'node:readline'
-import { readFileSync } from 'node:fs'
+import { readFileSync, openSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
+import { renderQr } from './qr'
 
 const DAEMON_JSON = join(homedir(), '.ce', 'daemon.json')
 
-interface DaemonInfo { port: number; pid: number; version?: string }
+interface DaemonInfo { port?: number; pid: number; version?: string; starting?: boolean }
 interface State {
   running: boolean; pid: number; version: string; relay: string; jupyter: string
   pairingMode: string; pin: string; phones: { id: string; name: string }[]; paired: string[]
   wsConnected: boolean
+  connectionCode: string | null
 }
 
 const C = {
@@ -35,13 +37,18 @@ function box(lines: string[]): string {
   return '┌' + '─'.repeat(w) + '┐\n' + lines.map(line).join('\n') + '\n└' + '─'.repeat(w) + '┘'
 }
 
-/** daemon 在跑?读 daemon.json + pid 存活探测(kill -0)。 */
-function info(): DaemonInfo | null {
+/** daemon 进程在不在:读 daemon.json + pid 存活探测(kill -0)。starting(还没就绪/port 未定)也算"在"。 */
+function procInfo(): DaemonInfo | null {
   try {
     const d = JSON.parse(readFileSync(DAEMON_JSON, 'utf8')) as DaemonInfo
-    if (!d.port || !d.pid) return null
+    if (!d.pid) return null
     try { process.kill(d.pid, 0); return d } catch { return null }
   } catch { return null }
+}
+/** daemon 就绪(进程在 + 控制端点 port 已定)。控制台进 menu 前要就绪。 */
+function readyInfo(): DaemonInfo | null {
+  const d = procInfo()
+  return d?.port ? d : null
 }
 
 async function api<T>(d: DaemonInfo, path: string, init?: RequestInit): Promise<T> {
@@ -55,7 +62,16 @@ function startDaemon(): void {
   const isDev = process.argv[1]?.endsWith('.ts') ?? false
   const cmd = isDev ? process.argv[0]! : process.execPath
   const args = isDev ? [process.argv[1]!, '--daemon'] : ['--daemon']
-  spawn(cmd, args, { detached: true, stdio: 'ignore', cwd: process.cwd() }).unref()
+  // daemon stdout/stderr → ~/.ce/ce.log(append):否则 stdio:'ignore' 吞掉 [ce] 日志 + uncaughtException,
+  // daemon 崩溃/重连时无据可查(控制台 [l] 只看得到 Jupyter 日志)。
+  let stdio: Array<'ignore' | number> = ['ignore', 'ignore', 'ignore']
+  try {
+    const fd = openSync(join(homedir(), '.ce', 'ce.log'), 'a')
+    stdio = ['ignore', fd, fd]
+  } catch {
+    /* 开日志失败 → 退回 ignore,不阻塞启动 */
+  }
+  spawn(cmd, args, { detached: true, stdio, cwd: process.cwd() }).unref()
 }
 
 /** 单键读取(raw mode);Ctrl+C/Ctrl+D 转 'q'。 */
@@ -83,12 +99,29 @@ async function prompt(msg: string): Promise<string> {
 export async function runConsole(): Promise<void> {
   process.stdout.write(clr)
   console.log(`${C.bold}ce 控制台${C.reset}`)
-  let d = info()
+  let d = procInfo()
   if (!d) {
     console.log('daemon 未运行,启动中...')
     startDaemon()
-    for (let i = 0; i < 40 && !d; i++) { await sleep(300); d = info() }
-    if (!d) { console.error(C.red + 'daemon 启动失败。手动排查:ce --daemon' + C.reset); process.exit(1) }
+  } else if (!d.port) {
+    console.log('daemon 启动中(首次正在准备 Jupyter,约 1-2 分钟)...')
+  }
+  // 等就绪(port 出现),最长 ~3 分钟(首次 pip install jupyterlab)。daemon 进程消失 = 真失败。
+  // 老逻辑只等 12s 就报失败 → 首次装 Jupyter 时必然误报 + 重复 spawn 多个 daemon。
+  for (let i = 0; i < 180; i++) {
+    if (d?.port) break
+    await sleep(1000)
+    d = procInfo()
+    if (!d) {
+      console.error(C.red + '\ndaemon 启动失败(进程已退出)。手动排查:ce --daemon' + C.reset)
+      process.exit(1)
+    }
+    process.stdout.write('.')
+  }
+  process.stdout.write('\n')
+  if (!d?.port) {
+    console.error(C.red + 'daemon 启动超时(首次装 Jupyter 较慢)。可先跑 ce --daemon 看进度,起来后再 ce' + C.reset)
+    process.exit(1)
   }
   await menu(d)
 }
@@ -106,7 +139,7 @@ async function menu(d: DaemonInfo): Promise<void> {
       `中继 ${C.cyan}${st.relay}${C.reset}`,
       `Jupyter ${C.cyan}${st.jupyter}${C.reset}  模式 ${st.pairingMode}${pinPart}`,
     ])
-    const help = `${C.dim}[s]启 [x]停 [r]重启 [u]更新 [p]改PIN [w]白名单 [l]日志 [d]体检 [q]退出${C.reset}`
+    const help = `${C.dim}[s]启 [x]停 [r]重启 [u]更新 [c]二维码 [p]改PIN [w]白名单 [l]日志 [d]体检 [q]退出${C.reset}`
     process.stdout.write(clr + panel + '\n' + help + '\n> ')
     const k = await readKey()
     if (k === 'q') { console.log('\n再见(daemon 继续后台跑)。'); return }
@@ -116,14 +149,15 @@ async function menu(d: DaemonInfo): Promise<void> {
       if (k === 'r') {
         await api(d, '/control/restart', { method: 'POST' })
         console.log('\n重启中...'); await sleep(2500)
-        const nd = info(); if (nd) d = nd
+        const nd = readyInfo(); if (nd) d = nd
       }
       if (k === 'u') {
         const r = await api<{ ok: boolean; updated?: boolean; error?: string }>(d, '/control/update', { method: 'POST' })
         console.log('\n' + (r.ok ? (r.updated ? C.green + '✓ 已更新,重启中...' + C.reset : '已是最新,无需更新') : C.red + '✗ ' + r.error + C.reset))
-        if (r.ok && r.updated) { await sleep(2500); const nd = info(); if (nd) d = nd }
+        if (r.ok && r.updated) { await sleep(2500); const nd = readyInfo(); if (nd) d = nd }
         await sleep(1500)
       }
+      if (k === 'c') await showQr(d)
       if (k === 'p') await changePin(d)
       if (k === 'w') await whitelist(d)
       if (k === 'l') await showLogs(d)
@@ -154,6 +188,24 @@ async function whitelist(d: DaemonInfo): Promise<void> {
   await api(d, '/control/unpair', { method: 'POST', body: JSON.stringify({ phoneId: p.id }) })
   console.log(C.green + '\n✓ 已踢 ' + (p.name || p.id) + C.reset)
   await sleep(1500)
+}
+
+/** 全屏显示二维码 + 连接码 + PIN(daemon 注册成功后才有 connectionCode)。按任意键返回。 */
+async function showQr(d: DaemonInfo): Promise<void> {
+  const st = await api<State>(d, '/control/state')
+  if (!st.connectionCode) {
+    console.log(clr + C.yellow + '尚未生成连接码(daemon 还在连中继,稍候按 [c] 再试)。' + C.reset)
+    await readKey()
+    return
+  }
+  let qr = ''
+  try { qr = renderQr(st.connectionCode) } catch { /* 渲染失败→只给连接码文本 */ }
+  const pinLine = st.pairingMode === 'pin'
+    ? `\n配对 PIN(新手机首次连接在 App 输入): ${C.bold}${st.pin}${C.reset}`
+    : ''
+  const head = qr ? qr + '\n' + C.dim + '用 App 扫码,或手动粘贴下方连接码:' + C.reset + '\n' : ''
+  console.log(clr + head + st.connectionCode + pinLine + '\n\n' + C.dim + '(按任意键返回)' + C.reset)
+  await readKey()
 }
 
 async function showLogs(d: DaemonInfo): Promise<void> {

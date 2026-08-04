@@ -68,7 +68,7 @@ export async function detectServers(): Promise<JupyterServer[]> {
   for (const sub of [['-m', 'jupyter_server', 'list'], ['-m', 'notebook', 'list']]) {
     try {
       // shell:true —— Windows 上靠 cmd 的 PATHEXT 解析 python.exe(其它平台无影响)
-      const { stdout } = await pExecFile('python', sub, { shell: true })
+      const { stdout } = await pExecFile('python', sub, { shell: true, windowsHide: true })
       const parsed = parseServerList(stdout)
       const live: JupyterServer[] = []
       for (const s of parsed) {
