@@ -950,6 +950,49 @@ async function main(): Promise<void> {
             const allow = (req as { decision?: 'allow' | 'deny' }).decision === 'allow'
             const hit = agentRunner.resolveApproval(reqId, allow) || approvals.resolve(reqId, allow ? 'allow' : 'deny')
             resp = { ok: true, data: { resolved: hit } }
+          } else if (req.op === 'exec') {
+            // 通用 exec(被控机跑一条命令,无 shell、捕 stdout/stderr/exitCode)。
+            // 无 shell(execFile)→ args 无法链式起别的程序,手机侧程序名白名单是唯一闸门。
+            // ENOENT(命令不存在)→ exitCode 127,让手机判「未安装」(而非 RPC 失败)。
+            const parseArgs = (s: string): string[] => {
+              const out: string[] = []
+              const re = /"([^"]*)"|'([^']*)'|(\S+)/g
+              let m: RegExpExecArray | null
+              while ((m = re.exec(s))) out.push(m[1] ?? m[2] ?? m[3] ?? '')
+              return out
+            }
+            const command = (req as { command?: string }).command ?? ''
+            const cwd = (req as { cwd?: string }).cwd
+            const tokens = parseArgs(command)
+            if (tokens.length === 0) {
+              resp = { ok: false, error: 'exec: 空命令' }
+            } else {
+              resp = await new Promise<{ ok: true; data: { stdout: string; stderr: string; exitCode: number } }>(
+                (resolve) => {
+                  execFile(
+                    tokens[0],
+                    tokens.slice(1),
+                    { cwd: cwd || undefined, timeout: 15000, maxBuffer: 1 << 20 },
+                    (err, stdout, stderr) => {
+                      if (err) {
+                        const e = err as NodeJS.ErrnoException
+                        const exitCode = e.code === 'ENOENT' ? 127 : typeof e.code === 'number' ? e.code : 1
+                        resolve({
+                          ok: true,
+                          data: {
+                            stdout: '',
+                            stderr: (stderr ? String(stderr) + '\n' : '') + String(e.message),
+                            exitCode,
+                          },
+                        })
+                      } else {
+                        resolve({ ok: true, data: { stdout: String(stdout), stderr: String(stderr), exitCode: 0 } })
+                      }
+                    },
+                  )
+                },
+              )
+            }
           } else {
             resp = await handleRpc(jupyter, req)
           }
