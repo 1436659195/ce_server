@@ -50,13 +50,14 @@ const VERSION = typeof CE_VERSION !== 'undefined' && CE_VERSION.length > 1 ? CE_
  *  进程死(正常/被杀/崩溃)内核自动回收端口 → 不用手动清,比文件锁可靠(文件锁崩溃留残留)。 */
 const LOCK_PORT = 48731
 
-/** Jupyter 验活:任意 HTTP 响应(含 401)即活;连接被拒/超时 = 死。复用上次 Jupyter 前先验活。 */
+/** Jupyter 验活:仅 200(token 对当前 Jupyter 有效)才算活;401/403(token 不匹配)/连接拒绝/超时 = 死。
+ *  复用 jupyter.json 前先验:旧 token 对换了进程的 Jupyter 无效 → 不复用,落自启拿新 token(否则后续 API 全 403)。 */
 async function jupyterAlive(url: string, token: string): Promise<boolean> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 3000)
   try {
-    await fetch(`${url}/api/status`, { headers: { Authorization: `Token ${token}` }, signal: ctrl.signal })
-    return true
+    const res = await fetch(`${url}/api/status`, { headers: { Authorization: `Token ${token}` }, signal: ctrl.signal })
+    return res.ok
   } catch {
     return false
   } finally {
@@ -236,10 +237,13 @@ async function resolveJupyter(
   }
   const existing = await detectServers()
   const reuse = existing.find((s) => s.root === osRoot) // 只复用 root 正好在根目录的现成 jupyter
-  if (reuse) {
+  if (reuse && (await jupyterAlive(reuse.url, reuse.token))) {
+    // 验 token 有效才复用:有的旧 Jupyter runtime stale / jupyter list 没带 token → detectServers 拿到空 token,
+    // 盲信复用会让后续所有 API 403。验不过(token 空/失效)就落自启,起一个 token 干净的新 Jupyter。
     console.log(`[ce] 复用根目录 Jupyter:${reuse.url}(root ${reuse.root})`)
     return { baseUrl: toLoopback(reuse.url), token: reuse.token, root: reuse.root }
   }
+  if (reuse) console.log(`[ce] 探到的 Jupyter ${reuse.url} token 验证失败(旧实例/runtime stale),改为自启`)
   console.log('[ce] 未发现根目录的 Jupyter,自启...')
   // 自装 Jupyter 前先拦 Python:没 Python 就给指引 + 退出,绝不拖到 pip 报错。
   await ensurePythonOrExit(relayUrl)
@@ -838,7 +842,14 @@ async function main(): Promise<void> {
           if (req.op === 'listTerminals') {
             // 转发 GET /api/terminals 拿「Jupyter 上所有终端」+ 用 ce 的 terms map 标 managed。
             // 手机「+」面板显示全部;杀 app 重开自动恢复只挑 managed(= ce 经手过的),零回归。
-            const all = await jupyter.listTerminals()
+            let all: { name: string; last_activity?: string }[] = []
+            try {
+              all = await jupyter.listTerminals()
+            } catch (e) {
+              // Jupyter token 失效(403)/卡死/重启中:别让 listTerminals 抛成 unhandledRejection 拖累。
+              // 退化为空列表(手机暂时看不到终端,但不崩;Jupyter 恢复后下次刷新补全量)。
+              console.error('[ce] 列终端失败,退化为空列表:', (e as Error).message)
+            }
             // 每条加 occupiedBy(占用者显示名;null=空闲)—— 手机「+」面板据此灰显别人在用的
             const terminals = toRemoteTerminals(all, new Set(terms.keys())).map((t) => ({
               ...t,
