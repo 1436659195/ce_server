@@ -4,17 +4,19 @@
 
 ## 一行安装
 
+默认连本项目中继 `ce.coding-everywhere.xyz`(wss 加密)。
+
 **Linux / macOS**(终端):
 ```sh
-curl -fsSL http://<中继地址>/install.sh | sh
+curl -fsSL https://ce.coding-everywhere.xyz/install.sh | sh
 ```
 
 **Windows**(PowerShell):
 ```powershell
-irm http://<中继地址>/install.ps1 | iex
+irm https://ce.coding-everywhere.xyz/install.ps1 | iex
 ```
 
-> `<中继地址>` 由服务运营者提供(形如 `your-relay.com:8606`)。通常你拿到的就是一条完整的 `curl … | sh` 命令,复制粘贴执行即可。
+> 自建中继把域名换成自己的;中继在 serve 安装脚本时已把地址注入,运营者通常给你一条可直接执行的完整命令。
 
 ## 装的过程(全自动)
 
@@ -78,4 +80,4 @@ CE 已在跑时,安装器会复用原 CE 的连接码(不重启)。看原 CE 窗
 问服务运营者 / 部署管理员。中继在 serve 安装脚本时已把地址注入,你通常拿到的是一条可直接执行的完整命令。
 
 **Q: 防火墙 / 公司网络拦了怎么办?**
-CE 走 WebSocket 连中继(出站)。若被拦,让网管放行到中继地址的出站 8606(或运营者指定端口)。
+CE 走 WebSocket(wss,出站 443)连中继。若被拦,让网管放行到中继域名的出站 443。

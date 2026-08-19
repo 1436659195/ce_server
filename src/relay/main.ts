@@ -14,6 +14,10 @@ const port = portArg
 
 const tlsCert = process.argv.find((a) => a.startsWith('--tls-cert='))?.split('=')[1]
 const tlsKey = process.argv.find((a) => a.startsWith('--tls-key='))?.split('=')[1]
+// 绑定网卡:--host= 或 RELAY_BIND;都不配 → 不传 host(Node 默认 0.0.0.0,向后兼容)。
+// 上反代(Caddy/nginx + TLS)时配 127.0.0.1,使明文 :port 仅本机可达,不对公网暴露(纵深防御)。
+const bindHost =
+  process.argv.find((a) => a.startsWith('--host='))?.split('=')[1] ?? process.env.RELAY_BIND
 // 对外中继地址(--public-url 或 RELAY_PUBLIC_URL):install 脚本注入用它,防 Host 头伪造。不配则回退请求 Host。
 const publicUrl =
   process.argv.find((a) => a.startsWith('--public-url='))?.split('=')[1] ?? process.env.RELAY_PUBLIC_URL
@@ -49,9 +53,15 @@ const { server, close } = createRelayServer(hub, {
   lanPyPath: join(here, '..', '..', 'scripts', 'lan.py'),
   publicUrl,
 })
-server.listen(port, () => {
-  console.log(`[relay] listening on :${port}${tlsCert ? ' (wss/TLS)' : ' (ws)'}`)
-})
+if (bindHost) {
+  server.listen(port, bindHost, () => {
+    console.log(`[relay] listening on ${bindHost}:${port}${tlsCert ? ' (wss/TLS)' : ' (ws)'}`)
+  })
+} else {
+  server.listen(port, () => {
+    console.log(`[relay] listening on :${port}${tlsCert ? ' (wss/TLS)' : ' (ws)'}`)
+  })
+}
 
 // 优雅退出
 process.on('SIGINT', () => {

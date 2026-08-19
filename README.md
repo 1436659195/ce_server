@@ -29,24 +29,35 @@ vi .env                     # 填:RELAY_STATE_KEY(密钥)/ RELAY_PUBLIC_URL(对�
 
 > `.env` 含密钥,已在 `.gitignore` 里(不进 git);各项含义见 `.env.example` 注释。
 
-**或手动启动**(不用脚本,直接 bun):
+**或手动启动**(不用脚本,直接 bun;明文仅本地测试 —— 生产上 wss 见 [docs/ops.md](docs/ops.md)):
 
 ```sh
 RELAY_STATE_KEY=<密钥> bun run src/relay/main.ts \
   --port=8606 --public-url=ws://<公网地址>:8606
 ```
 
-中继轻量(实测 ~60MB 内存、几乎不吃 CPU),2C2G 的入门服务器绰绰有余。手机和被控机都连这个公网地址。完整参数、安全机制、运维排障见 [docs/ops.md](docs/ops.md)。
+中继轻量(实测 ~60MB 内存、几乎不吃 CPU),2C2G 的入门服务器绰绰有余。手机和被控机都连这个公网地址。**生产务必上 wss(Caddy 反代 + Let's Encrypt 证书,堵明文;部署方式见 [docs/ops.md](docs/ops.md))**,别裸跑明文 ws。完整参数、安全机制、运维排障同样见 [docs/ops.md](docs/ops.md)。
 
 ## 部署被控机 ce
+
+**一行装二进制**(推荐,给被控机用户,无需 clone 本仓库;默认连本项目中继 `ce.coding-everywhere.xyz`,wss 加密):
+
+```sh
+# Linux / macOS
+curl -fsSL https://ce.coding-everywhere.xyz/install.sh | sh
+```
+```powershell
+# Windows(PowerShell)
+irm https://ce.coding-everywhere.xyz/install.ps1 | iex
+```
+
+装完自动写入中继地址、起后台 ce、打印二维码 —— 手机扫码即配对(首次输 PIN)。自建中继把上面域名换成自己的即可。详见 [INSTALL.md](INSTALL.md)。
 
 **源码直跑**(开发/自测):
 ```sh
 bun install
-bun run src/cli/main.ts --relay=ws://<中继>:8606 --jupyter=http://localhost:8888
+bun run src/cli/main.ts --relay=wss://ce.coding-everywhere.xyz --jupyter=http://localhost:8888
 ```
-
-**一行装二进制**(给被控机用户,无需 clone 本仓库):见 [INSTALL.md](INSTALL.md)。
 
 ## 编译分发二进制
 
@@ -60,7 +71,7 @@ bash scripts/build-binaries.sh
 ## 中继上补齐 `dist/`(让 `curl|sh` 能装 ce)
 
 中继只做转发、不依赖二进制;但被控机用 `curl|sh` 安装时要从中继 `/dl/` 下载 ce。
-若 `http://<中继>:8606/dl/ce-linux-x64` 返回 **404**,说明中继机上 `dist/` 没编译 —— 在**中继机本身**上跑:
+若 `https://<域名>/dl/ce-linux-x64` 返回 **404**,说明中继机上 `dist/` 没编译 —— 在**中继机本身**上跑:
 
 1. 定位 ce-server 根目录(含 `scripts/build-binaries.sh`):
    ```bash

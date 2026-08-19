@@ -19,12 +19,24 @@
 
 ### 中继 relay(公网服务器)
 
+**推荐:Caddy 反代终止 TLS** —— relay 本地明文、对外 wss、证书自动续(本项目生产部署即此方式):
+
+```bash
+# .env 里:
+#   RELAY_BIND=127.0.0.1                         # relay 只听 loopback(纵深防御)
+#   RELAY_PUBLIC_URL=wss://<域名>                 # 对外 wss 地址
+# ./start.sh 起 relay 后,写 /etc/caddy/Caddyfile:
+#   <域名> { reverse_proxy 127.0.0.1:8606 }
+# 安全组放行 80/443;systemctl reload caddy 自动签 Let's Encrypt 证书。
+```
+
+**或 relay 直挂 TLS 证书**(无反代,自己管续期):
 ```bash
 RELAY_STATE_KEY=<强密钥> \
 bun run src/relay/main.ts \
   --port=8606 --state=relay-state.json \
-  --public-url=ws://<公网IP或域名>:8606 \
-  [--tls-cert=cert.pem --tls-key=key.pem]   # 上 wss 用,强烈建议
+  --public-url=wss://<域名> \
+  --tls-cert=cert.pem --tls-key=key.pem
 ```
 
 | 参数 | 作用 |
@@ -40,7 +52,7 @@ bun run src/relay/main.ts \
 
 ```bash
 bun run src/cli/main.ts \
-  --relay=ws://<中继>:8606 \
+  --relay=wss://<域名> \
   [--jupyter=http://127.0.0.1:8888 --jupyter-token=t] \
   --pairing-mode=pin \
   [--pin=NNNNNN]

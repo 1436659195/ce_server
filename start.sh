@@ -34,6 +34,9 @@ ARGS=(--port="$RELAY_PORT" --public-url="$RELAY_PUBLIC_URL")
 if [ -n "${RELAY_STATE:-}" ]; then
   ARGS+=(--state="$RELAY_STATE")   # 可选 state 路径;不配 → main.ts 默认 ./relay-state.json
 fi
+if [ -n "${RELAY_BIND:-}" ]; then
+  ARGS+=(--host="$RELAY_BIND")   # 可选绑定网卡;反代场景配 127.0.0.1,使明文 port 不对公网暴露
+fi
 if [ -n "${RELAY_TLS_CERT:-}" ] && [ -n "${RELAY_TLS_KEY:-}" ]; then
   ARGS+=(--tls-cert="$RELAY_TLS_CERT" --tls-key="$RELAY_TLS_KEY")
   SCHEME=wss
