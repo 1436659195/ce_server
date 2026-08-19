@@ -28,3 +28,4 @@ Thumbs.db
 
 # CodeGraph 本地索引(不进 git)
 .codegraph/
+.ipynb_checkpoints/

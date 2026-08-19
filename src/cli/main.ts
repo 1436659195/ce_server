@@ -11,14 +11,14 @@
  *
  * ⚠️ 整合胶水,无单测;手测见 P3-5 清单(需真实中继 + Jupyter)。
  */
-import WebSocket from 'ws'
+import WebSocket, { type RawData } from 'ws'
 import { hostname, homedir } from 'node:os'
 import { writeFileSync, mkdirSync, unlinkSync, readFileSync, chmodSync, renameSync, appendFileSync } from 'node:fs'
 import { join, parse as parsePath } from 'node:path'
 import { randomBytes, createHash } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
-import { detectServers } from './jupyter-detect'
+import { detectServers, isAlive } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { ButlerManager } from './butler'
@@ -37,6 +37,8 @@ import { loadConfig } from './config'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 import { runConsole } from './console'
 import { renderQr } from './qr'
+import { rotateLogIfBig } from './log'
+import { ManagedTerms } from './managed-terms'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -49,21 +51,6 @@ const VERSION = typeof CE_VERSION !== 'undefined' && CE_VERSION.length > 1 ? CE_
 /** daemon 单例锁端口(固定,本机独占):同一时刻只能一个 daemon bind = 机器级单例。
  *  进程死(正常/被杀/崩溃)内核自动回收端口 → 不用手动清,比文件锁可靠(文件锁崩溃留残留)。 */
 const LOCK_PORT = 48731
-
-/** Jupyter 验活:仅 200(token 对当前 Jupyter 有效)才算活;401/403(token 不匹配)/连接拒绝/超时 = 死。
- *  复用 jupyter.json 前先验:旧 token 对换了进程的 Jupyter 无效 → 不复用,落自启拿新 token(否则后续 API 全 403)。 */
-async function jupyterAlive(url: string, token: string): Promise<boolean> {
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 3000)
-  try {
-    const res = await fetch(`${url}/api/status`, { headers: { Authorization: `Token ${token}` }, signal: ctrl.signal })
-    return res.ok
-  } catch {
-    return false
-  } finally {
-    clearTimeout(timer)
-  }
-}
 
 function arg(name: string): string | undefined {
   const found = process.argv.find((a) => a.startsWith(`--${name}=`))
@@ -228,7 +215,7 @@ async function resolveJupyter(
   // 比 detectServers 的 jupyter list 解析可靠(Windows 路径格式/大小写坑,正是之前没复用、反复起多个的根因)。
   try {
     const saved = JSON.parse(readFileSync(join(homedir(), '.ce', 'jupyter.json'), 'utf8')) as { url: string; token: string; root?: string }
-    if (saved.url && saved.token && (await jupyterAlive(saved.url, saved.token))) {
+    if (saved.url && saved.token && (await isAlive(saved.url, saved.token))) {
       console.log(`[ce] 复用上次 Jupyter:${saved.url}`)
       return { baseUrl: toLoopback(saved.url), token: saved.token, root: saved.root ?? osRoot }
     }
@@ -237,7 +224,7 @@ async function resolveJupyter(
   }
   const existing = await detectServers()
   const reuse = existing.find((s) => s.root === osRoot) // 只复用 root 正好在根目录的现成 jupyter
-  if (reuse && (await jupyterAlive(reuse.url, reuse.token))) {
+  if (reuse && (await isAlive(reuse.url, reuse.token))) {
     // 验 token 有效才复用:有的旧 Jupyter runtime stale / jupyter list 没带 token → detectServers 拿到空 token,
     // 盲信复用会让后续所有 API 403。验不过(token 空/失效)就落自启,起一个 token 干净的新 Jupyter。
     console.log(`[ce] 复用根目录 Jupyter:${reuse.url}(root ${reuse.root})`)
@@ -261,7 +248,9 @@ async function resolveJupyter(
   // 又让控制台 [l] 能看到 Jupyter 输出供排障。
   const { server, stop } = await launchJupyter(undefined, 30000, (chunk) => {
     try {
-      appendFileSync(join(homedir(), '.ce', 'ce.log'), chunk)
+      const p = join(homedir(), '.ce', 'ce.log')
+      rotateLogIfBig(p) // 写前轮转,防 Jupyter 访问日志撑爆磁盘
+      appendFileSync(p, chunk)
     } catch {
       /* 写失败忽略 */
     }
@@ -341,7 +330,16 @@ async function main(): Promise<void> {
   }
 
   const { baseUrl, token, root, stop } = await resolveJupyter(relayUrl)
-  if (stop) process.on('SIGINT', stop)
+  if (stop) {
+    // daemon 退出(含崩溃 uncaughtException / process.exit)必杀自启的 Jupyter + 清 daemon.json:
+    // 原 only SIGINT 调 stop → 崩溃退出留 Jupyter 孤儿(占端口/内存,越攒越多)。
+    const killJupyter = () => { try { stop() } catch { /* 已死 */ } }
+    process.on('SIGINT', killJupyter)
+    process.on('exit', () => {
+      killJupyter() // exit 兜底覆盖所有退出路径
+      try { unlinkSync(join(homedir(), '.ce', 'daemon.json')) } catch { /* 清 starting 残留/就绪态 */ }
+    })
+  }
 
   // --insecure:容忍自签证书(bun 下 ws 的 rejectUnauthorized 不生效,改设环境变量)
   const insecure = process.argv.includes('--insecure')
@@ -369,6 +367,10 @@ async function main(): Promise<void> {
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
+  // managed 终端集落盘(~/.ce/managed-terminals.json):terms 是内存态,daemon 重启即空 →
+  // listTerminals 全员 managed=false → 手机杀 app 重开不自动恢复(会话管理「清空」观感)。
+  // 重启后由它合并标注;终端真没了(Jupyter 列表不含)由 listTerminals 顺手 prune。
+  const managedTerms = new ManagedTerms(join(homedir(), '.ce', 'managed-terminals.json'))
   // 终端输出环形缓冲:转发 TermOutput 时旁路 append(与 owner 无关);read_terminal 工具读它(ce 本地,不回程问手机)。
   const buffers = new TermBuffers(500)
   // AI 管家:每台手机一个 cc(stream-json,全 pipe 由 ce spawn),ce 桥接 ButlerStdin/ButlerOutput。
@@ -686,6 +688,7 @@ async function main(): Promise<void> {
       if (terms.get(name) === tws) terms.delete(name)
     })
     terms.set(name, tws)
+    managedTerms.add(name) // ce 经手过 → managed(重启后仍能被手机自动恢复)
     return tws
   }
 
@@ -717,9 +720,12 @@ async function main(): Promise<void> {
     if (pairingMode === 'pin') console.log(`[ce] 配对 PIN(新手机首次连接在 App 输入): ${currentPin}\n`)
   }
 
-  // 在已注册的 ws 上接主消息循环(握手 + rpc + stdin + resize)
-  function wireBridge(curWs: WebSocket): void {
-    curWs.on('message', async (raw) => {
+  // 在已注册的 ws 上接主消息循环(握手 + rpc + stdin + resize)。
+  // pending:'registered' 之前到达的帧(中继 register 时立刻补发的 cliBuffer —— 旧版中继会先于
+  // 'registered' 发出,曾被 connect() 的临时处理器静默丢弃 = 掉线后探活全失败的根因)。
+  // 现临时处理器把它们缓冲到此处,挂好正式处理器后按序补处理(双端容错:无论中继补发早晚都不丢)。
+  function wireBridge(curWs: WebSocket, pending: RawData[] = []): void {
+    const onMessage = async (raw: RawData): Promise<void> => {
       let frame: Frame
       try {
         frame = decodeFrame(raw as Uint8Array)
@@ -850,8 +856,15 @@ async function main(): Promise<void> {
               // 退化为空列表(手机暂时看不到终端,但不崩;Jupyter 恢复后下次刷新补全量)。
               console.error('[ce] 列终端失败,退化为空列表:', (e as Error).message)
             }
+            // managed = terms(本次生命周期经手)∪ 落盘集合(上次生命周期经手;daemon 重启后
+            // terms 空但终端仍活在 Jupyter,靠它让手机杀 app 重开还能自动恢复会话)。
+            const managedSet = new Set(terms.keys())
+            for (const n of managedTerms.values()) managedSet.add(n)
+            // 顺手清理落盘集合:Jupyter 列表已不含的终端名摘掉(终端真没了,防文件无限膨胀)。
+            // 列表获取失败(all 空)不 prune —— 空列表≠终端全死,误清会丢用户会话。
+            if (all.length > 0) managedTerms.prune(all.map((t) => t.name))
             // 每条加 occupiedBy(占用者显示名;null=空闲)—— 手机「+」面板据此灰显别人在用的
-            const terminals = toRemoteTerminals(all, new Set(terms.keys())).map((t) => ({
+            const terminals = toRemoteTerminals(all, managedSet).map((t) => ({
               ...t,
               occupiedBy: terminalOwner.has(t.name)
                 ? (phoneKeys.get(terminalOwner.get(t.name)!)?.name ?? null)
@@ -884,6 +897,7 @@ async function main(): Promise<void> {
                 terms.delete(termName)
               }
               terminalOwner.delete(termName) // 释放占用(终端已删,owner 无意义)
+              managedTerms.remove(termName) // 硬删 → 不再 managed(杀 app 重开不恢复)
               try {
                 await fetch(`${baseUrl}/api/terminals/${encodeURIComponent(termName)}`, {
                   method: 'DELETE',
@@ -913,6 +927,7 @@ async function main(): Promise<void> {
                 terms.delete(termName)
               }
               terminalOwner.delete(termName) // 软移除也释放占用:别人可从「+」面板重新接管
+              managedTerms.remove(termName) // 软移除 = 用户显式不要 → 不再 managed(同硬删语义)
               resp = { ok: true }
             }
           } else if (req.op === 'createTerminal') {
@@ -935,6 +950,7 @@ async function main(): Promise<void> {
                 typeof (resp.data as { name?: string }).name === 'string'
               ) {
                 terminalOwner.set((resp.data as { name: string }).name, srcPhone)
+                managedTerms.add((resp.data as { name: string }).name) // 新建即经手 → managed
               }
             }
           } else if (req.op === 'butlerStart') {
@@ -1059,12 +1075,18 @@ async function main(): Promise<void> {
         default:
           break
       }
-    })
+    }
+    // 先按序补处理 'registered' 前到达的帧,再挂正式处理器(此后走实时路径)。
+    for (const r of pending) void onMessage(r)
+    curWs.on('message', onMessage)
   }
 
   // 连中继(带 cid)→ 注册 → 打 qr(首次)→ 接桥接;断开则指数退避重连。
   function connect(): void {
     ws = new WebSocket(`${relayUrl}/?cid=${cid}`)
+    // 'registered' 之前到达的帧(旧版中继 register 即刻补发 cliBuffer)不丢:缓冲给 wireBridge
+    // 按序补处理 —— 手机掉线期间的重握手/探活帧就靠它,丢了则 phoneKeys 空 → 探活必超时。
+    const preRegistered: RawData[] = []
     ws.on('message', function h(raw) {
       try {
         const m = JSON.parse(dec.decode(raw as Uint8Array))
@@ -1078,12 +1100,15 @@ async function main(): Promise<void> {
             qrPrinted = true
             printQr(sid, relayToken) // sid/cliPub 持久 → 二维码不变,只首次打
           }
-          wireBridge(ws as WebSocket)
+          wireBridge(ws as WebSocket, preRegistered)
         } else if (m.type === 'error') {
           console.error('[ce] 中继注册失败:', m.reason)
+        } else if (typeof m.type === 'number') {
+          // 隧道帧先于 'registered' 到达(中继补发 cliBuffer):缓冲,wireBridge 按序补处理。
+          preRegistered.push(raw)
         }
       } catch {
-        /* 非控制帧(registered 之后的消息由 wireBridge 处理,h 已 off) */
+        /* 非 JSON 帧(理论上 registered 前不会有)→ 丢弃 */
       }
     })
     ws.on('close', () => {
@@ -1105,14 +1130,11 @@ async function main(): Promise<void> {
 // 入口分叉:--daemon 跑守护进程(main);否则跑控制台 TUI(console.ts)。
 // daemon 加全局错误兜底:小意外记日志不退,严重错误退出(由控制台/系统拉起)+清 stale daemon.json。
 if (process.argv.includes('--daemon')) {
-  // 单例锁:占固定端口。EADDRINUSE = 已有 daemon 在跑 → 静默退出,绝不重复起 Jupyter/抢中继 cid/割裂终端会话。
-  // 这是「机器级唯一 daemon」的硬保证 —— 无论用户敲几次 ce、daemon 崩几次重启,同一时刻永远只有一个。
-  const lock = createServer()
-  lock.once('error', () => {
-    console.log('[ce] 已有 daemon 在跑(单例锁端口占用),本进程退出')
-    process.exit(0)
-  })
-  lock.listen(LOCK_PORT, '127.0.0.1', () => {
+  // 单例锁:占固定端口。listen 成功 = 唯一 daemon;EADDRINUSE = 端口被占,需区分是谁占的。
+  //   - daemon.json 里 pid 还活 = 另一个 ce daemon 在跑 → 静默退出(真单例);
+  //   - pid 死 / 无 daemon.json = 48731 被别的程序占(假阳性)→ 警告并继续(放弃端口锁,单例降级),
+  //     别让被控机用户面对「ce 起不来且无提示」的死锁(编译版端口号改不了)。
+  const startMain = () => {
     process.on('unhandledRejection', (r) => console.error('[ce] ⚠ unhandledRejection(已兜底,不退出):', r))
     process.on('uncaughtException', (e) => {
       console.error('[ce] ✗ uncaughtException(将退出,由控制台/系统拉起):', e)
@@ -1123,7 +1145,23 @@ if (process.argv.includes('--daemon')) {
       console.error('[ce] 启动失败:', (e as Error).message)
       process.exit(1)
     })
+  }
+  const lock = createServer()
+  lock.once('error', () => {
+    // 端口被占:判活已有 daemon?读 daemon.json 的 pid 验活。
+    let daemonRunning = false
+    try {
+      const d = JSON.parse(readFileSync(join(homedir(), '.ce', 'daemon.json'), 'utf8')) as { pid?: number }
+      if (d.pid) { try { process.kill(d.pid, 0); daemonRunning = true } catch { /* pid 不活 */ } }
+    } catch { /* 无 daemon.json */ }
+    if (daemonRunning) {
+      console.log('[ce] 已有 daemon 在跑,本进程退出')
+      process.exit(0)
+    }
+    console.warn('[ce] ⚠ 单例锁端口 48731 被其他程序占用(非 ce daemon),放弃端口锁继续运行')
+    startMain()
   })
+  lock.listen(LOCK_PORT, '127.0.0.1', startMain)
 } else {
   runConsole().catch((e) => {
     console.error('[ce] 控制台错误:', (e as Error).message)

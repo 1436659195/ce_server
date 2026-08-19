@@ -45,14 +45,14 @@ export function parseServerList(output: string): JupyterServer[] {
   return servers
 }
 
-/** 验活:`jupyter list` 常把已关掉的 server 当在跑报(runtime 文件没清的残留),fetch 一下连得上才算活。
- *  任意 HTTP 响应(含 401)即活;连接被拒/超时 = 死。 */
-async function isAlive(url: string, token: string, ms = 3000): Promise<boolean> {
+/** 验活:仅 200(token 对当前 Jupyter 有效)才算活;401/403(token 不匹配)/连接拒绝/超时 = 死。
+ *  原"任意响应即活"会把 token 拿不到/失效的旧 Jupyter 当活返回 → detectServers 返回它 → 复用后 API 全 403。 */
+export async function isAlive(url: string, token: string, ms = 3000): Promise<boolean> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), ms)
   try {
-    await fetch(`${url}/api/status`, { headers: { Authorization: `Token ${token}` }, signal: ctrl.signal })
-    return true
+    const res = await fetch(`${url}/api/status`, { headers: { Authorization: `Token ${token}` }, signal: ctrl.signal })
+    return res.ok
   } catch {
     return false
   } finally {

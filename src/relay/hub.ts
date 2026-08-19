@@ -71,6 +71,13 @@ function phoneLeftNotice(phoneId: string): string {
   return JSON.stringify({ type: 'phoneLeft', phoneId })
 }
 
+/** cliLeft 明文控制通知(hub 生成,非用户负载)。phone 收到后得知「被控机 ce 掉线」。
+ *  镜像 phoneLeft:不通知则 phone↔relay WS 仍活(half-open)——phone 以为连着,ce 实际没了,
+ *  RPC 只能干等 15s 超时,用户全程无感知(手机端「卡死」的根因)。 */
+function cliLeftNotice(): string {
+  return JSON.stringify({ type: 'cliLeft' })
+}
+
 /**
  * Hub:中继的纯逻辑核心。按 sessionId 把 cli 与(多台)phone 配对,互转密文。
  *
@@ -182,15 +189,24 @@ export class Hub {
       this.sessions.set(sid, s)
     } else {
       s.cli = cli // ce 重连:更新 socket
-      // 补发 phone 在 ce 断线期间发的消息(含握手 phonePub);否则 ce 错过握手 → 后续解密全失败
-      for (const m of s.cliBuffer) {
-        try {
-          cli.send(m)
-        } catch {
-          /* 客户端 ws 已关 */
-        }
-      }
+      // 补发 phone 在 ce 断线期间发的消息(含握手 phonePub);否则 ce 错过握手 → 后续解密全失败。
+      // ★ 必须延后一拍(macrotask):server.ts 在 register 返回后才发 'registered',而 ce 端
+      //   要等 'registered' 才挂正式 message 处理器 —— 立刻补发会被临时处理器当未知帧静默丢弃
+      //   (掉线后手机探活 RPC 石沉大海 → 15s 必超时的根因)。延迟后 wire 顺序 = registered → 补发,
+      //   TCP 保序,两端老版本亦兼容。
+      const buf = s.cliBuffer
       s.cliBuffer = []
+      const sidRef = s
+      setTimeout(() => {
+        if (sidRef.cli !== cli) return // 期间又有更新的 cli 注册(竞态):旧补发作废
+        for (const m of buf) {
+          try {
+            cli.send(m)
+          } catch {
+            /* 客户端 ws 已关 */
+          }
+        }
+      }, 0)
     }
     this.wsMeta.set(cli, { sid, role: 'cli' })
     return { sid, token }
@@ -321,6 +337,15 @@ export class Hub {
     if (s) {
       if (meta.role === 'cli') {
         s.cli = null
+        // ce 掉线:给该 session 所有在线 phone 发明文通知(手机立即进「重连等待」而非无感卡死)。
+        //   零信任边界不变:hub 只生成控制通知,不解密任何负载(与 phoneLeft 同款)。
+        for (const ws of s.phones.keys()) {
+          try {
+            ws.send(cliLeftNotice())
+          } catch {
+            /* phone ws 已关 */
+          }
+        }
       } else {
         s.phones.delete(src)
         // phone 断:给 cli 发明文控制通知(hub 生成,非加密帧),cli 据此清该 phone 的 E2E 通道与 owner

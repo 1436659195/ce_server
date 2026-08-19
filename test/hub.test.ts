@@ -321,3 +321,64 @@ test('定向帧缓冲有上限:超 DIRECTED_BUFFER_MAX(500)丢最早(防长任�
   hub.joinPhone(sid, token, phone.ws, 'p1')
   expect(phone.sent.length).toBe(500) // 超上限丢最早 10 条,恰好 500
 })
+
+// ── cli 掉线通知(cliLeft)────────────────────────────────────────────────────
+// 镜像 phoneLeft:ce 掉线时 hub 给 session 内所有在线 phone 发明文 {type:'cliLeft'}。
+// 不通知则 phone↔relay WS 半开(手机以为连着,ce 实际没了)→ RPC 干等 15s 超时,
+// 用户全程无感 —— 手机端「掉线卡死」的根因。零信任边界不变(hub 只生成控制通知)。
+test('onClose(cli) → 所有在线 phone 收到 cliLeft 明文通知', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const { sid, token } = hub.register('c1', cli.ws)
+  const p1 = fakeWs()
+  const p2 = fakeWs()
+  expect(hub.joinPhone(sid, token, p1.ws, 'phone-1')).toBe(true)
+  expect(hub.joinPhone(sid, token, p2.ws, 'phone-2')).toBe(true)
+
+  hub.onClose(cli.ws) // ce 掉线
+  const notice = JSON.stringify({ type: 'cliLeft' })
+  expect(p1.sent).toContain(notice)
+  expect(p2.sent).toContain(notice)
+})
+
+test('onClose(cli) → 无 phone 在线时不抛、无副作用', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  hub.register('c1', cli.ws)
+  expect(() => hub.onClose(cli.ws)).not.toThrow()
+})
+
+test('onClose(phone) → 不发 cliLeft(cliLeft 只关乎 ce 掉线;phone 断走 phoneLeft)', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const phone = fakeWs()
+  const { sid, token } = hub.register('c1', cli.ws)
+  hub.joinPhone(sid, token, phone.ws, 'p1')
+
+  hub.onClose(phone.ws) // phone 断 → 只通知 cli(phoneLeft),绝不发 cliLeft
+  expect(phone.sent).toEqual([])
+  expect(cli.sent).toContain(JSON.stringify({ type: 'phoneLeft', phoneId: 'p1' }))
+  expect(cli.sent.some((m) => m.includes('cliLeft'))).toBe(false)
+})
+
+test('ce 掉线 → 重连(同 cid):phone 不再收新通知,断线期间 phone 发的帧进 cliBuffer 补发', async () => {
+  const hub = new Hub()
+  const cli1 = fakeWs()
+  const { sid, token } = hub.register('c1', cli1.ws)
+  const phone = fakeWs()
+  hub.joinPhone(sid, token, phone.ws, 'p1')
+  hub.onClose(cli1.ws) // ce 掉线 → phone 收 cliLeft
+  expect(phone.sent).toContain(JSON.stringify({ type: 'cliLeft' }))
+  phone.sent.length = 0
+
+  // ce 断线期间 phone 发消息(重握手/探活)→ 暂存 cliBuffer
+  hub.onMessage(phone.ws, 'handshake-frame')
+
+  const cli2 = fakeWs()
+  hub.register('c1', cli2.ws) // ce 重连
+  expect(phone.sent).toEqual([]) // 重连本身不再通知 phone(探活机制自会感知)
+  // 补发延后一拍(macrotask):server.ts 先发 'registered'(ce 等它才挂正式处理器),
+  // 立刻补发会被 ce 临时处理器丢弃 —— 掉线后探活超时的根因。此处等一拍再断言。
+  await new Promise((r) => setTimeout(r, 0))
+  expect(cli2.sent).toEqual(['handshake-frame']) // 断线期间的帧按序补发给新 ce
+})

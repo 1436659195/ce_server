@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { renderQr } from './qr'
+import { rotateLogIfBig } from './log'
 
 const DAEMON_JSON = join(homedir(), '.ce', 'daemon.json')
 
@@ -66,7 +67,9 @@ function startDaemon(): void {
   // daemon 崩溃/重连时无据可查(控制台 [l] 只看得到 Jupyter 日志)。
   let stdio: Array<'ignore' | number> = ['ignore', 'ignore', 'ignore']
   try {
-    const fd = openSync(join(homedir(), '.ce', 'ce.log'), 'a')
+    const logPath = join(homedir(), '.ce', 'ce.log')
+    rotateLogIfBig(logPath) // 启动时轮转一次,防 daemon 长期跑撑爆 ce.log
+    const fd = openSync(logPath, 'a')
     stdio = ['ignore', fd, fd]
   } catch {
     /* 开日志失败 → 退回 ignore,不阻塞启动 */
