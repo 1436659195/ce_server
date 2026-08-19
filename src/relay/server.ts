@@ -236,9 +236,13 @@ export function createRelayServer(
       const phoneId = u.searchParams.get('phoneId') ?? 'anon-' + Math.random().toString(36).slice(2, 12)
       const ok = hub.joinPhone(sid, token, ws as RelayWS, phoneId)
       if (ok) {
+        console.log(`[relay] phone 加入 sid=${sid.slice(0, 8)}… phoneId=${phoneId}`)
         ws.send(JSON.stringify({ type: 'joined' }))
         wire(ws)
       } else {
+        // 中继重启后 cli 尚未回注(session 不在)会走到这 —— 手机 2s 重试环会再进来,属正常
+        // 恢复窗口;token 错也在此路。日志区分排查用(掉线恢复链路的观测点)。
+        console.log(`[relay] phone 被拒(会话未建/token 错) sid=${sid.slice(0, 8)}… phoneId=${phoneId}`)
         // 先把 error 帧刷到 socket 再关,避免 close 抢在数据帧前把消息丢掉(ws 常见坑)
         ws.send(JSON.stringify({ type: 'error', reason: 'bad token or unknown session' }), () =>
           ws.close()
