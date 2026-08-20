@@ -40,13 +40,21 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 
 ## 5. RPC 操作契约(手机 ↔ ce,密文帧内)
 
-手机发 `RPCReq { op, ... }`,ce 回 `RPCResp { ok, data?, error? }`。除 `listTerminals`/`deleteTerminal`/`detachTerminal` 为特例外,其余 `op`(`listDir`/`readFile`/`createDir`/`readFileRange`/`createTerminal`/`deleteFile`/`renameFile`/`saveFile`)由 `bridge.ts` 的 `handleRpc` 分派到本地 Jupyter REST。
+手机发 `RPCReq { op, ... }`,ce 回 `RPCResp { ok, data?, error? }`。除特例外,`op` 分两路:文件/终端常规 op(`listDir`/`readFile`/`createDir`/`readFileRange`/`createTerminal`/`deleteFile`/`renameFile`/`saveFile`)由 `bridge.ts` 的 `handleRpc` 分派到本地 Jupyter REST;**大文件分段上传四 op(`uploadBegin`/`uploadChunk`/`uploadEnd`/`uploadAbort`)由 `main.ts` 分派到 `uploads.ts` 直接 `node:fs` 落盘(不走 Jupyter REST)**。特例:`listTerminals`/`deleteTerminal`/`detachTerminal`(`main.ts`,访问 ce 的 terms map)。
 
 文件写操作(直连与中继对称,见 `useFiles.ts` ↔ `bridge.ts`):
 
 - **`deleteFile`**(`{ path }`):`DELETE /api/contents/{path}`(目录递归删)。
 - **`renameFile`**(`{ path, newPath }`):`PATCH /api/contents/{path}` body `{path: newPath}`。`newPath` 是去前导 `/` 的逻辑路径(JSON 值,**不** URL-encode;URL 段才走 `encodePath`)。仅同目录改名。
-- **`saveFile`**(`{ path, content, format }`):`PUT /api/contents/{path}` body `{type:'file', format:'text'|'base64', content}`。整文件覆盖(无分段语义):新建空文件(`content:''`)/ 编辑保存(text)/ 上传(base64)共用。
+- **`saveFile`**(`{ path, content, format }`):`PUT /api/contents/{path}` body `{type:'file', format:'text'|'base64', content}`。整文件覆盖(无分段语义):新建空文件(`content:''`)/ 编辑保存(text)/ 上传(base64)共用。**大 base64 在 RPC 链路上约 6 份内存拷贝同存(曾 OOM)+ 15s 超时,大文件上传勿走此 op(用下面四个分段 op;手机端 FilesStore.upload 以 2MB 分界)。**
+
+大文件分段上传(`uploads.ts`,ce 在 root 内直接落盘 —— 每 RPC 只持单段,内存恒定):
+
+- **`uploadBegin`**(`{ path, totalSize }`)→ `{ ok, data: { uploadId } }`:开始分段上传。校验:`path` resolve 后必须在 Jupyter `root_dir` 内(防 `../` 越界,直接 fs 写的红线)、父目录已存在(不自动建,对齐 saveFile 语义)、目标非文件夹。在**目标同目录**建隐藏临时文件 `.ce-upload-{uploadId}.part`(同 fs 保证 end 时 rename 原子);顺手清理:内存 Map 里超 1h 无活动的会话 + 该目录内 mtime 超 1h 的孤儿 `.part`(兜 ce 重启后 Map 丢失)。
+- **`uploadChunk`**(`{ uploadId, offset, content(base64) }`):追加写临时文件。每段 base64 **独立解码**(段长无须 3 的倍数);校验 `offset ===` 临时文件已写字节数,乱序/重复段拒绝(手机端逐段 await 保证顺序,此处防御纵深)。
+- **`uploadEnd`**(`{ uploadId }`):校验已写字节 === `totalSize` 后 rename 覆盖目标(Windows 对已存在目标 rename 抛 EPERM/EEXIST → 删目标重试;再失败报「被占用」)。字节数不符 → 删临时文件 + 报「上传不完整」。
+- **`uploadAbort`**(`{ uploadId }`):删临时文件、会话作废。**幂等**(未知 id 也 ok)——手机端 fire-and-forget 清理;`chunk`/`end` 对未知 id 则报错(那是真失败)。
+- 版本注记:**旧版 ce 对这四个 op 返 `{ok:false, error:'未知操作: uploadBegin'}`**(bridge.ts default 分支,文案形状已钉死),手机端据此提示「机器端 ce 版本过旧,请更新」;小文件(≤2MB)走 `saveFile`,所有版本兼容。已知残余:上传期间 `.part` 会短暂出现在该目录的 listDir(不做过滤)。
 
 - **`listTerminals`**(特例,`main.ts` 处理 —— 需访问 ce 的 `terms` map 算 `managed`):返回 `{ ok: true, data: { terminals: RemoteTerminalInfo[] } }`,其中
   - `RemoteTerminalInfo = { name: string; lastActivityAt: number | null; managed: boolean; occupiedBy: string | null }`
