@@ -210,3 +210,10 @@ test('toRemoteTerminals 解析 last_activity + managed 标记', () => {
 test('toRemoteTerminals 空数组 → 空数组', () => {
   expect(toRemoteTerminals([], new Set())).toEqual([])
 })
+
+test('未知 op(uploadBegin)→ 「未知操作」(旧 ce 对分段上传的降级文案,手机端据此提示更新)', async () => {
+  // 新 op 由 main.ts 拦截到 uploads.ts,不进 handleRpc —— 但旧版 ce 二进制没有那段拦截,
+  // 会落到这里。钉住文案形状:手机端 FilesStore.upload 靠 includes('未知操作') 识别。
+  const res = await handleRpc(noopClient, { op: 'uploadBegin', path: '/a.bin', totalSize: 3 })
+  expect(res).toEqual({ ok: false, error: '未知操作: uploadBegin' })
+})

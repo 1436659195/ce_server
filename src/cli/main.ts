@@ -21,6 +21,7 @@ import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame
 import { detectServers, isAlive } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
+import { UploadSessions } from './uploads'
 import { ButlerManager } from './butler'
 import { AgentRunner } from './agent-runner'
 import { ApprovalDispatcher } from './approval'
@@ -353,6 +354,8 @@ async function main(): Promise<void> {
   const cid = identity.cid
 
   const jupyter = makeJupyterClient(baseUrl, token, root)
+  // 大文件分段上传会话(root 内直接 node:fs 落盘;见 uploads.ts 头注)
+  const uploads = new UploadSessions(root)
   const wsBase = baseUrl.replace(/^http/, 'ws')
 
   let ws: WebSocket | null = null
@@ -1020,6 +1023,15 @@ async function main(): Promise<void> {
                 },
               )
             }
+          } else if (
+            req.op === 'uploadBegin' ||
+            req.op === 'uploadChunk' ||
+            req.op === 'uploadEnd' ||
+            req.op === 'uploadAbort'
+          ) {
+            // 大文件分段上传:ce 直接 node:fs 落盘(root 内),不走 Jupyter REST —— 整文件 PUT
+            // 有 15s 超时 + 大 buffer 内存语义(会重蹈 readFile OOM)。见 uploads.ts / spec.md §5。
+            resp = await uploads.handleRpc(req)
           } else {
             resp = await handleRpc(jupyter, req)
           }

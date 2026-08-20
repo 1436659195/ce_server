@@ -31,16 +31,18 @@ export interface JupyterClient {
 
 /** 手机发来的 RPC 请求(明文 JSON,解密后)。op 为 string 以兜住未知操作。 */
 export interface RpcRequest {
-  op: string // 'listDir'|'readFile'|'readFileRange'|'createTerminal'|'createDir'|'deleteFile'|'renameFile'|'saveFile'(或未知)
+  op: string // 'listDir'|'readFile'|'readFileRange'|'createTerminal'|'createDir'|'deleteFile'|'renameFile'|'saveFile'|'uploadBegin'|'uploadChunk'|'uploadEnd'|'uploadAbort'(后四者 main.ts 拦截到 uploads.ts,不走 Jupyter;或未知)
   path?: string
   cwd?: string
   offset?: number
   length?: number
   newPath?: string // renameFile:去前导/的新路径(PATCH body.path,JSON 值不 encode)
-  content?: string // saveFile:文本(text)或 base64(base64)
+  content?: string // saveFile:文本(text)或 base64(base64);uploadChunk:base64 段
   format?: 'text' | 'base64' // saveFile
   skill?: string // butlerStart:管家 skill 文本(ce 据此 spawn cc 的 --append-system-prompt)
   sid?: string // butlerStart/butlerStop:管家 sid(butlerStop 指定杀哪个 cc)
+  uploadId?: string // 分段上传会话 id(uploads.ts)
+  totalSize?: number // uploadBegin:声明的总字节数
 }
 
 /** ce 回的 RPC 响应(明文 JSON,加密前)。 */
