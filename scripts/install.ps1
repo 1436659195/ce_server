@@ -62,6 +62,14 @@ if (Test-Path $exe) {
   if ($remoteHash -and $remoteHash -eq $localHash) {
     Write-Host "[install] ce.exe 已是最新($localHash),跳过下载"
   } else {
+    # Windows 不允许覆盖运行中的 exe:更新前先停旧 ce(下方 ⑥ 会重新拉起)。
+    # ce 重启带 cid 注册回同一 sid,配对码/白名单不丢 —— 停是安全的。
+    $oldRunning = Get-Process -Name 'ce' -ErrorAction SilentlyContinue
+    if ($oldRunning) {
+      Write-Host "[install] 旧 ce 在跑(PID $($oldRunning.Id -join ',')),先停止再覆盖更新" -ForegroundColor Yellow
+      $oldRunning | Stop-Process -Force
+      $oldRunning | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+    }
     Write-Host "[install] ce.exe 有更新(本地 $localHash / 远程 $remoteHash),重新下载"
     Invoke-WebRequest -Uri $dlUrl -OutFile $exe
   }
@@ -93,7 +101,7 @@ if ($alreadyAuto) {
   Write-Host "[install] 已设置开机自启"
 }
 
-# ⑥ 启动 ce(若已在跑则复用其连接码,不起新进程 = 唯一 ce)
+# ⑥ 启动 ce(已在跑 = 本次未更新,复用其连接码;② 更新路径停了旧进程,此处查无进程 → 落到下方拉起新版)
 $running = Get-Process -Name 'ce' -ErrorAction SilentlyContinue
 if ($running) {
   Write-Host "[install] ce 已在运行(PID $($running.Id -join ',')),不重复启动" -ForegroundColor Yellow
