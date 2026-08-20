@@ -35,6 +35,9 @@ export function createRelayServer(
     installShPath?: string
     lanPyPath?: string
     publicUrl?: string // 对外中继 ws 地址(防 Host 头注入 install 脚本);不配则回退请求 Host
+    /** 心跳:每 intervalMs ping 一次,连续 maxMissed 次无 pong 判死 terminate。缺省 30s/2。
+     *  测试注入小值加速;治 half-open 死连接(断网/热点切换/NAT 超时,双方无数据则永不发现)。 */
+    heartbeat?: { intervalMs: number; maxMissed: number }
   }
 ): { server: Server; close: () => Promise<void> } {
   // 静态下载路由:/install.ps1 + /install.sh(注入 __RELAY_URL__)、/lan.py(纯静态,无占位)、/dl/ce-{windows-x64.exe,linux-x64,linux-arm64};其余 404。
@@ -211,7 +214,11 @@ export function createRelayServer(
     return e.n <= REGISTER_MAX
   }
 
+  // 心跳默认值(生产 30s/2;测试经 opts.heartbeat 注入小值)
+  const hb = opts?.heartbeat ?? { intervalMs: 30_000, maxMissed: 2 }
+
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+    startHeartbeat(ws)
     const u = new URL(req.url ?? '/', 'http://relay')
     const path = u.pathname.replace(/\/+$/, '') // 去尾斜杠:'/' → ''
     const token = u.searchParams.get('token') ?? ''
@@ -269,6 +276,31 @@ export function createRelayServer(
         console.error('[relay] onClose 异常(已兜底):', e)
       }
     })
+  }
+
+  /** 挂协议层心跳:每 intervalMs ping,连续 maxMissed 次无 pong → terminate(死连接上 close
+   *  握手完不成,必须 terminate 砍 TCP)→ 触发既有 close 处理器 → hub.onClose → cliLeft/phoneLeft。
+   *  pong 归零;ping 发送抛错同判死(连接已坏)。close 时清定时器,防泄漏/防对死对象继续 ping。 */
+  function startHeartbeat(ws: WebSocket): void {
+    let missed = 0
+    ws.on('pong', () => (missed = 0))
+    const t = setInterval(() => {
+      if (missed >= hb.maxMissed) {
+        console.log('[relay] 心跳判死(terminate)')
+        clearInterval(t)
+        ws.terminate()
+        return
+      }
+      try {
+        ws.ping()
+        missed++
+      } catch {
+        console.log('[relay] 心跳 ping 异常,判死(terminate)')
+        clearInterval(t)
+        ws.terminate()
+      }
+    }, hb.intervalMs)
+    ws.on('close', () => clearInterval(t))
   }
 
   return {

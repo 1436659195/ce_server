@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test'
 import WebSocket, { type RawData } from 'ws'
+import { createServer as createNetServer, connect as netConnect, type Socket } from 'node:net'
 import { createRelayServer } from '../src/relay/server'
 import { Hub } from '../src/relay/hub'
 
@@ -98,4 +99,65 @@ test('错误 token 加入被拒', async () => {
   expect(err.reason).toBeTruthy()
 
   await shutdown(close, cli, phone)
+})
+
+// ── 心跳:沉默客户端被判死 ───────────────────────────────────────────────
+test('心跳:客户端不回 pong → 判死 terminate,cli 置空 + phone 收到 cliLeft', async () => {
+  const { server, close } = createRelayServer(new Hub(), {
+    heartbeat: { intervalMs: 50, maxMissed: 2 },
+  })
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+  const port = (server.address() as { port: number }).port
+  const base = `ws://127.0.0.1:${port}`
+
+  // 注:Bun 自带 ws shim 不支持 autoPong:false(无脑自动回 pong),客户端侧造不出沉默连接。
+  // 改用 raw TCP 停转代理:握手/注册后停掉 server→client 方向转发,后续 ping 帧到不了真客户端
+  // → 无人回 pong,效果等同 half-open 死连接(能建连、无应答)。
+  let upSock: Socket | null = null // 代理 ↔ relay
+  const proxy = createNetServer((down) => {
+    upSock = netConnect(port, '127.0.0.1')
+    down.on('data', (d) => upSock?.write(d)) // client → relay:一直转发(注册帧能到)
+    upSock.on('data', (d) => down.write(d)) // relay → client:仅代理停转前转发
+  })
+  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r))
+  const pport = (proxy.address() as { port: number }).port
+
+  const cli = new WebSocket(`ws://127.0.0.1:${pport}/?cid=hb1`)
+  cli.on('error', () => {})
+  const reg = await waitForJson(cli, (m) => m.type === 'registered')
+  // 停转 relay→client:server 侧 socket 停读(不 RST、不 FIN,连接"看起来还在")
+  upSock?.pause()
+
+  const phone = connect(`${base}/${reg.sid}?token=${reg.token}`)
+  await waitForJson(phone, (m) => m.type === 'joined')
+
+  // 2 次无 pong(50ms × 2 + 余量)→ 服务端 terminate cli → hub.onClose → phone 收 cliLeft
+  const left = waitForJson(phone, (m) => m.type === 'cliLeft')
+  cli.on('close', (code) => {
+    // terminate 的 close code 是 1006(异常断),不是 1000(正常关)
+    expect([1006, 1000]).toContain(code)
+  })
+  expect(await left).toEqual({ type: 'cliLeft' })
+
+  await shutdown(close, phone) // cli 已被服务端 terminate,只关 phone
+  proxy.close(); upSock?.destroy()
+})
+
+// ── 心跳:正常回 pong 不误杀 ───────────────────────────────────────────
+test('心跳:正常客户端(自动回 pong)跨多个心跳周期仍活', async () => {
+  const { server, close } = createRelayServer(new Hub(), {
+    heartbeat: { intervalMs: 30, maxMissed: 2 }, // 30ms × 5 周期 = 150ms
+  })
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+  const port = (server.address() as { port: number }).port
+
+  const cli = connect(`ws://127.0.0.1:${port}/?cid=hb2`) // connect() 辅助:默认 autoPong 开
+  const reg = await waitForJson(cli, (m) => m.type === 'registered')
+  expect(reg.sid).toBeTruthy()
+
+  // 跨 5+ 个心跳周期(默认 ws 客户端自动回 pong);若误杀,close 事件触发、发送抛错
+  await new Promise((r) => setTimeout(r, 250))
+  expect(cli.readyState).toBe(WebSocket.OPEN) // 仍活 = 未被误杀
+
+  await shutdown(close, cli)
 })
