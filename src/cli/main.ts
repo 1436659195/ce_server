@@ -19,7 +19,7 @@ import { join, parse as parsePath } from 'node:path'
 import { randomBytes, createHash } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
-import { detectServers, isAlive } from './jupyter-detect'
+import { detectServers, isAlive, toLoopback } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { ButlerManager } from './butler'
@@ -173,12 +173,6 @@ async function ensurePythonOrExit(relayUrl: string): Promise<void> {
   process.exit(1)
 }
 
-/** baseUrl 里 `localhost` → `127.0.0.1`:Bun 偶把 localhost 解析成 IPv6 `::1`,而 Jupyter 默认只听
- *  IPv4 loopback → fetch 报 "Unable to connect"。127.0.0.1 无歧义、Jupyter 一定在听(它打的 URL 含 127.0.0.1)。 */
-function toLoopback(url: string): string {
-  return url.replace(/:\/\/localhost\b/, '://127.0.0.1')
-}
-
 /** 取 url 的 port(无/非法 → '')。用于在同机多 jupyter 里按 port 匹配。 */
 function portOf(url: string): string {
   try {
@@ -261,7 +255,8 @@ async function resolveJupyter(
   const root = pickRoot(live, server.url)
   // 记忆自启的 Jupyter:daemon 重启时 resolveJupyter 开头读它 + 验活复用,不再起新的(终端会话不丢)。
   try {
-    writeFileSync(join(homedir(), '.ce', 'jupyter.json'), JSON.stringify({ url: server.url, token: server.token, root }))
+    // 落盘即固化 127.0.0.1(不落 localhost):isAlive 验活与下次复用全走 v4,消灭 Mac 双栈歧义
+    writeFileSync(join(homedir(), '.ce', 'jupyter.json'), JSON.stringify({ url: toLoopback(server.url), token: server.token, root }))
   } catch {
     /* 写失败 → 下次可能再起一个,不致命 */
   }

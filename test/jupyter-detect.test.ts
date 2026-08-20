@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { parseServerList } from '../src/cli/jupyter-detect'
+import { parseServerList, toLoopback } from '../src/cli/jupyter-detect'
 
 // 解析 `jupyter server list` 文本 → {url, token, root}[]。所有 token 均为假数据。
 test('parseServerList:表驱动(空/单/多/特殊字符)', () => {
@@ -30,4 +30,25 @@ test('parseServerList:表驱动(空/单/多/特殊字符)', () => {
   for (const c of cases) {
     expect(parseServerList(c.input)).toEqual(c.want)
   }
+})
+
+// ── toLoopback:localhost → 127.0.0.1(Mac 上 Bun 解析 localhost→::1 而 Jupyter 终端路由 ──
+//    在 v4/v6 双栈间有瞬时差异;统一 127.0.0.1 消灭歧义) ─────────────────────────────────
+
+test('toLoopback:localhost 替换为 127.0.0.1', () => {
+  expect(toLoopback('http://localhost:53358')).toBe('http://127.0.0.1:53358')
+})
+
+test('toLoopback:已是 127.0.0.1 不变', () => {
+  expect(toLoopback('http://127.0.0.1:8888')).toBe('http://127.0.0.1:8888')
+})
+
+test('toLoopback:其他 hostname 不动(用户显式指定的外部 jupyter)', () => {
+  expect(toLoopback('http://192.168.1.5:8888')).toBe('http://192.168.1.5:8888')
+  expect(toLoopback('http://myjupyter.example.com:8888')).toBe('http://myjupyter.example.com:8888')
+})
+
+test('toLoopback:端口后带边界字符不误伤(只替换 host 段)', () => {
+  expect(toLoopback('http://localhost:8888/lab')).toBe('http://127.0.0.1:8888/lab')
+  expect(toLoopback('http://localhostx:8888')).toBe('http://localhostx:8888') // localhost 后是 x 非边界,不改
 })

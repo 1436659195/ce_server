@@ -82,3 +82,10 @@ export async function detectServers(): Promise<JupyterServer[]> {
   }
   return []
 }
+
+/** baseUrl 里 `localhost` → `127.0.0.1`:Bun 偶把 localhost 解析成 IPv6 `::1`,而 Jupyter 默认只听
+ *  IPv4 loopback → fetch 报 "Unable to connect"。127.0.0.1 无歧义、Jupyter 一定在听(它打的 URL 含 127.0.0.1)。
+ *  Mac 双栈监听下 v4/v6 在扩展路由上有瞬时差异(配对瞬间 404 竞态入口),统一 v4 消灭歧义。 */
+export function toLoopback(url: string): string {
+  return url.replace(/:\/\/localhost\b/, '://127.0.0.1')
+}
