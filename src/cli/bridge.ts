@@ -81,6 +81,32 @@ export function toRemoteTerminals(
   }))
 }
 
+/**
+ * listTerminals 带短重试:失败 → delayMs 后再试 retries 次,仍败抛最后错误。
+ * 治「手机(重)配对瞬间 Jupyter /api/terminals 瞬态 404」(Mac 实测同进程同 token 下一秒即 200,
+ * 首错即降级空列表会让手机「+」面板闪空)。降级(空列表+日志)留在调用点(main.ts RPC 分发)。
+ * sleep 注入仅为测试加速;默认 setTimeout。只包 listTerminals —— createTerminal 失败
+ * 原样报用户更诚实,不吞错重试。
+ */
+export async function listTerminalsRetry(
+  client: JupyterClient,
+  opts: { retries?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<{ name: string; last_activity?: string }[]> {
+  const retries = opts.retries ?? 1
+  const delayMs = opts.delayMs ?? 300
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  let lastErr: unknown
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) await sleep(delayMs)
+    try {
+      return await client.listTerminals()
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  throw lastErr
+}
+
 /** 把一条 RPC 请求分派到 JupyterClient 对应方法。纯逻辑,异常 → ok:false。 */
 export async function handleRpc(client: JupyterClient, req: RpcRequest): Promise<RpcResponse> {
   try {

@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { handleRpc, toRemoteTerminals, type JupyterClient } from '../src/cli/bridge'
+import { handleRpc, listTerminalsRetry, toRemoteTerminals, type JupyterClient } from '../src/cli/bridge'
 
 // 用 fake JupyterClient 测 RPC 分派逻辑(不碰真实 Jupyter)。
 // noopClient 给全方法空默认:新增 JupyterClient 方法只在此补一处;各 test 用 spread + override 关注的方法。
@@ -209,4 +209,61 @@ test('toRemoteTerminals 解析 last_activity + managed 标记', () => {
 
 test('toRemoteTerminals 空数组 → 空数组', () => {
   expect(toRemoteTerminals([], new Set())).toEqual([])
+})
+
+// ── listTerminalsRetry:首错 300ms×1 重试(治配对瞬间 Jupyter 瞬态 404;Mac 侧实测同进程 ──
+//    下一秒即恢复) ────────────────────────────────────────────────────────────────────────
+const noSleep = async (): Promise<void> => {} // 注入空 sleep,测试不等 300ms
+
+test('listTerminalsRetry:首抛次成 → 返回数据(重试兜住瞬态)', async () => {
+  let n = 0
+  const client: JupyterClient = {
+    ...noopClient,
+    async listTerminals() {
+      if (++n === 1) throw new Error('列终端失败:404 Not Found')
+      return [{ name: 't1' }, { name: 't2' }]
+    },
+  }
+  const res = await listTerminalsRetry(client, { sleep: noSleep })
+  expect(res).toEqual([{ name: 't1' }, { name: 't2' }])
+  expect(n).toBe(2)
+})
+
+test('listTerminalsRetry:两次都抛 → 抛最后错误(降级留给调用点)', async () => {
+  const client: JupyterClient = {
+    ...noopClient,
+    async listTerminals() {
+      throw new Error('列终端失败:404 Not Found')
+    },
+  }
+  await expect(listTerminalsRetry(client, { sleep: noSleep })).rejects.toThrow('列终端失败:404')
+})
+
+test('listTerminalsRetry:首次成功不重试', async () => {
+  let n = 0
+  const client: JupyterClient = {
+    ...noopClient,
+    async listTerminals() {
+      n++
+      return [{ name: 'ok' }]
+    },
+  }
+  const res = await listTerminalsRetry(client, { sleep: noSleep })
+  expect(res).toEqual([{ name: 'ok' }])
+  expect(n).toBe(1)
+})
+
+test('listTerminalsRetry:重试间隔确实传给 sleep(默认 300ms)', async () => {
+  const got: number[] = []
+  const sleep = async (ms: number): Promise<void> => {
+    got.push(ms)
+  }
+  const client: JupyterClient = {
+    ...noopClient,
+    async listTerminals() {
+      throw new Error('x')
+    },
+  }
+  await listTerminalsRetry(client, { sleep }).catch(() => {})
+  expect(got).toEqual([300])
 })

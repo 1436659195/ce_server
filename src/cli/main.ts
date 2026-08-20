@@ -21,7 +21,7 @@ import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
 import { detectServers, isAlive, toLoopback } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
-import { makeJupyterClient, handleRpc, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
+import { makeJupyterClient, handleRpc, listTerminalsRetry, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { ButlerManager } from './butler'
 import { AgentRunner } from './agent-runner'
 import { ApprovalDispatcher } from './approval'
@@ -846,11 +846,11 @@ async function main(): Promise<void> {
             // 手机「+」面板显示全部;杀 app 重开自动恢复只挑 managed(= ce 经手过的),零回归。
             let all: { name: string; last_activity?: string }[] = []
             try {
-              all = await jupyter.listTerminals()
+              all = await listTerminalsRetry(jupyter) // 首错 300ms×1 重试:治配对瞬间瞬态 404
             } catch (e) {
-              // Jupyter token 失效(403)/卡死/重启中:别让 listTerminals 抛成 unhandledRejection 拖累。
-              // 退化为空列表(手机暂时看不到终端,但不崩;Jupyter 恢复后下次刷新补全量)。
-              console.error('[ce] 列终端失败,退化为空列表:', (e as Error).message)
+              // 重试后仍失败(Jupyter token 失效(403)/卡死/重启中):别让 listTerminals 抛成
+              // unhandledRejection 拖累。退化为空列表(手机暂时看不到终端,但不崩;恢复后下次刷新补全量)。
+              console.error('[ce] 列终端失败(重试后仍失败),退化为空列表:', (e as Error).message)
             }
             // managed = terms(本次生命周期经手)∪ 落盘集合(上次生命周期经手;daemon 重启后
             // terms 空但终端仍活在 Jupyter,靠它让手机杀 app 重开还能自动恢复会话)。
