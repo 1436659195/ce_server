@@ -12,6 +12,7 @@
  * ⚠️ 整合胶水,无单测;手测见 P3-5 清单(需真实中继 + Jupyter)。
  */
 import WebSocket, { type RawData } from 'ws'
+import { Heartbeat } from './heartbeat'
 import { hostname, homedir } from 'node:os'
 import { writeFileSync, mkdirSync, unlinkSync, readFileSync, chmodSync, renameSync, appendFileSync } from 'node:fs'
 import { join, parse as parsePath } from 'node:path'
@@ -1087,6 +1088,9 @@ async function main(): Promise<void> {
     // 'registered' 之前到达的帧(旧版中继 register 即刻补发 cliBuffer)不丢:缓冲给 wireBridge
     // 按序补处理 —— 手机掉线期间的重握手/探活帧就靠它,丢了则 phoneKeys 空 → 探活必超时。
     const preRegistered: RawData[] = []
+    // 协议层心跳:30s ping × 2 次无 pong → terminate → 下方 close 处理器接管重连。
+    // 治 half-open(热点断换/NAT 超时:TCP 死但 close 不来,永不重连)。
+    let hb: Heartbeat | null = new Heartbeat(ws)
     ws.on('message', function h(raw) {
       try {
         const m = JSON.parse(dec.decode(raw as Uint8Array))
@@ -1112,6 +1116,8 @@ async function main(): Promise<void> {
       }
     })
     ws.on('close', () => {
+      hb?.stop() // 心跳随连接结束;hb 置 null 防重连前旧定时器误触发 terminate
+      hb = null
       console.log(`[ce] 中继断开,${reconnectDelay}ms 后重连`)
       phoneKeys.clear() // 中继断了:所有 phone 通道失效,重连后手机重新握手派生
       terminalOwner.clear() // 占用随连接重置(手机重连后重新 attach/tryAcquire)
