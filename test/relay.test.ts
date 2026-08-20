@@ -133,11 +133,10 @@ test('心跳:客户端不回 pong → 判死 terminate,cli 置空 + phone 收到
 
   // 2 次无 pong(50ms × 2 + 余量)→ 服务端 terminate cli → hub.onClose → phone 收 cliLeft
   const left = waitForJson(phone, (m) => m.type === 'cliLeft')
-  cli.on('close', (code) => {
-    // terminate 的 close code 是 1006(异常断),不是 1000(正常关)
-    expect([1006, 1000]).toContain(code)
-  })
   expect(await left).toEqual({ type: 'cliLeft' })
+  // 注:此处不 close-code 断言。实测经停转代理(upSock.pause)后,服务端 terminate 的
+  // close 帧永远到不了客户端 → cli 的 'close' 事件不触发,await 即 5s 超时炸弹。
+  // 判死的真断言是 phone 收到 cliLeft(上行方向仍通),足够。
 
   await shutdown(close, phone) // cli 已被服务端 terminate,只关 phone
   proxy.close(); upSock?.destroy()

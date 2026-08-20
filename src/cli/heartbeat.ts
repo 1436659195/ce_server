@@ -14,6 +14,8 @@ export class Heartbeat {
       ping(): void
       terminate(): void
       on(ev: 'pong' | 'close', fn: () => void): void
+      /** ws 库 WebSocket 有 readyState(1=OPEN);测试假对象可不带(undefined → 不 guard) */
+      readyState?: number
     },
     private opts: { intervalMs?: number; maxMissed?: number } = {}
   ) {
@@ -23,6 +25,10 @@ export class Heartbeat {
   }
 
   private tick(): void {
+    // CONNECTING 期(慢握手)不是死连接:ws.ping() 在非 OPEN 态会抛 InvalidStateError,
+    // 若不 guard 会被下面的 catch 误判为死连接而 terminate。故未 OPEN 时跳过本 tick,
+    // 不计 missed、不 terminate,等握手完成后正常心跳。
+    if (this.ws.readyState !== undefined && this.ws.readyState !== 1) return
     const maxMissed = this.opts.maxMissed ?? 2
     if (this.missed >= maxMissed) {
       console.log('[ce] 心跳超时,重连')

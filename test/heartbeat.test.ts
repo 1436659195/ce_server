@@ -6,6 +6,7 @@ class FakeWs {
   pings = 0
   terminated = false
   stopped = false
+  readyState?: number // 不设 = undefined → Heartbeat 不 guard(兼容无该字段的假对象)
   private pongFns: (() => void)[] = []
   private closeFns: (() => void)[] = []
   ping(): void {
@@ -38,16 +39,25 @@ test('连续 2 次无 pong → terminate', async () => {
 })
 
 test('收到 pong 归零,不误杀', async () => {
+  // 余量加厚:25ms 间隔 vs 10ms pong 周期,跨 8 个周期 ~200ms,杜绝真 flaky
   const ws = new FakeWs()
-  new Heartbeat(ws, fast)
-  await tick(15)
-  ws.emitPong() // 第 1 次 ping 后回 pong
-  await tick(15)
-  ws.emitPong()
-  await tick(15)
-  ws.emitPong()
+  new Heartbeat(ws, { intervalMs: 25, maxMissed: 2 })
+  const end = Date.now() + 200
+  while (Date.now() < end) {
+    await tick(10)
+    ws.emitPong() // pong 派发周期 10ms,远快于心跳间隔
+  }
   expect(ws.terminated).toBe(false)
   expect(ws.pings).toBeGreaterThanOrEqual(3) // 一直在正常心跳
+})
+
+test('CONNECTING 期(readyState=0)跳过 tick:不 ping 不 terminate', async () => {
+  const ws = new FakeWs()
+  ws.readyState = 0 // ws 库 CONNECTING;此期 ping() 会抛 InvalidStateError,不能误判死
+  new Heartbeat(ws, fast)
+  await tick(80)
+  expect(ws.terminated).toBe(false) // 慢握手 ≠ 死连接
+  expect(ws.pings).toBe(0) // 未 OPEN 不发 ping
 })
 
 test('close 后定时器已清(stop 幂等)', async () => {
