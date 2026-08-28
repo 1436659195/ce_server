@@ -931,12 +931,14 @@ async function main(): Promise<void> {
             }
           } else if (req.op === 'createTerminal') {
             const termType = (req as { type?: string }).type
-            if (termType === 'cc') {
-              // CC 对话:起 ce 端 Agent SDK runner(不开 Jupyter 终端、不 parse TUI)。一机可多 CC(各目录独立),
-              // 每次 createTerminal 新建一个 agent(不复用)。返 sid(形如 cc-xxxx)作「终端名」——
-              // 手机据它路由 stdin(TermStdin cc- 分支)+ demux agentEvents(帧带 sid)+ 渲染对话组件(type:'cc')。
+            if (termType === 'cc' || termType === 'workshop') {
+              // CC 对话 / 插件工坊:起 ce 端 Agent SDK runner(不开 Jupyter 终端、不 parse TUI)。一机可多开
+              // (各目录独立),每次 createTerminal 新建一个 agent(不复用)。返 sid(形如 cc-xxxx)作「终端名」——
+              // 手机据它路由 stdin(TermStdin cc- 分支)+ demux agentEvents(帧带 sid)+ 渲染对话组件。
+              // workshop 与 cc 同一个 generic runner,只是手机侧 cwd 传工坊仓路径(技能随项目级 .claude/skills
+              // 自动加载)、首条发言由工坊插件自己组织(分档/资源评估提示词在手机侧插件里,ce 保持哑管道)。
               const sid = agentRunner.start(srcPhone, (req as { cwd?: string }).cwd)
-              console.log(`[ce] createTerminal(cc) → agentRunner sid=${sid} (phone=${srcPhone})`)
+              console.log(`[ce] createTerminal(${termType}) → agentRunner sid=${sid} (phone=${srcPhone})`)
               resp = { ok: true, data: { name: sid } }
             } else {
               // 普通终端:Jupyter 分配的新 name 必空闲 → 创建者即 owner(先到先得天然满足)。
