@@ -126,7 +126,8 @@ test('心跳:客户端不回 pong → 判死 terminate,cli 置空 + phone 收到
   cli.on('error', () => {})
   const reg = await waitForJson(cli, (m) => m.type === 'registered')
   // 停转 relay→client:server 侧 socket 停读(不 RST、不 FIN,连接"看起来还在")
-  upSock?.pause()
+  // (as 断言:TS 流分析看不到回调里的赋值,会把 upSock 窄化成 null → never)
+  ;(upSock as Socket | null)?.pause()
 
   const phone = connect(`${base}/${reg.sid}?token=${reg.token}`)
   await waitForJson(phone, (m) => m.type === 'joined')
@@ -139,7 +140,7 @@ test('心跳:客户端不回 pong → 判死 terminate,cli 置空 + phone 收到
   // 判死的真断言是 phone 收到 cliLeft(上行方向仍通),足够。
 
   await shutdown(close, phone) // cli 已被服务端 terminate,只关 phone
-  proxy.close(); upSock?.destroy()
+  proxy.close(); (upSock as Socket | null)?.destroy()
 })
 
 // ── 心跳:正常回 pong 不误杀 ───────────────────────────────────────────

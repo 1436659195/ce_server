@@ -74,7 +74,7 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 管家大脑 = **ce 里的一个 cc**,经 `@anthropic-ai/claude-agent-sdk` 的 `query()` 长驻跑(`prompt` = 永不结束的异步队列 → cc 多轮常驻)。终端操作是 cc 的**自定义工具**(`createSdkMcpServer` 里 `list_terminals`/`read_terminal`/`send_terminal`),handler 跑在 ce 进程内、直接读 ce 终端缓冲 / 写 terminado stdin。**管家是中继专属**(直连无 ce,无管家),且**工具无关**——终端里跑 cc/codex/opencode/服务/裸 shell 都用同一套工具管。
 
 - **skill** 由手机在 `butlerStart` RPC 里传(`req.skill`),ce 作为 mcpServer `instructions` 注入;ce 不另存。
-- **隔离**:`cwd='/tmp/ce-butler-cwd'`(空)→ cc 不加载任何项目 CLAUDE.md;`pathToClaudeCodeExecutable=resolveClaudeBin()` 复用系统 claude(连带 auth,绕开编译期 extractFromBunfs)。
+- **隔离**:`cwd=mkdtemp(tmpdir()/ce-butler-)`(空、随机、按需建)→ cc 不加载任何项目 CLAUDE.md;`pathToClaudeCodeExecutable=resolveClaudeBin()` 复用系统 claude(连带 auth,绕开编译期 extractFromBunfs;全候选失败 → null → butler_nocc,不裸回 'claude')。
 - **读类工具**(`list_terminals`/`read_terminal`/`Read`/`Grep`/`Glob`)进 `allowedTools` 自动放行;**写类**(`send_terminal`)走 `canUseTool` 问手机审批。
 
 ### 7.1 RPC(复用 RPCReq/Resp)

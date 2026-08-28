@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
 import { parse as parsePath } from 'node:path'
 import type { JupyterServer } from './jupyter-detect'
+import { resolvePythonBin } from './jupyter-detect'
 
 /**
  * 从 Jupyter 启动输出里抓 baseUrl + token。
@@ -53,9 +54,10 @@ export async function launchJupyter(
   // --ServerApp.allow_root=True:root 用户下 Jupyter 默认拒启(要 --allow-root),显式开(非 root 忽略无害)。
   const dir = rootDir ?? parsePath(process.cwd()).root
   const port = await pickFreePort() // ce 自选端口传 Jupyter,避开 --port=0 在某些环境打印 localhost:0
+  const py = await resolvePythonBin() // 生产红线 C1:不写死 'python'(标准发行版只有 python3)
   return new Promise((resolve, reject) => {
     const proc = spawn(
-      'python',
+      py,
       ['-m', 'jupyterlab', '--no-browser', `--port=${port}`, `--ServerApp.root_dir=${dir}`, '--ServerApp.allow_root=True'],
       {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -102,6 +104,11 @@ export async function launchJupyter(
       if (settled) return
       settled = true
       clearTimeout(timer)
+      // 127 + not found 尾巴 = 解释器缺失(shell:true 下非 ENOENT)→ 翻译成可行动报错(生产红线 C1)
+      if (code === 127 && /not found|no such file|is not recognized/i.test(buf)) {
+        reject(new Error(`未找到 python 解释器(${py} 退出 127)。可用 --python=<路径> 或环境变量 CE_PYTHON 指定。输出:\n${buf.slice(-1500)}`))
+        return
+      }
       reject(new Error(`Jupyter 进程提前退出(码 ${code})。输出:\n${buf.slice(-1500)}`))
     })
     proc.on('error', (e) => {

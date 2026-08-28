@@ -112,8 +112,9 @@ export interface AgentRunnerOpts {
   /** SDK 事件 → 手机(回调;main.ts 接到后加密成 AgentEvent 帧发给 owner)。带 sid 让手机 demux 多 CC tab。 */
   onEvent: (owner: string, sid: string, event: AgentEvent) => void
   onExit: (sid: string, owner: string, code: number | null) => void
-  /** resolveClaudeBin() 结果;SDK 经 pathToClaudeCodeExecutable 复用系统 claude(连带 auth)。 */
-  claudeBin: string
+  /** resolveClaudeBin() 结果;null = 全候选实测失败(生产红线 C2:不再裸回 'claude')。
+   *  首条消息时守卫拒启 + 通知手机,不在 spawn 时才炸。SDK 经 pathToClaudeCodeExecutable 复用系统 claude(连带 auth)。 */
+  claudeBin: string | null
   /** 注入点(测试用):喂假 query 避免真 spawn cc。签名同 SDK query。 */
   query?: (params: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => AsyncIterable<SDKMessage>
   /** 工作目录(claude 的项目根;CC 对话跑在用户项目,butler 跑 /tmp)。 */
@@ -154,6 +155,17 @@ export class AgentRunner {
     proc.queue.push(msg)
     if (!proc.started) {
       proc.started = true
+      // 生产红线 C2:claudeBin=null(全候选实测失败)→ 显式拒启 + 告知手机,不裸 spawn 'claude'
+      if (!this.opts.claudeBin) {
+        console.error(`[ce:agent-runner] ${sid} 无法启动:本机未探到可用的 claude(可用 --claude-bin=<路径> 指定)`)
+        this.opts.onEvent(proc.owner, proc.sid, {
+          kind: 'text',
+          text: '[ce] 本机未找到可用的 claude,对话无法启动。请在被控机安装/修复 claude,或启动 ce 时用 --claude-bin=<路径> 指定。',
+        })
+        this.opts.onEvent(proc.owner, proc.sid, { kind: 'turn-end', status: 'failed' })
+        this.finish(proc, -2)
+        return
+      }
       console.log(`[ce:agent-runner] ${sid} 首条消息,启动 SDK query(cwd=${proc.cwd}, claude=${this.opts.claudeBin})`)
       this.runConversation(proc).catch((e) => {
         console.error(`[ce:agent-runner] ${sid} 对话循环异常(不崩 ce):`, (e as Error).message)
