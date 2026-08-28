@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { resolvePythonBin } from './python'
 
 const pExecFile = promisify(execFile)
 
@@ -15,8 +16,8 @@ export interface JupyterServer {
  * 解析 `jupyter server list`(或老版 `jupyter notebook list`)的文本输出。
  * 输出形如:
  *   Currently running servers:
- *   http://localhost:8888/?token=xxx :: /home/user
- *   https://10.0.0.1:9999/?token=yyy :: /data
+ *   http://localhost:8888/?token=xxx :: /srv/app
+ *   https://10.0.0.1:9999/?token=yyy :: /mnt/disk
  */
 export function parseServerList(output: string): JupyterServer[] {
   const servers: JupyterServer[] = []
@@ -60,15 +61,22 @@ export async function isAlive(url: string, token: string, ms = 3000): Promise<bo
   }
 }
 
-/** 跑 `python -m jupyter_server list` 探测本机在跑的 Jupyter(无则空数组)。
- *  结果逐个 fetch 验活——`jupyter list` 会列出已关掉的残留 runtime 条目,不验活会复用死 URL → fetch "Unable to connect"。 */
-export async function detectServers(): Promise<JupyterServer[]> {
-  // 走 `python -m ...` 而非 `jupyter ...`:Bun --compile 的 Windows 二进制 spawn 不了 jupyter.exe,
+/** 跑 `<python 解释器> -m jupyter_server list` 探测本机在跑的 Jupyter(无则空数组)。
+ *  结果逐个 fetch 验活——`jupyter list` 会列出已关掉的残留 runtime 条目,不验活会复用死 URL → fetch "Unable to connect"。
+ *  pythonBin 由调用方注入(main 用 resolvePythonBin 统一解析);缺省时自解析(解释器缺失 → 空数组 + warn,不再静默)。 */
+export async function detectServers(pythonBin?: string): Promise<JupyterServer[]> {
+  const bin = pythonBin ?? (await resolvePythonBin())
+  if (!bin) {
+    console.warn('[ce] 未找到 python 解释器(试过 python3/python),无法探测本机 Jupyter;可用 --python=<路径> 或环境变量 CE_PYTHON 指定')
+    return []
+  }
+  let exit127 = false
+  // 走 `<bin> -m ...` 而非 `jupyter ...`:Bun --compile 的 Windows 二进制 spawn 不了 jupyter.exe,
   // 但 spawn python.exe 正常(见 launchJupyter 注释)。优先 `jupyter_server list`,回退老版 `notebook list`
   for (const sub of [['-m', 'jupyter_server', 'list'], ['-m', 'notebook', 'list']]) {
     try {
       // shell:true —— Windows 上靠 cmd 的 PATHEXT 解析 python.exe(其它平台无影响)
-      const { stdout } = await pExecFile('python', sub, { shell: true, windowsHide: true })
+      const { stdout } = await pExecFile(bin, sub, { shell: true, windowsHide: true })
       const parsed = parseServerList(stdout)
       const live: JupyterServer[] = []
       for (const s of parsed) {
@@ -76,9 +84,12 @@ export async function detectServers(): Promise<JupyterServer[]> {
       }
       if (live.length > 0) return live
       // 全是 stale(已关掉的残留)→ 当作没探测到,落到上层自起一个
-    } catch {
-      // 该子命令不存在或失败,试下一个
+    } catch (e) {
+      // 127 = shell 下解释器不存在(command not found)—— 不再纯静默,给可行动提示;
+      // 其余失败(如模块未装退出 1)维持旧行为:试下一个子命令。
+      if ((e as { code?: number | string }).code === 127) exit127 = true
     }
   }
+  if (exit127) console.warn(`[ce] 未找到 python 解释器:「${bin}」退出码 127(command not found);请检查 --python= / CE_PYTHON 指定的路径`)
   return []
 }

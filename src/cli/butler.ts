@@ -11,11 +11,25 @@
  */
 import { query, createSdkMcpServer, type SDKMessage, type SDKUserMessage, type Options } from '@anthropic-ai/claude-agent-sdk'
 import { randomBytes } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { makeButlerTools, type ToolDeps } from './butler-tools'
 
-/** 管家隔离工作目录(空)→ cc 不加载任何项目 CLAUDE.md,身份只由 skill 决定。 */
-const BUTLER_CWD = '/tmp/ce-butler-cwd'
+/** 管家隔离工作目录(空)→ cc 不加载任何项目 CLAUDE.md,身份只由 skill 决定。
+ *  位置:os.tmpdir() 下 mkdtemp 随机子目录,本进程懒建一次 —— 不写死绝对路径(W2:旧版写死的
+ *  固定 /tmp 子目录既假设目录布局、又跨用户共享不隔离);mkdtemp 失败退 tmpdir() 本身。 */
+let butlerCwd: string | undefined
+function ensureButlerCwd(): string {
+  if (butlerCwd === undefined) {
+    try {
+      butlerCwd = mkdtempSync(join(tmpdir(), 'ce-butler-'))
+    } catch {
+      butlerCwd = tmpdir()
+    }
+  }
+  return butlerCwd
+}
 /** 写类工具(非 allowedTools)走手机审批;15s 不答 → 自动拒。 */
 const APPROVAL_TIMEOUT_MS = 15000
 /** 孤儿管家回收:phoneLeft 后该手机 6h 不回来 → 回收其管家(免「移除服务器」后 ce 端 cc 常驻泄漏)。
@@ -59,8 +73,9 @@ export interface ButlerOpts {
   onExit: (sid: string, owner: string, code: number | null) => void
   /** 终端工具依赖(buffers + send),全 ce 共享一份。 */
   deps: ToolDeps
-  /** resolveClaudeBin() 结果;SDK 经 pathToClaudeCodeExecutable 复用系统 claude(连带 auth)。 */
-  claudeBin: string
+  /** resolveClaudeBin() 结果;SDK 经 pathToClaudeCodeExecutable 复用系统 claude(连带 auth)。
+   *  null = 探测全失败(显式无 claude)—— start() 不 spawn、直接走 butler_nocc 提示。 */
+  claudeBin: string | null
   /** 注入点(测试用):喂假 query 避免真 spawn cc。默认用 SDK 的 query。签名同 SDK query(单 params 对象)。 */
   query?: (params: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => AsyncIterable<SDKMessage>
 }
@@ -101,10 +116,17 @@ export class ButlerManager {
   start(skill: string, owner: string): string {
     const existing = this.sidForPhone(owner)
     if (existing) return existing
-    try { mkdirSync(BUTLER_CWD, { recursive: true }) } catch { /* 已在 */ }
     const sid = `butler-${randomBytes(4).toString('hex')}`
     const proc: ButlerProc = { sid, owner, queue: new InputQueue(), approvals: new Map(), stopping: false }
     this.procs.set(sid, proc)
+    if (this.opts.claudeBin == null) {
+      // claude 探测全失败(resolveClaudeBin 显式 null):不 spawn。收尾延到下个 macrotask —— 手机在
+      // butlerStart 的 RPCResp resolve 之后才注册 onButlerOutput(同 system/init 的时序约束),同步发
+      // 会被丢、手机干等 40s。code -2 → main 的 onExit 映射 butler_nocc,手机显式提示「无 claude」。
+      console.warn('[ce:butler] claude 不可用(探测全候选失败),管家不启动')
+      setTimeout(() => this.finish(proc, -2), 0)
+      return sid
+    }
     proc.queue.push(BOOTSTRAP) // ★ seed 首条:触发 cc boot + 吐 system/init(空队列 cc 不启动)
     // 后台跑对话循环;query 自身 spawn cc,异常 → finish(-2)(ce 不崩)。
     this.runConversation(proc, skill).catch((e) => {
@@ -122,8 +144,8 @@ export class ButlerManager {
       prompt: proc.queue,
       options: {
         mcpServers: { 'ce-butler': server },
-        cwd: BUTLER_CWD,
-        pathToClaudeCodeExecutable: this.opts.claudeBin,
+        cwd: ensureButlerCwd(),
+        pathToClaudeCodeExecutable: this.opts.claudeBin ?? undefined, // start() 已拦 null,此处仅类型收窄
         settingSources: [], // 跳过用户/项目/本地设置 → 不加载 superpowers 等用户级插件/hook(否则 SessionStart hook 吐巨量 skill 文本 + 拖慢 init → 唤醒 40s 超时)。auth 走 credentials,不受影响。
         plugins: [], // 显式不载任何插件(双保险)
         tools: ['Read', 'Grep', 'Glob'], // 内置只留只读三件

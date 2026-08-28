@@ -223,3 +223,30 @@ describe('AgentRunner.replayPendingApprovals', () => {
     expect(events).toEqual([])
   })
 })
+
+// ── claudeBin=null(探测全失败,PROD-PATH-FIXES C2):不调 SDK,显式提示 + failed 收尾 ──
+describe('AgentRunner.claudeBin=null', () => {
+  it('首条消息 → text 提示 + turn-end failed,不调 query,proc 收尾', () => {
+    const events: AgentEvent[] = []
+    let queryCalled = false
+    /** 探针 query:被调到即置位(null 路径绝不应调它)。 */
+    const probeQuery = async function* (): AsyncGenerator<SDKMessage> {
+      queryCalled = true
+      yield { type: 'result', subtype: 'success' } as unknown as SDKMessage
+    }
+    const runner = new AgentRunner({
+      onEvent: (_o, _s, ev) => events.push(ev as AgentEvent),
+      onExit: () => {},
+      claudeBin: null,
+      cwd: '/tmp',
+      query: probeQuery,
+    })
+    const sid = runner.start('phoneA', '/')
+    runner.writeStdin(sid, 'hi')
+    expect(events.map((e) => e.kind)).toEqual(['text', 'turn-end'])
+    expect((events[0] as { text: string }).text).toContain('claude')
+    expect((events[1] as { status: string }).status).toBe('failed')
+    expect(queryCalled).toBe(false) // 绝不裸 spawn
+    expect(runner.sids()).toEqual([]) // proc 已收尾
+  })
+})

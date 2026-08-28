@@ -219,11 +219,11 @@ async function showLogs(d: DaemonInfo): Promise<void> {
 }
 
 async function doctor(d: DaemonInfo): Promise<void> {
-  const r = await api<{ relay: { url: string; connected: boolean }; jupyter: { url: string } | null; claude: string }>(d, '/control/doctor')
+  const r = await api<{ relay: { url: string; connected: boolean }; jupyter: { url: string } | null; claude: string | null }>(d, '/control/doctor')
   const lines = [
     `中继    ${r.relay.connected ? C.green + '✓ 已连' : C.red + '✗ 未连'}${C.reset}  ${r.relay.url}`,
     `Jupyter ${r.jupyter ? C.green + '✓ ' + r.jupyter.url : C.red + '✗ 未检测到'}${C.reset}`,
-    `claude  ${r.claude}`,
+    `claude  ${r.claude ? C.green + '✓ ' + r.claude + C.reset : C.red + '✗ 未检测到(管家/CC 对话不可用)' + C.reset}`,
   ]
   console.log(clr + box(lines) + '\n(按任意键返回)')
   await readKey()

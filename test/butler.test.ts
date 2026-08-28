@@ -58,3 +58,28 @@ test('writeStdin:未知 sid 静默 no-op(不抛)', () => {
   const mgr = newMgr(() => {})
   expect(() => mgr.writeStdin('butler-nope', new TextEncoder().encode('{}'))).not.toThrow()
 })
+
+// claudeBin=null(探测全失败,PROD-PATH-FIXES C2):不 spawn query,异步按 code -2 收尾
+// (main 的 onExit 把 -2 映射成 butler_nocc,手机显式提示「无 claude」)。
+test('claudeBin=null:start 不调 query,异步 onExit(-2)', async () => {
+  let queryCalled = false
+  const probeQuery = async function* (): AsyncGenerator<SDKMessage> {
+    queryCalled = true
+    yield { type: 'system', subtype: 'init' } as SDKMessage
+  }
+  const exits: Array<[string, number | null]> = []
+  const mgr = new ButlerManager({
+    onOutput: () => {},
+    onExit: (_sid, _o, code) => exits.push(['x', code]),
+    deps: fakeDeps,
+    claudeBin: null,
+    query: probeQuery,
+  })
+  const sid = mgr.start('SKILL', 'phone-A')
+  await wait(30) // setTimeout(0) 收尾
+  expect(queryCalled).toBe(false) // 绝不裸 spawn
+  expect(mgr.hasForPhone('phone-A')).toBe(false) // proc 已收尾
+  expect(exits.length).toBe(1)
+  expect(exits[0][1]).toBe(-2)
+  expect(sid).toMatch(/^butler-/)
+})
