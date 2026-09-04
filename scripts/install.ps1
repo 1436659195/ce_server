@@ -78,10 +78,47 @@ if (Test-Path $exe) {
   Invoke-WebRequest -Uri $dlUrl -OutFile $exe
 }
 
-# ③ 写 config.json(ce 启动读它,不必每次带 --relay)
+# ③ 选盘(= Jupyter root_dir,手机文件栏的浏览根;默认有 D: 用 D:、否则 C:)+ 写 config.json(ce 启动读它,不必每次带 --relay)
 $ceDir = Join-Path $env:USERPROFILE '.ce'
 New-Item -ItemType Directory -Force -Path $ceDir | Out-Null
-@{ relay = $relay } | ConvertTo-Json | Set-Content (Join-Path $ceDir 'config.json')
+$cfgPath = Join-Path $ceDir 'config.json'
+$oldRoot = $null
+if (Test-Path $cfgPath) {
+  try { $oldRoot = (Get-Content $cfgPath -Raw | ConvertFrom-Json).root } catch {}
+}
+
+# 枚举本地盘:固定 + 可移动(排除 CD-ROM/网络盘);IsReady 滤掉未就绪的空卡槽
+$drives = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') })
+Write-Host "[install] 选择文件根盘(手机文件栏从它浏览):"
+for ($i = 0; $i -lt $drives.Count; $i++) {
+  $d = $drives[$i]
+  $type = if ($d.DriveType -eq 'Fixed') { '固定盘' } else { '可移动' }
+  $free = [math]::Round($d.TotalFreeSpace / 1GB, 1)
+  Write-Host ("  [{0}] {1}  {2}  剩余 {3} GB" -f ($i + 1), $d.RootDirectory.Path, $type, $free)
+}
+function Find-DriveIdx([object[]]$ds, [string]$path) {
+  for ($i = 0; $i -lt $ds.Count; $i++) { if ($ds[$i].RootDirectory.Path -ieq $path) { return $i } }
+  return -1
+}
+# 默认:重跑时旧配置的根(回车保持)→ 首装 D:(有则)→ C: → 第 0 个
+$defaultIdx = if ($oldRoot) { Find-DriveIdx $drives $oldRoot } else { Find-DriveIdx $drives 'D:\' }
+if ($defaultIdx -lt 0) { $defaultIdx = Find-DriveIdx $drives 'C:\' }
+if ($defaultIdx -lt 0) { $defaultIdx = 0 }
+$sel = Read-Host ("[install] 输入编号(回车 = [{0}] {1})" -f ($defaultIdx + 1), $drives[$defaultIdx].RootDirectory.Path)
+$idx = $defaultIdx
+if ($sel -match '^\s*\d+\s*$') {
+  $n = [int]$sel - 1
+  if ($n -ge 0 -and $n -lt $drives.Count) { $idx = $n }
+  else { Write-Host "[install] 编号超出范围,用默认" -ForegroundColor Yellow }
+}
+$root = $drives[$idx].RootDirectory.Path
+$rootChanged = ($oldRoot -and ($oldRoot -ine $root))
+@{ relay = $relay; root = $root } | ConvertTo-Json | Set-Content $cfgPath
+if ($rootChanged) {
+  Write-Host "[install] 文件根: $oldRoot → $root(下方重启 ce 后生效)" -ForegroundColor Yellow
+} else {
+  Write-Host "[install] 文件根: $root"
+}
 
 # ④ 注册 ce 到用户 PATH(新终端里 ce 命令生效)
 $userPath = [Environment]::GetEnvironmentVariable('Path','User')
@@ -103,6 +140,13 @@ if ($alreadyAuto) {
 
 # ⑥ 启动 ce(已在跑 = 本次未更新,复用其连接码;② 更新路径停了旧进程,此处查无进程 → 落到下方拉起新版)
 $running = Get-Process -Name 'ce' -ErrorAction SilentlyContinue
+# ③ 换了盘 → 停旧 ce 重启才生效(同 ② 更新逻辑;ce 重启带 cid 注册回同一 sid,配对码/白名单不丢)
+if ($running -and $rootChanged) {
+  Write-Host "[install] 文件根已改($oldRoot → $root),重启 ce 使其生效" -ForegroundColor Yellow
+  $running | Stop-Process -Force
+  $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+  $running = $null
+}
 if ($running) {
   Write-Host "[install] ce 已在运行(PID $($running.Id -join ',')),不重复启动" -ForegroundColor Yellow
   $codeFile = Join-Path $ceDir 'connection-code.json'

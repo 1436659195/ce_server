@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { promisify } from 'node:util'
 
 const pExecFile = promisify(execFile)
@@ -136,4 +137,27 @@ export async function detectServers(): Promise<JupyterServer[]> {
  *  Mac 双栈监听下 v4/v6 在扩展路由上有瞬时差异(配对瞬间 404 竞态入口),统一 v4 消灭歧义。 */
 export function toLoopback(url: string): string {
   return url.replace(/:\/\/localhost\b/, '://127.0.0.1')
+}
+
+/** 解析 osRoot(Jupyter 自启的 root_dir / 复用判定基准):config.root(install.ps1 选盘写入,
+ *  Windows 默认 D: 有则 D:、否则 C:)优先,盘还在才用;盘没了(拔盘/换盘符)warn 后回退 cwd 盘根
+ *  —— 不删配置,盘回来下次即恢复。install.sh 不写 root → Linux/Mac 恒走 cwd 根('/')。
+ *  exists 可注入(单测喂假结果,同 probePythonBin 惯例)。 */
+export function resolveOsRoot(
+  configured: string | undefined,
+  cwdRoot: string,
+  exists: (p: string) => boolean = existsSync,
+): string {
+  if (!configured) return cwdRoot
+  if (exists(configured)) return configured
+  console.warn(`[ce] 配置的根 ${configured} 不存在(盘被移除/未挂载?),本次回退 ${cwdRoot}`)
+  return cwdRoot
+}
+
+/** 盘根相等判定:大小写 + 尾部分隔符归一(`D:\` vs `d:`;`/` 归一后两侧皆空串恒等)。
+ *  用于 `jupyter server list` 输出的 root 与 config/osRoot 的比较 —— 换盘后旧 root 的活 Jupyter
+ *  靠它挡在复用之外,而不是靠裸 `===`(Windows 大小写/尾斜杠不稳)。 */
+export function sameRoot(a: string, b: string): boolean {
+  const norm = (p: string): string => p.replace(/[\\/]+$/, '').toLowerCase()
+  return norm(a) === norm(b)
 }

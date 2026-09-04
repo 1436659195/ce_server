@@ -19,7 +19,7 @@ import { join, resolve, parse as parsePath } from 'node:path'
 import { randomBytes, createHash } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
-import { detectServers, isAlive, toLoopback, probePythonBin, resolvePythonBin } from './jupyter-detect'
+import { detectServers, isAlive, toLoopback, probePythonBin, resolvePythonBin, resolveOsRoot, sameRoot } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, listTerminalsRetry, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { UploadSessions } from './uploads'
@@ -206,9 +206,9 @@ function pickRoot(servers: { url: string; root: string }[], url: string): RootPi
   return { root: process.cwd(), source: 'cwd' }
 }
 
-/** 解析 Jupyter:显式 > 探测(只复用 root 在根目录的)> 引导装 > 启动。
- *  ce 的 jupyter 永远服务【宿主机根目录】(手机文件栏从根浏览整个文件系统)。
- *  探测到的 jupyter 若 root 正好在根目录 → 复用;否则(无 / root 不在根目录,如本机 screen 开的 /data)→ 自启根目录的。
+/** 解析 Jupyter:显式 > 探测(只复用 root 在配置根的)> 引导装 > 启动。
+ *  ce 的 jupyter 服务【配置根】= config.root(Windows install.ps1 选盘,默认 D: 有则 D:)/ Linux-Mac '/'。
+ *  探测到的 jupyter 若 root 正好在配置根 → 复用;否则(无 / root 不在配置根,如本机 screen 开的 /data)→ 自启配置根的。
  *  返回 root(jupyter root_dir OS 路径,CC 对话 cwd 的 base)。 */
 async function resolveJupyter(
   relayUrl: string
@@ -230,20 +230,28 @@ async function resolveJupyter(
     }
     return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root: pick.root }
   }
-  const osRoot = parsePath(process.cwd()).root // Linux/Mac '/',Windows 当前盘根 = ce 自启用的 root_dir
+  // osRoot:config.root(Windows install.ps1 选盘写入,默认有 D: 用 D:、否则 C:)优先,盘没了回退 cwd 盘根;
+  // install.sh 不写 → Linux/Mac 恒 '/'(原行为)
+  const osRoot = resolveOsRoot(loadConfig().root, parsePath(process.cwd()).root)
   // 优先复用上次自启的 Jupyter(daemon 重启不起新的 → 终端会话/终端名不丢,手机不会因换 Jupyter 而 404)。
   // 比 detectServers 的 jupyter list 解析可靠(Windows 路径格式/大小写坑,正是之前没复用、反复起多个的根因)。
   try {
     const saved = JSON.parse(readFileSync(join(homedir(), '.ce', 'jupyter.json'), 'utf8')) as { url: string; token: string; root?: string }
-    if (saved.url && saved.token && (await isAlive(saved.url, saved.token))) {
+    // 复用须 root 与当前 osRoot 一致:换盘(config.root 变)后,旧 root 的活 Jupyter 不能把新选择挡住。
+    // saved.root 缺失(古老/手改文件)同判不一致 —— root 是 CC 对话 cwd base + 上传边界,不可信就不复用(红线 W1 同源)。
+    if (saved.url && saved.token && saved.root && sameRoot(saved.root, osRoot) && (await isAlive(saved.url, saved.token))) {
       console.log(`[ce] 复用上次 Jupyter:${saved.url}`)
-      return { baseUrl: toLoopback(saved.url), token: saved.token, root: saved.root ?? osRoot }
+      return { baseUrl: toLoopback(saved.url), token: saved.token, root: saved.root }
+    }
+    if (saved.url && saved.root && !sameRoot(saved.root, osRoot)) {
+      console.log(`[ce] 上次 Jupyter root ${saved.root} ≠ 当前根 ${osRoot}(换盘?),不复用、按新根解析`)
     }
   } catch {
     /* 无 jupyter.json 或验活失败 → 落到探测/自启 */
   }
   const existing = await detectServers()
-  const reuse = existing.find((s) => s.root === osRoot) // 只复用 root 正好在根目录的现成 jupyter
+  // 只复用 root 正好在(配置)盘根的现成 jupyter;sameRoot 归一比较防 Windows 大小写/尾斜杠
+  const reuse = existing.find((s) => sameRoot(s.root, osRoot))
   if (reuse && (await isAlive(reuse.url, reuse.token))) {
     // 验 token 有效才复用:有的旧 Jupyter runtime stale / jupyter list 没带 token → detectServers 拿到空 token,
     // 盲信复用会让后续所有 API 403。验不过(token 空/失效)就落自启,起一个 token 干净的新 Jupyter。
@@ -266,7 +274,7 @@ async function resolveJupyter(
   console.log('[ce] 启动 Jupyter...')
   // onLog:把 Jupyter 的 stdout/stderr 持续接走写 ~/.ce/ce.log —— 既 drain pipe(防 Jupyter 被自己日志噎死),
   // 又让控制台 [l] 能看到 Jupyter 输出供排障。
-  const { server, stop } = await launchJupyter(undefined, 30000, (chunk) => {
+  const { server, stop } = await launchJupyter(osRoot, 30000, (chunk) => {
     try {
       const p = join(homedir(), '.ce', 'ce.log')
       rotateLogIfBig(p) // 写前轮转,防 Jupyter 访问日志撑爆磁盘

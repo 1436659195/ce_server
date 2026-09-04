@@ -18,14 +18,17 @@ irm https://ce.coding-everywhere.xyz/install.ps1 | iex
 
 > 自建中继把域名换成自己的;中继在 serve 安装脚本时已把地址注入,运营者通常给你一条可直接执行的完整命令。
 
-## 装的过程(全自动)
+## 装的过程(基本全自动)
 
 1. 自动识别系统(Linux / macOS / Windows × x64 / arm64),下载对应 CE
 2. 校验文件指纹(已是最新则跳过下载,免重复拉 ~90MB)
-3. 装到 `/usr/local/bin/ce`(无权限则回退 `~/.local/bin/ce`)
-4. 写配置 `~/.ce/config.json`(记中继地址)
-5. 询问是否开机自启(可选;Linux 走 systemd user service)
-6. 启动 CE
+3. 装到 `/usr/local/bin/ce`(无权限则回退 `~/.local/bin/ce`;Windows 装 `%LOCALAPPDATA%\Programs\ce\ce.exe`)
+4. **Windows 选盘**:列出本地盘(盘符 / 类型 / 剩余空间),回车默认 D:(没有则 C:);所选盘 = Jupyter 文件根(手机文件栏从它浏览),记入 `~/.ce/config.json` 的 `root`
+5. 写配置 `~/.ce/config.json`(记中继地址)
+6. 询问是否开机自启(可选;Linux 走 systemd user service)
+7. 启动 CE
+
+**Windows 换盘**:重跑安装命令重新选(回车保持原值);换了盘安装器会自动重启 CE 使其生效。选的盘后来被移除/换盘符,CE 启动时回退系统盘根并提示,不删配置。
 
 ## 启动后
 

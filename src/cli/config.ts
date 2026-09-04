@@ -8,6 +8,9 @@ const PATH = join(DIR, 'config.json')
 export interface CeConfig {
   /** 默认中继地址(ws://host:port);install.ps1 写入,ce 启动读它(回退 --relay 参数) */
   relay?: string
+  /** Jupyter root_dir(手机文件栏浏览根),形如 `D:\`;install.ps1 选盘写入,ce 启动读它。
+   *  install.sh(Linux/Mac)不写 → 恒走 cwd 盘根('/')。换盘:重跑安装命令重选。 */
+  root?: string
 }
 
 /** 读 config;不存在/损坏 → 空对象(不抛)。path 可注入便于测试。 */

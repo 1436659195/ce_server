@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { parseServerList, toLoopback, probePythonBin } from '../src/cli/jupyter-detect'
+import { parseServerList, toLoopback, probePythonBin, resolveOsRoot, sameRoot } from '../src/cli/jupyter-detect'
 
 // 解析 `jupyter server list` 文本 → {url, token, root}[]。所有 token 均为假数据。
 test('parseServerList:表驱动(空/单/多/特殊字符)', () => {
@@ -103,4 +103,33 @@ test('probePythonBin:--python= 盖过 CE_PYTHON', async () => {
     process.argv.pop()
     delete process.env.CE_PYTHON
   }
+})
+
+// ── resolveOsRoot(config.root 优先,盘没了回退 cwd 根;install.ps1 选盘写入, ──
+//    install.sh 不写 → Linux/Mac 恒走 cwd 根 '/')─────────────────────────────
+
+test('resolveOsRoot:配置根存在 → 返回配置值(Windows 选盘生效)', () => {
+  expect(resolveOsRoot('D:\\', 'C:\\', () => true)).toBe('D:\\')
+})
+
+test('resolveOsRoot:配置根盘没了(拔盘/换盘符)→ 回退 cwd 根,不炸', () => {
+  expect(resolveOsRoot('E:\\', 'C:\\', () => false)).toBe('C:\\')
+})
+
+test('resolveOsRoot:没配置 → cwd 根(现行为;exists 不应被调)', () => {
+  expect(resolveOsRoot(undefined, '/', () => { throw new Error('不应探测') })).toBe('/')
+})
+
+// ── sameRoot(盘根归一比较:jupyter server list 输出 vs config 写入,大小写/尾分隔符 ──
+//    可能不一致;换盘后旧 root 的活 Jupyter 靠它挡在复用之外)─────────────────────────
+
+test('sameRoot:大小写与尾部分隔符归一', () => {
+  expect(sameRoot('D:\\', 'd:')).toBe(true)
+  expect(sameRoot('C:\\', 'C:\\')).toBe(true)
+  expect(sameRoot('/', '/')).toBe(true)
+})
+
+test('sameRoot:不同盘 / 子目录 ≠ 盘根 → false', () => {
+  expect(sameRoot('D:\\', 'C:\\')).toBe(false)
+  expect(sameRoot('D:\\work', 'D:\\')).toBe(false)
 })
