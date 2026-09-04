@@ -233,6 +233,8 @@ async function resolveJupyter(
   // osRoot:config.root(Windows install.ps1 选盘写入,默认有 D: 用 D:、否则 C:)优先,盘没了回退 cwd 盘根;
   // install.sh 不写 → Linux/Mac 恒 '/'(原行为)
   const osRoot = resolveOsRoot(loadConfig().root, parsePath(process.cwd()).root)
+  // 排障可见性:选盘是否生效一行看穿(配置的盘没了时 resolveOsRoot 另有 warn),否则只能从手机文件栏反推
+  console.log(`[ce] 文件根(Jupyter root_dir):${osRoot}`)
   // 优先复用上次自启的 Jupyter(daemon 重启不起新的 → 终端会话/终端名不丢,手机不会因换 Jupyter 而 404)。
   // 比 detectServers 的 jupyter list 解析可靠(Windows 路径格式/大小写坑,正是之前没复用、反复起多个的根因)。
   try {
