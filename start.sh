@@ -49,6 +49,11 @@ is_running() {
 CMD="${1:-start}"
 case "$CMD" in
   start)
+    # 已交给 systemd 管理(ce-relay.service)时引导用 systemctl,避免双实例抢 8606 端口。
+    if systemctl is-active --quiet ce-relay 2>/dev/null; then
+      echo "relay 已由 systemd 管理(ce-relay.service)且正在运行。请用:systemctl restart ce-relay"
+      exit 0
+    fi
     if is_running; then
       echo "relay 已在运行(pid $(cat "$PID_FILE"))。如需重启:./start.sh restart"
       exit 0

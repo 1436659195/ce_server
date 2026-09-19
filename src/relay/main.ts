@@ -3,6 +3,17 @@ import { fileURLToPath } from 'node:url'
 import { createRelayServer } from './server'
 import { Hub, deriveStateKey } from './hub'
 
+// 日志统一带本地时间戳:relay.log 原先无时间戳,故障窗口只能靠文件 mtime 猜(9-19 事故排查痛点)。
+const ts = (): string => {
+  const d = new Date()
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+for (const m of ['log', 'warn', 'error'] as const) {
+  const orig = console[m].bind(console)
+  console[m] = (...args: unknown[]) => orig(`[${ts()}]`, ...args)
+}
+
 // 静态下载文件路径(中继以 bun 脚本模式跑,import.meta.url 解析正常;src/relay/ → dist|scripts/)。
 const here = fileURLToPath(new URL('.', import.meta.url))
 
@@ -12,8 +23,10 @@ const port = portArg
   ? Number(portArg.split('=')[1])
   : Number(process.env.RELAY_PORT ?? 8606)
 
-const tlsCert = process.argv.find((a) => a.startsWith('--tls-cert='))?.split('=')[1]
-const tlsKey = process.argv.find((a) => a.startsWith('--tls-key='))?.split('=')[1]
+const tlsCert =
+  process.argv.find((a) => a.startsWith('--tls-cert='))?.split('=')[1] ?? process.env.RELAY_TLS_CERT
+const tlsKey =
+  process.argv.find((a) => a.startsWith('--tls-key='))?.split('=')[1] ?? process.env.RELAY_TLS_KEY
 // 对外中继地址(--public-url 或 RELAY_PUBLIC_URL):install 脚本注入用它,防 Host 头伪造。不配则回退请求 Host。
 const publicUrl =
   process.argv.find((a) => a.startsWith('--public-url='))?.split('=')[1] ?? process.env.RELAY_PUBLIC_URL
@@ -53,10 +66,12 @@ server.listen(port, () => {
   console.log(`[relay] listening on :${port}${tlsCert ? ' (wss/TLS)' : ' (ws)'}`)
 })
 
-// 优雅退出
-process.on('SIGINT', () => {
-  close().then(() => process.exit(0))
-})
+// 优雅退出(SIGINT 手动 Ctrl+C;SIGTERM 是 systemd/docker 停服务发的信号,原先没接会变强杀)
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => {
+    close().then(() => process.exit(0))
+  })
+}
 
 // 兜底①:Promise 漏接(最常见的「小意外带崩全场」源)→ 记日志,不退出,保住在用连接。
 process.on('unhandledRejection', (reason) => {
