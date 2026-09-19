@@ -42,7 +42,16 @@ export function createRelayServer(
   const requestListener = (req: IncomingMessage, res: ServerResponse): void => {
     const host = req.headers.host ?? 'localhost'
     const relayWs = opts?.publicUrl ?? `ws://${host}`
-    const path = new URL(req.url ?? '/', 'http://relay').pathname
+    // 畸形请求行(如扫描器发 "//")会让 new URL 抛 ERR_INVALID_URL → uncaughtException 整进程退出,这里直接 400 掉。
+    let path: string
+    try {
+      path = new URL(req.url ?? '/', 'http://relay').pathname
+    } catch {
+      console.warn(`[relay] 畸形请求已拒(400): ${req.method} ${JSON.stringify(req.url)} from ${req.socket.remoteAddress}`)
+      res.writeHead(400)
+      res.end('bad request')
+      return
+    }
     if (path === '/install.ps1' && opts?.installScriptPath) {
       try {
         const body = renderInstallScript(readFileSync(opts.installScriptPath, 'utf8'), relayWs)
@@ -212,7 +221,15 @@ export function createRelayServer(
   }
 
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-    const u = new URL(req.url ?? '/', 'http://relay')
+    // 畸形 upgrade 路径(如 "//")同样会让 new URL 抛 ERR_INVALID_URL → 崩进程,拒掉并记来源。
+    let u: URL
+    try {
+      u = new URL(req.url ?? '/', 'http://relay')
+    } catch {
+      console.warn(`[relay] 畸形 ws 请求已拒: ${JSON.stringify(req.url)} from ${req.socket.remoteAddress}`)
+      ws.close(1008, 'bad request')
+      return
+    }
     const path = u.pathname.replace(/\/+$/, '') // 去尾斜杠:'/' → ''
     const token = u.searchParams.get('token') ?? ''
 
