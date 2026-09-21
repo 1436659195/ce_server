@@ -29,7 +29,7 @@ import { generateHooksConfig, handleHookBody } from './cc-hooks'
 import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
-import { loadAuthorized, addAuthorized, removeAuthorized, authorize, type PairingMode } from './pairing'
+import { loadAuthorized, loadPaired, addAuthorized, removeAuthorized, authorize, loadPin, savePin, type PairingMode } from './pairing'
 import { spawn, execFile } from 'node:child_process'
 import { createServer } from 'node:net'
 import { promisify } from 'node:util'
@@ -426,9 +426,13 @@ async function main(): Promise<void> {
   const phoneKeys = new Map<string, { sharedKey: Uint8Array; name: string }>()
   // 握手认证:pin 模式下新手机首次连接须带正确 PIN 才入白名单,已授权 phoneId 重连放行;
   //   --pairing-mode=open 退回旧的「明文 phonePub 即配对」(过渡兼容)。白名单持久 ~/.ce/authorized-phones.json。
+  // 2026-09-21:① 内存 Set 与磁盘同步(配对 add/踢出 delete —— 此前只写盘,同进程内新配对手机
+  //   一重连(杀 app 重开)就被内存旧名单拒掉,真机"过段时间连不上必须重扫"主根因);
+  //   ② PIN 持久 ~/.ce/pin.json(此前每次启动随机 → 白名单意外丢条目即"必须重扫")。
   const pairingMode = (arg('pairing-mode') ?? 'pin') as PairingMode
   const authorized = loadAuthorized()
-  let currentPin = pairingMode === 'pin' ? (arg('pin') ?? randomPin()) : ''
+  let currentPin = pairingMode === 'pin' ? (arg('pin') ?? loadPin() ?? randomPin()) : ''
+  if (currentPin) savePin(currentPin) // 显式 --pin 也落盘:下次不带参启动沿用同一枚,手机记住的 PIN 不作废
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
@@ -561,7 +565,7 @@ async function main(): Promise<void> {
           relay: relayUrl, jupyter: baseUrl, pairingMode,
           pin: currentPin,
           phones: [...phoneKeys.entries()].map(([id, v]) => ({ id, name: v.name })),
-          paired: [...authorized],
+          paired: loadPaired(), // 带名字+配对时间(控制台白名单页用;此前只是内存 id 集,重启前配对的不显示)
           wsConnected: ws?.readyState === WebSocket.OPEN,
           connectionCode,
         })
@@ -581,14 +585,16 @@ async function main(): Promise<void> {
         const { pin } = await req.json() as { pin?: string }
         if (!pin || !/^\d{6}$/.test(pin)) return json({ ok: false, error: 'PIN 须 6 位数字' }, 400)
         currentPin = pin
+        savePin(pin) // 2026-09-21:改 PIN 也落盘(此前只在内存,重启即回旧值,用户以为改了)
         return json({ ok: true, pin: currentPin })
       }
       if (path === '/control/unpair' && req.method === 'POST') {
         const { phoneId } = await req.json() as { phoneId?: string }
         if (!phoneId) return json({ ok: false, error: '缺 phoneId' }, 400)
         removeAuthorized(phoneId)
+        authorized.delete(phoneId) // 内存同步:此前踢掉的手机在 ce 不重启期间仍能白名单命中重连
         phoneKeys.delete(phoneId)
-        return json({ ok: true, paired: [...loadAuthorized()] })
+        return json({ ok: true, paired: loadPaired() })
       }
       if (path === '/control/logs') {
         const n = Number(url.searchParams.get('n') ?? 80)
@@ -876,10 +882,26 @@ async function main(): Promise<void> {
           // 认证门禁:open 模式直放;pin 模式下白名单内 phoneId 放行,否则需正确 PIN 首次配对。
           const auth = authorize({ mode: pairingMode, phoneId, authorized, pin: framePin, currentPin })
           if (!auth.allow) {
-            console.log(`[ce] 拒绝配对 phoneId=${phoneId}(pin 模式:非白名单且 PIN 错/缺)`)
+            // 拒绝必回因(2026-09-21:此前静默丢帧,手机只能 15s 超时、无从分辨)。
+            // 明文:握手未成无共享密钥;载荷只有粗粒度原因,不含任何秘密。旧手机端不识
+            // PairReject 编号 → 安全降级为原超时行为。
+            console.log(`[ce] 拒绝配对 phoneId=${phoneId}(${auth.denyReason})`)
+            if (srcPhone) {
+              sendFrame({
+                type: FrameType.PairReject,
+                targetPhoneId: srcPhone,
+                payload: enc.encode(JSON.stringify({ reason: auth.denyReason })),
+              })
+            }
             return
           }
-          if (auth.pair) addAuthorized(phoneId)
+          if (auth.pair) {
+            addAuthorized(phoneId, name)
+            authorized.add(phoneId) // 内存同步:同进程内该手机断线重连(杀 app 重开)白名单直接命中
+          } else if (name) {
+            // 白名单命中也刷新名字(手机端改名由此传播到落盘)
+            addAuthorized(phoneId, name)
+          }
           const sharedKey = sharedSecret(cliPriv, unb64(phonePubB64))
           phoneKeys.set(phoneId, { sharedKey, name })
           butlers.markPhoneBack(phoneId) // 手机(重)连 → 取消其孤儿回收计时(管家续用、保留上下文)

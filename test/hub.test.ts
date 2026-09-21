@@ -382,3 +382,23 @@ test('ce 掉线 → 重连(同 cid):phone 不再收新通知,断线期间 phone 
   await new Promise((r) => setTimeout(r, 0))
   expect(cli2.sent).toEqual(['handshake-frame']) // 断线期间的帧按序补发给新 ce
 })
+
+// ─── 2026-09-21:phone 接入时 ce 离线 → 立即 cliLeft 通知(手机快速失败+准确话术) ──
+test('joinPhone: cli 离线(session 在但 cli 断着)→ phone 立即收 cliLeft', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const { sid, token } = hub.register('cid-1', cli.ws)
+  hub.onClose(cli.ws) // ce 掉线(session 保留,cli = null)
+  const phone = fakeWs()
+  expect(hub.joinPhone(sid, token, phone.ws, 'p1')).toBe(true)
+  expect(phone.sent).toContain(JSON.stringify({ type: 'cliLeft' }))
+})
+
+test('joinPhone: cli 在线 → 不发 cliLeft(只有 server.ts 层的 joined)', () => {
+  const hub = new Hub()
+  const cli = fakeWs()
+  const { sid, token } = hub.register('cid-1', cli.ws)
+  const phone = fakeWs()
+  expect(hub.joinPhone(sid, token, phone.ws, 'p1')).toBe(true)
+  expect(phone.sent).not.toContain(JSON.stringify({ type: 'cliLeft' }))
+})

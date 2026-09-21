@@ -16,9 +16,10 @@ import { rotateLogIfBig } from './log'
 const DAEMON_JSON = join(homedir(), '.ce', 'daemon.json')
 
 interface DaemonInfo { port?: number; pid: number; version?: string; starting?: boolean }
+interface PairedPhone { id: string; name: string; pairedAt: number }
 interface State {
   running: boolean; pid: number; version: string; relay: string; jupyter: string
-  pairingMode: string; pin: string; phones: { id: string; name: string }[]; paired: string[]
+  pairingMode: string; pin: string; phones: { id: string; name: string }[]; paired: PairedPhone[]
   wsConnected: boolean
   connectionCode: string | null
 }
@@ -181,12 +182,20 @@ async function changePin(d: DaemonInfo): Promise<void> {
 
 async function whitelist(d: DaemonInfo): Promise<void> {
   const st = await api<State>(d, '/control/state')
+  // 2026-09-21:白名单页列【磁盘持久名单】(带名字/配对时间/在线标记),不再是内存会话表
+  // —— 此前 ce 重启后显示 (无),配对过的手机全不可见、无法区分谁是谁。
+  const online = new Set(st.phones.map((p) => p.id))
   console.log('\n已配对手机:')
-  if (st.phones.length === 0) console.log('  (无)')
-  st.phones.forEach((p, i) => console.log(`  ${i}  ${p.name || '(无名)'}  ${C.dim}${p.id}${C.reset}`))
+  if (st.paired.length === 0) console.log('  (无)')
+  st.paired.forEach((p, i) => {
+    const when = p.pairedAt ? new Date(p.pairedAt).toLocaleString('zh-CN', { hour12: false }) : '未知时间'
+    console.log(
+      `  ${i}  ${p.name || '(未命名)'}  ${when}${online.has(p.id) ? ' ' + C.green + '●在线' + C.reset : ''}  ${C.dim}${p.id}${C.reset}`,
+    )
+  })
   const idx = await prompt('\n踢掉第几个?(数字,留空取消): ')
   if (!idx) return
-  const p = st.phones[Number(idx)]
+  const p = st.paired[Number(idx)]
   if (!p) { console.log(C.red + '序号无效' + C.reset); await sleep(1500); return }
   await api(d, '/control/unpair', { method: 'POST', body: JSON.stringify({ phoneId: p.id }) })
   console.log(C.green + '\n✓ 已踢 ' + (p.name || p.id) + C.reset)
