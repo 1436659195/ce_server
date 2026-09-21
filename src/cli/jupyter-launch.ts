@@ -67,6 +67,10 @@ export async function launchJupyter(
       ['-m', 'jupyterlab', '--no-browser', `--port=${port}`, `--ServerApp.root_dir=${dir}`, '--ServerApp.allow_root=True'],
       {
         stdio: ['ignore', 'pipe', 'pipe'],
+        // ★ cwd=dir:jupyter_server 的终端(terminado)不认 POST /api/terminals 的 cwd 参数
+        // (2.20 源码 terminal/ 模块零引用),终端继承【服务器进程 cwd】—— 不传此项,
+        // 选盘 D: 的机器文件栏在 D:\ 而终端落在 ce daemon 的 cwd(如 C:\)。
+        cwd: dir,
         shell: true, // Windows 上靠 cmd 的 PATHEXT 解析 python.exe;其它平台无影响
         windowsHide: true, // Windows 下别弹 cmd 控制台窗口(否则用户误关窗口 = 杀掉 Jupyter)
       },
