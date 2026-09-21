@@ -107,25 +107,25 @@ for ($i = 0; $i -lt $drives.Count; $i++) {
   $d = $drives[$i]
   $type = if ($d.DriveType -eq 'Fixed') { '固定盘' } else { '可移动' }
   $free = [math]::Round($d.TotalFreeSpace / 1GB, 1)
-  Write-Host ("  [{0}] {1}  {2}  剩余 {3} GB" -f ($i + 1), $d.RootDirectory.Path, $type, $free)
+  Write-Host ("  [{0}] {1}  {2}  剩余 {3} GB" -f ($i + 1), $d.Name, $type, $free)
 }
 function Find-DriveIdx([object[]]$ds, [string]$path) {
-  for ($i = 0; $i -lt $ds.Count; $i++) { if ($ds[$i].RootDirectory.Path -ieq $path) { return $i } }
+  for ($i = 0; $i -lt $ds.Count; $i++) { if ($ds[$i].Name -ieq $path) { return $i } }
   return -1
 }
 # 默认:重跑时旧配置的根(回车保持)→ 首装 D:(有则)→ C: → 第 0 个
 $defaultIdx = if ($oldRoot) { Find-DriveIdx $drives $oldRoot } else { Find-DriveIdx $drives 'D:\' }
 if ($defaultIdx -lt 0) { $defaultIdx = Find-DriveIdx $drives 'C:\' }
 if ($defaultIdx -lt 0) { $defaultIdx = 0 }
-$sel = Read-Host ("[install] 输入编号(回车 = [{0}] {1})" -f ($defaultIdx + 1), $drives[$defaultIdx].RootDirectory.Path)
+$sel = Read-Host ("[install] 输入编号(回车 = [{0}] {1})" -f ($defaultIdx + 1), $drives[$defaultIdx].Name)
 $idx = $defaultIdx
 if ($sel -match '^\s*\d+\s*$') {
   $n = [int]$sel - 1
   if ($n -ge 0 -and $n -lt $drives.Count) { $idx = $n }
   else { Write-Host "[install] 编号超出范围,用默认" -ForegroundColor Yellow }
 }
-$root = $drives[$idx].RootDirectory.Path
-$rootChanged = ($oldRoot -and ($oldRoot -ine $root))
+$root = $drives[$idx].Name
+$rootChanged = ($oldRoot -ine $root)  # null→值也算改:首次落盘/从坏值修复,同样要重启 ce 才生效
 @{ relay = $relay; root = $root } | ConvertTo-Json | Set-Content $cfgPath
 if ($rootChanged) {
   Write-Host "[install] 文件根: $oldRoot → $root(下方重启 ce 后生效)" -ForegroundColor Yellow
