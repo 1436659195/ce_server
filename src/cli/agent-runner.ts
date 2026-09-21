@@ -294,7 +294,9 @@ export class AgentRunner {
     const out: { sid: string; cwd: string }[] = []
     for (const p of this.procs.values()) {
       if (p.owner !== phoneId) continue
-      const rel = p.cwd === root ? '/' : p.cwd.startsWith(root + '/') ? '/' + p.cwd.slice(root.length + 1) : '/'
+      // root 前缀剥离用 path.sep:Windows 下 resolve 产反斜杠,硬编码 '/' 永远匹配不上 → 子目录
+      // cwd 退化为 '/'(restore 回根)。剩余段再转 '/',手机只认 jupyter 逻辑路径。
+      const rel = p.cwd === root ? '/' : p.cwd.startsWith(root + path.sep) ? '/' + p.cwd.slice(root.length + 1).split(path.sep).join('/') : '/'
       out.push({ sid: p.sid, cwd: rel })
     }
     return out

@@ -6,8 +6,8 @@
  *   → ce/中继重启后,手机存的配对码(cliPub + sid)仍有效、不必重扫;ce 断线自动重连中继
  *   (指数退避),本地 terminado 终端跨重连不丢。
  *
- * 用法:ce --relay=ws://relay.yourserver[:port] [--jupyter=url --jupyter-token=t]
- *       (不传 --jupyter 则先探测、再启动)
+ * 用法:ce --relay=ws://relay.yourserver[:port] [--jupyter=url --jupyter-token=t] [--workdir=目录]
+ *       (不传 --jupyter 则先探测、再启动;--workdir 选 Jupyter 启动目录,缺省宿主机根)
  *
  * ⚠️ 整合胶水,无单测;手测见 P3-5 清单(需真实中继 + Jupyter)。
  */
@@ -19,7 +19,7 @@ import { join, resolve, parse as parsePath } from 'node:path'
 import { randomBytes, createHash } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
-import { detectServers, isAlive, toLoopback, resolveOsRoot, sameRoot } from './jupyter-detect'
+import { detectServers, isAlive, toLoopback, resolveOsRoot } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, listTerminalsRetry, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { UploadSessions } from './uploads'
@@ -35,7 +35,8 @@ import { spawn, execFile } from 'node:child_process'
 import { createServer } from 'node:net'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
-import { loadConfig } from './config'
+import { loadConfig, saveWorkdir } from './config'
+import { sameDir, resolveWorkdir } from './paths'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 import { resolvePythonBin } from './python'
 import { runConsole } from './console'
@@ -195,12 +196,15 @@ function pickRoot(servers: { url: string; root: string }[], url: string): string
   return servers.find((s) => portOf(s.url) === port)?.root ?? null
 }
 
-/** 解析 Jupyter:显式 > 探测(只复用 root 在配置根的)> 引导装 > 启动。
- *  ce 的 jupyter 服务【配置根】= config.root(Windows install.ps1 选盘,默认 D: 有则 D:)/ Linux-Mac '/'。
- *  探测到的 jupyter 若 root 正好在配置根 → 复用;否则(无 / root 不在配置根,如本机 screen 开的 /data)→ 自启配置根的。
+/** 解析 Jupyter:显式 > 探测(只复用 root 在期望工作目录的)> 引导装 > 启动。
+ *  ce 的 jupyter 服务【期望工作目录】desiredRoot(main 解析:--workdir > config.json workdir >
+ *  config.root(install.ps1 选盘,盘没了回退)> cwd 盘根;手机文件栏从该目录起浏览)。
+ *  探测到的 jupyter 若 root 与期望一致 → 复用;否则(无 / root 不一致,如用户自己在别的目录开的、
+ *  或刚换了 --workdir/选盘)→ 自启期望目录的。
  *  返回 root(jupyter root_dir OS 路径,CC 对话 cwd 的 base)。 */
 async function resolveJupyter(
-  relayUrl: string
+  relayUrl: string,
+  desiredRoot: string
 ): Promise<{ baseUrl: string; token: string; root: string; stop?: () => void }> {
   const explicitUrl = arg('jupyter')
   const explicitToken = arg('jupyter-token')
@@ -219,38 +223,38 @@ async function resolveJupyter(
     }
     return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root }
   }
-  // osRoot:config.root(Windows install.ps1 选盘写入,默认有 D: 用 D:、否则 C:)优先,盘没了回退 cwd 盘根;
-  // install.sh 不写 → Linux/Mac 恒 '/'(原行为)
-  const osRoot = resolveOsRoot(loadConfig().root, parsePath(process.cwd()).root)
-  // 排障可见性:选盘是否生效一行看穿(配置的盘没了时 resolveOsRoot 另有 warn),否则只能从手机文件栏反推
-  console.log(`[ce] 文件根(Jupyter root_dir):${osRoot}`)
+  // 排障可见性:期望工作目录一行看穿(--workdir/选盘是否生效;配置盘没了时 resolveOsRoot 另有 warn)
+  console.log(`[ce] 文件根(Jupyter root_dir):${desiredRoot}`)
   // 优先复用上次自启的 Jupyter(daemon 重启不起新的 → 终端会话/终端名不丢,手机不会因换 Jupyter 而 404)。
   // 比 detectServers 的 jupyter list 解析可靠(Windows 路径格式/大小写坑,正是之前没复用、反复起多个的根因)。
+  // root 必须与期望工作目录一致(sameDir 归一化比较,治 Windows 大小写/分隔符/尾斜杠差异):换了 --workdir
+  // 绝不能复用旧目录的 Jupyter —— root 是 agent cwd base + 上传边界,复用错目录 = 对话树与上传树分叉(W1)。
   try {
     const saved = JSON.parse(readFileSync(join(homedir(), '.ce', 'jupyter.json'), 'utf8')) as { url: string; token: string; root?: string }
-    // 复用须 root 与当前 osRoot 一致:换盘(config.root 变)后,旧 root 的活 Jupyter 不能把新选择挡住。
-    // saved.root 缺失(古老/手改文件)同判不一致 —— root 是 CC 对话 cwd base + 上传边界,不可信就不复用(红线 W1 同源)。
-    if (saved.url && saved.token && saved.root && sameRoot(saved.root, osRoot) && (await isAlive(saved.url, saved.token))) {
-      console.log(`[ce] 复用上次 Jupyter:${saved.url}`)
-      return { baseUrl: toLoopback(saved.url), token: saved.token, root: saved.root }
-    }
-    if (saved.url && saved.root && !sameRoot(saved.root, osRoot)) {
-      console.log(`[ce] 上次 Jupyter root ${saved.root} ≠ 当前根 ${osRoot}(换盘?),不复用、按新根解析`)
+    // 复用须 root 与期望工作目录一致(sameDir 归一化,治 Windows 大小写/分隔符/尾斜杠):换了
+    // --workdir 或选盘后,旧 root 的活 Jupyter 不能把新选择挡住。saved.root 缺失(古老/手改文件)
+    // 同判不一致 —— root 是 CC 对话 cwd base + 上传边界,不可信就不复用(红线 W1 同源)。
+    if (saved.url && saved.token && (await isAlive(saved.url, saved.token))) {
+      if (saved.root && sameDir(saved.root, desiredRoot)) {
+        console.log(`[ce] 复用上次 Jupyter:${saved.url}(root ${saved.root})`)
+        return { baseUrl: toLoopback(saved.url), token: saved.token, root: saved.root }
+      }
+      console.log(`[ce] 上次 Jupyter root 是 ${saved.root ?? '(未记录)'},与当前工作目录(${desiredRoot})不符(换了 --workdir/选盘?),不复用`)
     }
   } catch {
     /* 无 jupyter.json 或验活失败 → 落到探测/自启 */
   }
   const existing = await detectServers()
-  // 只复用 root 正好在(配置)盘根的现成 jupyter;sameRoot 归一比较防 Windows 大小写/尾斜杠
-  const reuse = existing.find((s) => sameRoot(s.root, osRoot))
+  // 只复用 root 与期望工作目录一致的现成 jupyter;sameDir 归一比较防 Windows 大小写/尾斜杠
+  const reuse = existing.find((s) => sameDir(s.root, desiredRoot))
   if (reuse && (await isAlive(reuse.url, reuse.token))) {
     // 验 token 有效才复用:有的旧 Jupyter runtime stale / jupyter list 没带 token → detectServers 拿到空 token,
     // 盲信复用会让后续所有 API 403。验不过(token 空/失效)就落自启,起一个 token 干净的新 Jupyter。
-    console.log(`[ce] 复用根目录 Jupyter:${reuse.url}(root ${reuse.root})`)
+    console.log(`[ce] 复用工作区 Jupyter:${reuse.url}(root ${reuse.root})`)
     return { baseUrl: toLoopback(reuse.url), token: reuse.token, root: reuse.root }
   }
   if (reuse) console.log(`[ce] 探到的 Jupyter ${reuse.url} token 验证失败(旧实例/runtime stale),改为自启`)
-  console.log('[ce] 未发现根目录的 Jupyter,自启...')
+  console.log(`[ce] 未发现工作区 Jupyter(root ${desiredRoot}),自启...`)
   // 自装 Jupyter 前先拦 Python:没 Python 就给指引 + 退出,绝不拖到 pip 报错。
   // 返回的 pyBin 注入后续 deps/launch(同一套解析,前置检查过的 = 真用的)。
   const pyBin = await ensurePythonOrExit(relayUrl)
@@ -266,7 +270,7 @@ async function resolveJupyter(
   console.log('[ce] 启动 Jupyter...')
   // onLog:把 Jupyter 的 stdout/stderr 持续接走写 ~/.ce/ce.log —— 既 drain pipe(防 Jupyter 被自己日志噎死),
   // 又让控制台 [l] 能看到 Jupyter 输出供排障。
-  const { server, stop } = await launchJupyter(osRoot, 30000, (chunk) => {
+  const { server, stop } = await launchJupyter(desiredRoot, 30000, (chunk) => {
     try {
       const p = join(homedir(), '.ce', 'ce.log')
       rotateLogIfBig(p) // 写前轮转,防 Jupyter 访问日志撑爆磁盘
@@ -291,7 +295,8 @@ async function resolveJupyter(
     }
   } else {
     // 探测没按 port 对上(候选空/对不上)→ root 用启动时传给 Jupyter 的目录(server.root =
-    // osRoot 配置根,Windows 取所选盘根 —— by construction 正确,不是猜的)。★ 该 root 不写入
+    // 期望工作目录 desiredRoot(--workdir/config.workdir 覆盖,否则选盘根/cwd 盘根)——
+    // by construction 正确,不是猜的)。★ 该 root 不写入
     // jupyter.json(W1):兜底值固化后,后续复用会把对话树与上传树架在未验证的 root 上;
     // 宁可下次重启重探,也不错存。
     root = server.root
@@ -401,10 +406,36 @@ function writeCcSettings(port: number): void {
 async function main(): Promise<void> {
   const relayUrl = arg('relay') ?? loadConfig().relay
   if (!relayUrl) {
-    console.error('用法:ce --relay=ws://relay.yourserver[:port] [--jupyter=url --jupyter-token=t]')
+    console.error('用法:ce --relay=ws://relay.yourserver[:port] [--jupyter=url --jupyter-token=t] [--workdir=目录]')
     console.error('（或先运行一行安装器: curl -fsSL http://<relay>/install.sh | sh）')
     console.error('（Windows: irm http://<relay>/install.ps1 | iex）')
     process.exit(1)
+  }
+
+  // 期望工作目录(Jupyter root_dir):--workdir > config.json 的 workdir > config.root(install.ps1
+  // 选盘,默认有 D: 用 D:;盘没了 resolveOsRoot 回退 cwd 盘根并 warn)> cwd 盘根。
+  // CLI --workdir 传入即落盘 config.json —— 开机自启(注册表 Run / systemd)不携带任何 CLI 参数,
+  // 不落盘则重启即丢。无效目录区分来源:CLI(用户在场)→ 可行动报错退出;config 陈旧(目录被删/
+  // 盘被拔)→ 大声警告后回退(仍有选盘根兜底)—— daemon 是手机的命脉,不能因陈旧配置变砖。
+  const cfg = loadConfig()
+  let desiredRoot: string
+  const wd = resolveWorkdir(arg('workdir'), cfg.workdir)
+  if ('invalid' in wd) {
+    if (wd.origin === 'cli') {
+      console.error(`[ce] --workdir 指向的目录无效:"${wd.invalid}"(不存在或不是文件夹),请检查路径后重试。`)
+      console.error('     恢复默认(选盘根/宿主机根):去掉 --workdir 并删除 ~/.ce/config.json 里的 workdir 字段')
+      process.exit(1)
+    }
+    console.error(`[ce] ~/.ce/config.json 里的 workdir "${wd.invalid}" 已不存在(目录被删/移动/盘被拔?),本次回退默认根目录,不影响连接;请更新或删除该字段`)
+    desiredRoot = resolveOsRoot(cfg.root, parsePath(process.cwd()).root)
+  } else if (wd.origin === 'default') {
+    desiredRoot = resolveOsRoot(cfg.root, wd.dir) // 都没选 → 选盘根优先(Windows install.ps1 选盘)
+  } else {
+    desiredRoot = wd.dir
+    if (wd.origin === 'cli') {
+      if (!saveWorkdir(wd.dir)) console.error('[ce] 警告:工作目录写入 ~/.ce/config.json 失败,重启后将回退默认根目录')
+      else console.log(`[ce] 已记住工作目录:${wd.dir}(~/.ce/config.json,重启后仍生效;不选则默认选盘根/宿主机根)`)
+    }
   }
 
   // 尽早登记 daemon(pid + starting):让控制台立刻发现「daemon 已在启动」并耐心等就绪,
@@ -418,7 +449,7 @@ async function main(): Promise<void> {
     /* 写失败不阻塞启动 */
   }
 
-  const { baseUrl, token, root, stop } = await resolveJupyter(relayUrl)
+  const { baseUrl, token, root, stop } = await resolveJupyter(relayUrl, desiredRoot)
   if (stop) {
     // daemon 退出(含崩溃 uncaughtException / process.exit)必杀自启的 Jupyter + 清 daemon.json:
     // 原 only SIGINT 调 stop → 崩溃退出留 Jupyter 孤儿(占端口/内存,越攒越多)。

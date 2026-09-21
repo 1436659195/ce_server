@@ -54,11 +54,14 @@ bun run src/relay/main.ts \
 bun run src/cli/main.ts \
   --relay=wss://<域名> \
   [--jupyter=http://127.0.0.1:8888 --jupyter-token=t] \
+  [--workdir=<目录>] \
   --pairing-mode=pin \
   [--pin=NNNNNN]
 ```
 
 - 不传 `--jupyter` 则探测本机 → 引导装 → 自启动
+- `--workdir`:Jupyter 启动目录(root_dir)= 手机文件栏顶层 / 上传边界 / CC 对话 cwd 基准;**缺省宿主机根**(Windows 当前盘根)。CLI 传入即写入 `~/.ce/config.json` 的 `workdir` 字段(开机自启不带 CLI 参数,须落盘才跨重启;删除该字段恢复默认)。目录必须真实存在:CLI 传无效路径直接报错退出,config 里的目录失效(被删/盘被拔)则告警并回退根目录
+- 显式 `--jupyter` 时 root 以该服务实际为准(同给 `--workdir` 或按端口探测到,对不上直接退出;CLI 传的 `--workdir` 仍会照常落盘)
 - `--pairing-mode=pin`(默认):新手机首次配对须 PIN;`open` 回退旧行为
 - `--pin`:指定固定 PIN;**不传则每次启动随机**
 - 启动打印二维码 + PIN 到终端(`[ce] 配对 PIN: XXXXXX`)

@@ -37,7 +37,8 @@ function pickFreePort(): Promise<number> {
 
 /**
  * 启动一个本地 Jupyter(`<python 解释器> -m jupyterlab --no-browser --port=<ce 自选空闲端口>`),等它打印 URL+token 后返回。
- * root_dir 设为宿主机根目录(Linux/Mac '/'、Windows 当前盘根):手机文件栏从根浏览整个文件系统,而非 ce 的 cwd。返回 stop() 退出杀进程。
+ * root_dir:rootDir 传入则用(main 解析的期望工作目录);缺省宿主机根(Linux/Mac '/'、Windows 当前盘根)
+ * —— 手机文件栏从该目录起浏览。返回 stop() 退出杀进程。
  *
  * pythonBin 由调用方注入(main 用 resolvePythonBin 统一解析,治「裸 python 在无 python 别名的系统上
  * 退出码 127、daemon exit(1) 起不来」);缺省时自解析,解析不到 → 直接 reject 可行动报错。
