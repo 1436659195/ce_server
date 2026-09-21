@@ -39,7 +39,7 @@ test('listDir 路由到 client.listDir 且透传 path', async () => {
   expect(got).toBe('/x')
 })
 
-test('readFile 小文件(≤2MB)正常回 content', async () => {
+test('readFile 小文件(≤5MB)正常回 content', async () => {
   const client: JupyterClient = {
     ...noopClient,
     async readFile() {
@@ -53,11 +53,25 @@ test('readFile 小文件(≤2MB)正常回 content', async () => {
   })
 })
 
-test('readFile 超 2MB 不带 content、标 tooLarge(防 ce 序列化 OOM)', async () => {
+test('readFile 3MB(旧护栏上方、新阈值内)正常回 content(阈值 2026-09-15 两端同步 5MB)', async () => {
   const client: JupyterClient = {
     ...noopClient,
     async readFile() {
       return { type: 'file', content: 'x'.repeat(3_000_000), size: 3_000_000, format: 'text' }
+    },
+  }
+  const res = await handleRpc(client, { op: 'readFile', path: '/mid.txt' })
+  expect(res.ok).toBe(true)
+  const data = res.data as { tooLarge?: boolean; content: string; size: number }
+  expect(data.tooLarge).toBeUndefined()
+  expect(data.content.length).toBe(3_000_000)
+})
+
+test('readFile 超 5MB 不带 content、标 tooLarge(防 ce 序列化 OOM)', async () => {
+  const client: JupyterClient = {
+    ...noopClient,
+    async readFile() {
+      return { type: 'file', content: 'x'.repeat(5 * 1024 * 1024 + 1), size: 5 * 1024 * 1024 + 1, format: 'text' }
     },
   }
   const res = await handleRpc(client, { op: 'readFile', path: '/big.txt' })
@@ -65,7 +79,7 @@ test('readFile 超 2MB 不带 content、标 tooLarge(防 ce 序列化 OOM)', asy
   const data = res.data as { tooLarge: boolean; content: string; size: number }
   expect(data.tooLarge).toBe(true)
   expect(data.content).toBe('')
-  expect(data.size).toBe(3_000_000)
+  expect(data.size).toBe(5 * 1024 * 1024 + 1)
 })
 
 test('createTerminal 路由且透传 cwd', async () => {

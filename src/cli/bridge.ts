@@ -116,10 +116,11 @@ export async function handleRpc(client: JupyterClient, req: RpcRequest): Promise
       case 'listDir':
         return { ok: true, data: await client.listDir(req.path ?? '/') }
       case 'readFile': {
-        // 护栏:content 超 2MB 不带回 —— 否则 JSON.stringify(中文 \uXXXX 转义放大 ~6 倍)+ encode + 加密
+        // 护栏:content 超 5MB 不带回 —— 否则 JSON.stringify(中文 \uXXXX 转义放大 ~6 倍)+ encode + 加密
         // 三个大 buffer 同存,会撑爆 ce 进程 OOM(曾崩于此)。手机端据 size/tooLarge 显「文件过大」,
-        // 跟客户端 MAX_FILE_BYTES 语义一致。下载仍走 readFileRange 分段,不受影响。
-        const MAX_READFILE_BYTES = 2 * 1024 * 1024
+        // 跟客户端 MAX_FILE_BYTES 语义一致(2026-09-15 两端同步 1MB→5MB;5MB 文本极端转义
+        // ~30MB 瞬时 buffer,被控机为开发机量级,可承受)。下载仍走 readFileRange 分段,不受影响。
+        const MAX_READFILE_BYTES = 5 * 1024 * 1024
         const data = (await client.readFile(req.path ?? '/')) as {
           content?: string
           size?: number

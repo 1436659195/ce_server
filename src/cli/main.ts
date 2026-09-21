@@ -19,7 +19,7 @@ import { join, resolve, parse as parsePath } from 'node:path'
 import { randomBytes, createHash } from 'node:crypto'
 import { sharedSecret, seal, open } from '../shared/crypto'
 import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame'
-import { detectServers, isAlive, toLoopback, probePythonBin, resolvePythonBin, resolveOsRoot, sameRoot } from './jupyter-detect'
+import { detectServers, isAlive, toLoopback, resolveOsRoot, sameRoot } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, listTerminalsRetry, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { UploadSessions } from './uploads'
@@ -30,13 +30,14 @@ import { generateHooksConfig, handleHookBody } from './cc-hooks'
 import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
-import { loadAuthorized, addAuthorized, removeAuthorized, authorize, type PairingMode } from './pairing'
+import { loadAuthorized, loadPaired, addAuthorized, removeAuthorized, authorize, loadPin, savePin, type PairingMode } from './pairing'
 import { spawn, execFile } from 'node:child_process'
 import { createServer } from 'node:net'
 import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
 import { loadConfig } from './config'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
+import { resolvePythonBin } from './python'
 import { runConsole } from './console'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
@@ -92,16 +93,16 @@ async function askYesNo(msg: string): Promise<boolean> {
   }
 }
 
-/** ensureJupyter 的真实副作用实现:spawn python/pip、stdin y/n。解释器统一走 resolvePythonBin()
- *  (生产红线 C1:不写死 'python' —— 标准发行版只有 python3,写死会让前置检查探 python3 通过、下游全 127)。 */
-function realJupyterDeps(): JupyterInstallDeps {
+/** ensureJupyter 的真实副作用实现:spawn <python 解释器>/pip、stdin y/n。
+ *  pythonBin 由调用方注入(resolvePythonBin 统一解析;生产红线 C1:不写死 'python' ——
+ *  标准发行版只有 python3,写死会让前置检查探 python3 通过、下游全 127)。 */
+function realJupyterDeps(pythonBin: string): JupyterInstallDeps {
   return {
-    // 走 `<py> -m pip show jupyterlab`(而非 `jupyter --version`):Bun --compile 的 Windows 二进制
+    // 走 `<python> -m pip show jupyterlab`(而非 `jupyter --version`):Bun --compile 的 Windows 二进制
     // spawn 不了 jupyter.exe,但 spawn python.exe 正常(见 launchJupyter 注释)。pip show 退码 0=已装。
     hasJupyter: async () => {
-      const py = await resolvePythonBin()
       try {
-        await pExecFile(py, ['-m', 'pip', 'show', 'jupyterlab'], { shell: true, windowsHide: true })
+        await pExecFile(pythonBin, ['-m', 'pip', 'show', 'jupyterlab'], { shell: true, windowsHide: true })
         return true
       } catch {
         return false
@@ -109,13 +110,12 @@ function realJupyterDeps(): JupyterInstallDeps {
     },
     prompt: (msg) => askYesNo(msg),
     install: async () => {
-      const py = await resolvePythonBin()
       console.log('[ce] pip install jupyterlab(清华源,约 1-2 分钟,请等待)...')
       await new Promise<void>((resolve, reject) => {
-        // `<py> -m pip`(而非裸 `pip`):解释器已确认能跑(ensurePythonOrExit 同源解析),更稳。
+        // `<python> -m pip`(而非裸 `pip`):解释器已经 resolvePythonBin 实测过(ensurePythonOrExit 同源解析),更稳。
         // -i 清华 PyPI 源加速(默认源国内慢);--trusted-host 防 SSL 拦截(公司代理/旧证书)
         const p = spawn(
-          py,
+          pythonBin,
           ['-m', 'pip', 'install', 'jupyterlab', '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple', '--trusted-host', 'pypi.tuna.tsinghua.edu.cn'],
           { shell: true, stdio: 'inherit', windowsHide: true }
         )
@@ -140,12 +140,16 @@ async function commandExists(name: string): Promise<boolean> {
  * 自装 Jupyter(=要走 pip)前先确保本机有 Python:没有就按平台给安装指引 + 让用户
  * 【重开终端】重跑一行安装器,然后退出。务必在 `pip install jupyterlab` 之前拦下——
  * 否则会拖到 pip 才报错,用户只看到“pip 退出码 1”,不知道根因是没装 Python。
+ * 解析复用 resolvePythonBin(与探测/启动同一套:win32=python,否则实测先 python3 再 python,
+ * 支持 --python=/CE_PYTHON 覆盖)—— 保证「前置检查过的解释器」=「后面真用的解释器」。
+ * 返回解析出的解释器(供 realJupyterDeps / launchJupyter 注入);没有则已 exit(1)。
  */
-async function ensurePythonOrExit(relayUrl: string): Promise<void> {
-  // 与 detect/launch/deps 同一解析(覆盖参数/环境变量/实测),不再各探各的(旧版这里探
-  // python3、下游全用 'python',前置检查形同虚设 —— 生产红线 C1)
-  if (await probePythonBin()) return
+async function ensurePythonOrExit(relayUrl: string): Promise<string> {
+  // 与 detect/launch/deps 同一解析(覆盖参数/环境变量/两层实测;生产红线 C1:旧版这里探
+  // python3、下游全用 'python',前置检查形同虚设)—— 保证「前置检查过的解释器」=「后面真用的」
   const isWin = process.platform === 'win32'
+  const bin = await resolvePythonBin()
+  if (bin) return bin
 
   const httpBase = relayUrl.replace(/^ws/, 'http')
   console.error('[ce] 未检测到 Python。Coding Everywhere 需要 Python 才能运行 Jupyter。')
@@ -181,29 +185,14 @@ function portOf(url: string): string {
   }
 }
 
-/** pickRoot 结果:root + 来源。来源决定可信度 —— 'port'(url port 对上的同机 jupyter,可信,可落盘)
- *  vs 'first'(port 对不上但探测非空,取第一个,是猜的)/'cwd'(探测空,兜底 ce 启动目录,纯应急)。 */
-interface RootPick {
-  root: string
-  source: 'port' | 'first' | 'cwd'
-}
-
 /** 从本机 jupyter 探测结果挑 root_dir(OS 路径)。Jupyter Contents API 不暴露 root_dir,
  *  只有 `jupyter server list` 输出的 `:: /path` 才是 OS 路径 → 必须靠 detectServers。
- *  按 port 匹配同机唯一 jupyter;对不上/探测空 → 打 warn 区分猜测来源(生产红线 W1:
- *  root 是 CC 对话 cwd base + 上传边界,静默兜底 cwd 会让对话树与上传树分叉,且兜底值
- *  禁止写入 jupyter.json 固化 —— 由调用方按 source 判断)。 */
-function pickRoot(servers: { url: string; root: string }[], url: string): RootPick {
+ *  只认按 port 精确匹配(同机多 jupyter 时猜第一个会把 root 安错);对不上 → null,由调用方显式处理。
+ *  ★ 绝不兜底 process.cwd()(W1):root 是 agent cwd base 与上传边界,猜错 = 对话树与上传树分叉。 */
+function pickRoot(servers: { url: string; root: string }[], url: string): string | null {
   const port = portOf(url)
-  const byPort = port ? servers.find((s) => portOf(s.url) === port) : undefined
-  if (byPort) return { root: byPort.root, source: 'port' }
-  const first = servers[0]
-  if (first) {
-    console.warn(`[ce] 探测结果里没有 port 对得上的 Jupyter(url=${url}),取第一个候选(roots: ${servers.map((s) => s.root).join(', ')})`)
-    return { root: first.root, source: 'first' }
-  }
-  console.warn(`[ce] 未探到任何 Jupyter root_dir,root 兜底 ce 启动目录 ${process.cwd()}(仅本次会话用,不落盘)`)
-  return { root: process.cwd(), source: 'cwd' }
+  if (!port) return null
+  return servers.find((s) => portOf(s.url) === port)?.root ?? null
 }
 
 /** 解析 Jupyter:显式 > 探测(只复用 root 在配置根的)> 引导装 > 启动。
@@ -216,19 +205,19 @@ async function resolveJupyter(
   const explicitUrl = arg('jupyter')
   const explicitToken = arg('jupyter-token')
   if (explicitUrl && explicitToken) {
-    // 显式 url/token 最优先(用户明确指定外部 jupyter);root 不可猜(API 不暴露 root_dir)——
-    // 生产红线 W1:要么用户同给 --workdir,要么探测结果 port 对得上;再不允许静默兜底 cwd
-    // (root 是 CC 对话 cwd base + 上传边界,错了对话树/上传树分叉)。
+    // 显式 url/token 最优先(用户明确指定外部 jupyter)。root 必须可确知(Contents API 不暴露 root_dir):
+    // ① 同给 --workdir → 直接用(resolve 绝对化,容相对路径);② 本机探测按 port 精确对上 → 用它;③ 否则 exit(1)。
+    // ★ 绝不静默兜底 ce 启动目录(W1):root 是 agent cwd base + 上传边界,猜错 = 对话树与上传树分叉。
     const workdir = arg('workdir')
     if (workdir) return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root: resolve(workdir) }
     const existing = await detectServers()
-    const pick = pickRoot(existing, explicitUrl)
-    if (pick.source !== 'port') {
-      console.error(`[ce] 显式 --jupyter 模式拿不到可靠 root_dir(${pick.source === 'cwd' ? '本机探测不到该 Jupyter' : '探测结果 port 对不上'}:${explicitUrl})。`)
-      console.error('[ce] 请同给 --workdir=<目录>(= 该 Jupyter 的 root_dir),或让 ce 与该 Jupyter 同机可探测。')
+    const root = pickRoot(existing, explicitUrl)
+    if (root === null) {
+      console.error(`[ce] --jupyter(${explicitUrl})的 root_dir 无法确定。本机探测候选:${existing.map((s) => `${s.url} → ${s.root}`).join('; ') || '(空)'}`)
+      console.error('[ce] 显式指定外部 Jupyter 时请同给 --workdir=<该 Jupyter 的 root_dir>,或改用本机在跑的 Jupyter 端口')
       process.exit(1)
     }
-    return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root: pick.root }
+    return { baseUrl: toLoopback(explicitUrl), token: explicitToken, root }
   }
   // osRoot:config.root(Windows install.ps1 选盘写入,默认有 D: 用 D:、否则 C:)优先,盘没了回退 cwd 盘根;
   // install.sh 不写 → Linux/Mac 恒 '/'(原行为)
@@ -263,8 +252,9 @@ async function resolveJupyter(
   if (reuse) console.log(`[ce] 探到的 Jupyter ${reuse.url} token 验证失败(旧实例/runtime stale),改为自启`)
   console.log('[ce] 未发现根目录的 Jupyter,自启...')
   // 自装 Jupyter 前先拦 Python:没 Python 就给指引 + 退出,绝不拖到 pip 报错。
-  await ensurePythonOrExit(relayUrl)
-  const r = await ensureJupyter(realJupyterDeps())
+  // 返回的 pyBin 注入后续 deps/launch(同一套解析,前置检查过的 = 真用的)。
+  const pyBin = await ensurePythonOrExit(relayUrl)
+  const r = await ensureJupyter(realJupyterDeps(pyBin))
   if (r === 'cancelled') {
     console.error('[ce] 未安装 Jupyter,无法继续。手动装:pip install jupyterlab -i https://pypi.tuna.tsinghua.edu.cn/simple')
     process.exit(1)
@@ -284,23 +274,28 @@ async function resolveJupyter(
     } catch {
       /* 写失败忽略 */
     }
-  })
+  }, pyBin)
   console.log(`[ce] 已启动 Jupyter:${server.url}`)
-  const live = await detectServers() // 启动后再探一次拿 root_dir
-  const pick = pickRoot(live, server.url)
-  const root = pick.root
-  // 记忆自启的 Jupyter:daemon 重启时 resolveJupyter 开头读它 + 验活复用,不再起新的(终端会话不丢)。
-  // 生产红线 W1:只有 port 对上的可靠 root 才落盘 —— 'first'/'cwd' 来源是猜的,落盘会把错值
-  // 固化成下次复用首选(saved.root ?? osRoot),且 root 是 CC 对话 cwd base + 上传边界,错了分叉。
-  if (pick.source === 'port') {
+  const live = await detectServers() // 启动后再探一次:拿 Jupyter 自己视角的 root_dir(路径规范化)
+  const detectedRoot = pickRoot(live, server.url)
+  let root: string
+  if (detectedRoot !== null) {
+    root = detectedRoot
+    // 记忆自启的 Jupyter:daemon 重启时 resolveJupyter 开头读它 + 验活复用,不再起新的(终端会话不丢)。
+    // 生产红线 W1:只有 port 对上的可靠 root 才落盘;落盘即固化 127.0.0.1(不落 localhost)——
+    // isAlive 验活与下次复用全走 v4,消灭 Mac 双栈歧义(配对瞬间 404 竞态入口)。
     try {
-      // 落盘即固化 127.0.0.1(不落 localhost):isAlive 验活与下次复用全走 v4,消灭 Mac 双栈歧义
       writeFileSync(join(homedir(), '.ce', 'jupyter.json'), JSON.stringify({ url: toLoopback(server.url), token: server.token, root }))
     } catch {
       /* 写失败 → 下次可能再起一个,不致命 */
     }
   } else {
-    console.warn('[ce] root 来源不可靠(port 未对上),本次不写 ~/.ce/jupyter.json(免错值固化;下次启动重解析)')
+    // 探测没按 port 对上(候选空/对不上)→ root 用启动时传给 Jupyter 的目录(server.root =
+    // osRoot 配置根,Windows 取所选盘根 —— by construction 正确,不是猜的)。★ 该 root 不写入
+    // jupyter.json(W1):兜底值固化后,后续复用会把对话树与上传树架在未验证的 root 上;
+    // 宁可下次重启重探,也不错存。
+    root = server.root
+    console.warn(`[ce] 启动后探测未按 port 对上 ${server.url}(候选:${live.map((s) => s.url).join('; ') || '空'}),root 用启动目录 ${server.root},且不写入 jupyter.json(防未验证 root 固化)`)
   }
   return { baseUrl: toLoopback(server.url), token: server.token, root, stop }
 }
@@ -316,59 +311,69 @@ function appendCeLog(text: string): void {
   }
 }
 
-/** 探测一个能跑的 claude 二进制。机器上可能装多份(系统/nvm/npm),PATH 先解析到的可能是坏的
- *  "native binary not installed"。优先 --claude-bin 参数;否则 command -v 解析 PATH 首个 + 平台标准
- *  位置 + ~/.local/bin + nvm 各版本,逐个跑 --version 验证(含版本号 + 无 native binary 报错)。
- *  生产红线 C2:①不再外包 GNU timeout(macOS 无它 → 全候选 127 静默假失败;pExecFile 自带超时);
- *  ②全失败返回 null(旧版裸回未验证的 'claude',错机器上才发现);③探测用 PATH + 各候选结果记
- *  ~/.ce/ce.log(systemd user service 的 PATH 探不到 ~/.local/bin/nvm,排障要能看到它)。 */
+/** claude 候选路径表:PATH 解析到的 + 常见安装位(系统路径 / homebrew / 用户位 ~/.local/bin /
+ *  nvm 每版本 bin)。systemd user service 的 PATH 常缺用户位(~/.local/bin / nvm)→ 光靠 PATH 会漏。 */
+async function claudeCandidates(): Promise<string[]> {
+  if (process.platform === 'win32') {
+    // Windows 无 sh;探测时靠 shell:true 经 cmd PATHEXT 解析。固定候选带上 npm 全局位与
+    // ~/.local/bin(PATH 缺它们时仍可探到)。
+    const home = homedir()
+    return ['claude', join(process.env.APPDATA ?? home, 'npm', 'claude.cmd'), join(home, '.local', 'bin', 'claude.exe')]
+  }
+  const out: string[] = []
+  try {
+    // command -v 按探测时 PATH 解析(探测用 PATH 已记 ce.log,排障可对照)
+    const { stdout } = await pExecFile('sh', ['-c', 'command -v claude 2>/dev/null'])
+    const p = stdout.trim().split('\n')[0]
+    if (p) out.push(p)
+  } catch {
+    /* PATH 上无 claude */
+  }
+  const home = homedir()
+  out.push('/usr/local/bin/claude', '/usr/bin/claude', '/opt/homebrew/bin/claude', join(home, '.local', 'bin', 'claude'))
+  try {
+    // nvm:~/.nvm/versions/node/<ver>/bin/claude;倒序(新版本优先)
+    const versions = readdirSync(join(home, '.nvm', 'versions', 'node')).sort().reverse()
+    for (const v of versions) out.push(join(home, '.nvm', 'versions', 'node', v, 'bin', 'claude'))
+  } catch {
+    /* 无 nvm */
+  }
+  return [...new Set(out)]
+}
+
+/** 探测一个能跑的 claude 二进制。机器上可能装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
+ *  "native binary not installed"。优先 --claude-bin 参数;否则按候选表逐个跑 --version 验证
+ *  (stdout/stderr 合并判:含版本号 + 无 native binary 报错才算可用),用第一个好的。管家/CC 对话用它 spawn。
+ *  ★ 不再用 GNU timeout 包裹(macOS 没有、Windows 无 sh;挂起防护交给 pExecFile 自带 timeout)。
+ *  ★ 全失败 → 显式返回 null,走 butler_nocc / 提示 —— 绝不裸回 'claude' 假装能用(生产红线 C2,
+ *    旧版曾静默假通过)。探测用 PATH + 各候选失败原因记 ~/.ce/ce.log(systemd user service 的
+ *    PATH 探不到 ~/.local/bin/nvm,排障要能看到它)。 */
 async function resolveClaudeBin(): Promise<string | null> {
   const explicit = arg('claude-bin')
   if (explicit) return explicit
-  const home = homedir()
-  const cands: string[] = []
-  if (process.platform === 'win32') {
-    // Windows:sh/command -v 不存在,spawn 靠 cmd 的 PATHEXT 解析(下方实测分支同款)
-    cands.push('claude', join(process.env.APPDATA ?? home, 'npm', 'claude.cmd'), join(home, '.local', 'bin', 'claude.exe'))
-  } else {
-    // command -v 拿 PATH 首个的真实路径(可能是 wrapper/nvm shim,不在固定候选表里)
-    try {
-      const { stdout } = await pExecFile('sh', ['-c', 'command -v claude 2>/dev/null'])
-      const p = stdout.trim()
-      if (p) cands.push(p)
-    } catch {
-      /* PATH 上无 claude */
-    }
-    cands.push('/usr/local/bin/claude', '/usr/bin/claude', '/opt/homebrew/bin/claude', join(home, '.local', 'bin', 'claude'))
-    // nvm:每版本一个 bin(readdir 展开替代 shell glob;无 .nvm 目录 → 跳过)
-    try {
-      for (const v of readdirSync(join(home, '.nvm', 'versions', 'node'))) {
-        cands.push(join(home, '.nvm', 'versions', 'node', v, 'bin', 'claude'))
-      }
-    } catch {
-      /* 无 nvm */
-    }
-  }
+  const isWin = process.platform === 'win32'
   const pathNote = `  PATH=${process.env.PATH ?? '(空)'}`
+  appendCeLog(`[ce] claude 探测:PATH\n${pathNote}`)
   const fails: string[] = []
-  for (const c of [...new Set(cands)]) {
+  for (const c of await claudeCandidates()) {
     try {
-      // 要含版本号且无 native binary 报错才算可用;超时由 pExecFile 兜(npx-stub 安装挂起 8s 判死)
-      const { stdout } =
-        process.platform === 'win32'
-          ? await pExecFile(c, ['--version'], { shell: true, windowsHide: true, timeout: 8000 })
-          : await pExecFile('sh', ['-c', `"${c}" --version 2>&1`], { timeout: 8000 })
-      if (/\d+\.\d+\.\d+/.test(stdout) && !/native binary not installed/i.test(stdout)) {
-        console.log(`[ce] 管家用 claude: ${c} (${stdout.trim().split('\n')[0]})`)
-        appendCeLog(`[ce] claude 探测:命中 ${c}\n${pathNote}`)
+      // pExecFile 自带 8s timeout 防 npx-stub 触发安装挂起;win 经 shell(cmd)解析,unix 直跑绝对路径。
+      const { stdout, stderr } = await pExecFile(c, ['--version'], {
+        timeout: 8000,
+        ...(isWin ? { shell: true, windowsHide: true } : {}),
+      })
+      const out = `${stdout}${stderr}`
+      if (/\d+\.\d+\.\d+/.test(out) && !/native binary not installed/i.test(out)) {
+        console.log(`[ce] 管家用 claude: ${c} (${out.trim().split('\n')[0]})`)
+        appendCeLog(`[ce] claude 探测:命中 ${c}`)
         return c
       }
-      fails.push(`  ${c}: --version 输出不合规(${stdout.trim().split('\n')[0] || '(空)'})`)
+      fails.push(`  ${c}: --version 输出不合规(${out.trim().split('\n')[0] || '(空)'})`)
     } catch (e) {
       fails.push(`  ${c}: ${(e as Error).message}`)
     }
   }
-  console.warn('[ce] 未找到能跑的 claude(候选全失败),管家/CC 对话不可用;可用 --claude-bin=<path> 指定')
+  console.warn('[ce] 未找到能跑的 claude(候选 --version 全失败),管家/CC 对话不可用;装好 claude 后重启 ce,或 --claude-bin=<path> 指定')
   appendCeLog(`[ce] claude 探测:全候选失败(共 ${fails.length})\n${pathNote}\n${fails.join('\n')}`)
   return null
 }
@@ -447,9 +452,13 @@ async function main(): Promise<void> {
   const phoneKeys = new Map<string, { sharedKey: Uint8Array; name: string }>()
   // 握手认证:pin 模式下新手机首次连接须带正确 PIN 才入白名单,已授权 phoneId 重连放行;
   //   --pairing-mode=open 退回旧的「明文 phonePub 即配对」(过渡兼容)。白名单持久 ~/.ce/authorized-phones.json。
+  // 2026-09-21:① 内存 Set 与磁盘同步(配对 add/踢出 delete —— 此前只写盘,同进程内新配对手机
+  //   一重连(杀 app 重开)就被内存旧名单拒掉,真机"过段时间连不上必须重扫"主根因);
+  //   ② PIN 持久 ~/.ce/pin.json(此前每次启动随机 → 白名单意外丢条目即"必须重扫")。
   const pairingMode = (arg('pairing-mode') ?? 'pin') as PairingMode
   const authorized = loadAuthorized()
-  let currentPin = pairingMode === 'pin' ? (arg('pin') ?? randomPin()) : ''
+  let currentPin = pairingMode === 'pin' ? (arg('pin') ?? loadPin() ?? randomPin()) : ''
+  if (currentPin) savePin(currentPin) // 显式 --pin 也落盘:下次不带参启动沿用同一枚,手机记住的 PIN 不作废
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
@@ -460,8 +469,8 @@ async function main(): Promise<void> {
   // 终端输出环形缓冲:转发 TermOutput 时旁路 append(与 owner 无关);read_terminal 工具读它(ce 本地,不回程问手机)。
   const buffers = new TermBuffers(500)
   // AI 管家:每台手机一个 cc(stream-json,全 pipe 由 ce spawn),ce 桥接 ButlerStdin/ButlerOutput。
-  // claudeBin:探测一个能跑的 claude——机器上常装多份(系统/nvm/npx),PATH 先解析到的可能是坏的
-  //   "native binary not installed"。优先绝对路径、跑 --version 验证,用第一个好的;管家 cc 用它 spawn。
+  // claudeBin:探测一个能跑的 claude(候选表 + --version 实测,见 resolveClaudeBin)。可能为 null
+  //   (全候选失败)—— 管家/CC 对话此时显式走 nocc/提示路径,不再裸回 'claude' 假装能用。
   const claudeBin = await resolveClaudeBin()
   const butlers = new ButlerManager({
     onOutput: (sid, owner, chunk) => encryptThenSend(FrameType.ButlerOutput, chunk, { sid, targetPhoneId: owner }),
@@ -582,7 +591,7 @@ async function main(): Promise<void> {
           relay: relayUrl, jupyter: baseUrl, pairingMode,
           pin: currentPin,
           phones: [...phoneKeys.entries()].map(([id, v]) => ({ id, name: v.name })),
-          paired: [...authorized],
+          paired: loadPaired(), // 带名字+配对时间(控制台白名单页用;此前只是内存 id 集,重启前配对的不显示)
           wsConnected: ws?.readyState === WebSocket.OPEN,
           connectionCode,
         })
@@ -602,14 +611,16 @@ async function main(): Promise<void> {
         const { pin } = await req.json() as { pin?: string }
         if (!pin || !/^\d{6}$/.test(pin)) return json({ ok: false, error: 'PIN 须 6 位数字' }, 400)
         currentPin = pin
+        savePin(pin) // 2026-09-21:改 PIN 也落盘(此前只在内存,重启即回旧值,用户以为改了)
         return json({ ok: true, pin: currentPin })
       }
       if (path === '/control/unpair' && req.method === 'POST') {
         const { phoneId } = await req.json() as { phoneId?: string }
         if (!phoneId) return json({ ok: false, error: '缺 phoneId' }, 400)
         removeAuthorized(phoneId)
+        authorized.delete(phoneId) // 内存同步:此前踢掉的手机在 ce 不重启期间仍能白名单命中重连
         phoneKeys.delete(phoneId)
-        return json({ ok: true, paired: [...loadAuthorized()] })
+        return json({ ok: true, paired: loadPaired() })
       }
       if (path === '/control/logs') {
         const n = Number(url.searchParams.get('n') ?? 80)
@@ -897,10 +908,26 @@ async function main(): Promise<void> {
           // 认证门禁:open 模式直放;pin 模式下白名单内 phoneId 放行,否则需正确 PIN 首次配对。
           const auth = authorize({ mode: pairingMode, phoneId, authorized, pin: framePin, currentPin })
           if (!auth.allow) {
-            console.log(`[ce] 拒绝配对 phoneId=${phoneId}(pin 模式:非白名单且 PIN 错/缺)`)
+            // 拒绝必回因(2026-09-21:此前静默丢帧,手机只能 15s 超时、无从分辨)。
+            // 明文:握手未成无共享密钥;载荷只有粗粒度原因,不含任何秘密。旧手机端不识
+            // PairReject 编号 → 安全降级为原超时行为。
+            console.log(`[ce] 拒绝配对 phoneId=${phoneId}(${auth.denyReason})`)
+            if (srcPhone) {
+              sendFrame({
+                type: FrameType.PairReject,
+                targetPhoneId: srcPhone,
+                payload: enc.encode(JSON.stringify({ reason: auth.denyReason })),
+              })
+            }
             return
           }
-          if (auth.pair) addAuthorized(phoneId)
+          if (auth.pair) {
+            addAuthorized(phoneId, name)
+            authorized.add(phoneId) // 内存同步:同进程内该手机断线重连(杀 app 重开)白名单直接命中
+          } else if (name) {
+            // 白名单命中也刷新名字(手机端改名由此传播到落盘)
+            addAuthorized(phoneId, name)
+          }
           const sharedKey = sharedSecret(cliPriv, unb64(phonePubB64))
           phoneKeys.set(phoneId, { sharedKey, name })
           butlers.markPhoneBack(phoneId) // 手机(重)连 → 取消其孤儿回收计时(管家续用、保留上下文)

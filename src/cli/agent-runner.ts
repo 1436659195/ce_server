@@ -112,12 +112,13 @@ export interface AgentRunnerOpts {
   /** SDK 事件 → 手机(回调;main.ts 接到后加密成 AgentEvent 帧发给 owner)。带 sid 让手机 demux 多 CC tab。 */
   onEvent: (owner: string, sid: string, event: AgentEvent) => void
   onExit: (sid: string, owner: string, code: number | null) => void
-  /** resolveClaudeBin() 结果;null = 全候选实测失败(生产红线 C2:不再裸回 'claude')。
-   *  首条消息时守卫拒启 + 通知手机,不在 spawn 时才炸。SDK 经 pathToClaudeCodeExecutable 复用系统 claude(连带 auth)。 */
+  /** resolveClaudeBin() 结果;SDK 经 pathToClaudeCodeExecutable 复用系统 claude(连带 auth)。
+   *  null = 探测全失败(显式无 claude,生产红线 C2)—— 首条消息时守卫拒启 + 给手机提示 + failed 收尾,
+   *  不调 SDK 假装能跑,也不在 spawn 时才炸。 */
   claudeBin: string | null
   /** 注入点(测试用):喂假 query 避免真 spawn cc。签名同 SDK query。 */
   query?: (params: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => AsyncIterable<SDKMessage>
-  /** 工作目录(claude 的项目根;CC 对话跑在用户项目,butler 跑 /tmp)。 */
+  /** 工作目录(claude 的项目根;CC 对话跑在用户项目,butler 跑隔离空目录)。 */
   cwd: string
 }
 
@@ -155,14 +156,15 @@ export class AgentRunner {
     proc.queue.push(msg)
     if (!proc.started) {
       proc.started = true
-      // 生产红线 C2:claudeBin=null(全候选实测失败)→ 显式拒启 + 告知手机,不裸 spawn 'claude'
-      if (!this.opts.claudeBin) {
-        console.error(`[ce:agent-runner] ${sid} 无法启动:本机未探到可用的 claude(可用 --claude-bin=<路径> 指定)`)
+      if (this.opts.claudeBin == null) {
+        // claude 探测全失败(resolveClaudeBin 显式 null,C2):不调 SDK 假装能跑 —— 直接给手机一条
+        // 可行动提示 + failed 收尾,免得手机对着永远不来的回轮干等。
+        console.error(`[ce:agent-runner] ${sid} 无法启动:本机未探到能跑的 claude(候选 --version 全失败;可用 --claude-bin=<路径> 指定)`)
         this.opts.onEvent(proc.owner, proc.sid, {
           kind: 'text',
-          text: '[ce] 本机未找到可用的 claude,对话无法启动。请在被控机安装/修复 claude,或启动 ce 时用 --claude-bin=<路径> 指定。',
+          text: '[ce] 本机未找到能跑的 claude(候选 --version 全失败)。请在被控机安装 claude CLI 后重启 ce,或用 --claude-bin=<路径> 指定。',
         })
-        this.opts.onEvent(proc.owner, proc.sid, { kind: 'turn-end', status: 'failed' })
+        this.opts.onEvent(proc.owner, proc.sid, { kind: 'turn-end', status: 'failed', durationMs: 0 })
         this.finish(proc, -2)
         return
       }

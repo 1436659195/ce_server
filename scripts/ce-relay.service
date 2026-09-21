@@ -1,0 +1,23 @@
+[Unit]
+Description=CE relay(ce-server-repo,手机↔被控机 WebSocket 中继,:8606)
+After=network-online.target
+Wants=network-online.target
+# 崩溃自愈:Restart=always;限 burst 防"起不来还无限重启"的风暴
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/data/AI-project/personal_xm/coding_everywhere_v2/ce-server-repo
+# 端口/公网地址/state 密钥全在 .env(main.ts 直接读 RELAY_PORT/RELAY_PUBLIC_URL/RELAY_STATE_KEY/RELAY_TLS_*)
+EnvironmentFile=/data/AI-project/personal_xm/coding_everywhere_v2/ce-server-repo/.env
+ExecStart=/root/.bun/bin/bun run src/relay/main.ts
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+# 与 start.sh 时代保持同一个日志文件,排查习惯不变
+StandardOutput=append:/data/AI-project/personal_xm/coding_everywhere_v2/ce-server-repo/relay.log
+StandardError=append:/data/AI-project/personal_xm/coding_everywhere_v2/ce-server-repo/relay.log
+
+[Install]
+WantedBy=multi-user.target

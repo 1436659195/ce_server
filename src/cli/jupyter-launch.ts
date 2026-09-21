@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
 import { parse as parsePath } from 'node:path'
 import type { JupyterServer } from './jupyter-detect'
-import { resolvePythonBin } from './jupyter-detect'
+import { resolvePythonBin } from './python'
 
 /**
  * 从 Jupyter 启动输出里抓 baseUrl + token。
@@ -36,10 +36,12 @@ function pickFreePort(): Promise<number> {
 }
 
 /**
- * 启动一个本地 Jupyter(`python -m jupyterlab --no-browser --port=<ce 自选空闲端口>`),等它打印 URL+token 后返回。
+ * 启动一个本地 Jupyter(`<python 解释器> -m jupyterlab --no-browser --port=<ce 自选空闲端口>`),等它打印 URL+token 后返回。
  * root_dir 设为宿主机根目录(Linux/Mac '/'、Windows 当前盘根):手机文件栏从根浏览整个文件系统,而非 ce 的 cwd。返回 stop() 退出杀进程。
  *
- * ⚠️ 走 `python -m jupyterlab` 而非 `jupyter lab`:Bun `--compile` 出的 Windows 二进制里 `shell:true`
+ * pythonBin 由调用方注入(main 用 resolvePythonBin 统一解析,治「裸 python 在无 python 别名的系统上
+ * 退出码 127、daemon exit(1) 起不来」);缺省时自解析,解析不到 → 直接 reject 可行动报错。
+ * ⚠️ 走 `<python> -m jupyterlab` 而非 `jupyter lab`:Bun `--compile` 出的 Windows 二进制里 `shell:true`
  * spawn 不了 `jupyter.exe`(setuptools 入口包装器),但 spawn `python.exe` 正常(ensurePythonOrExit 已证)。
  * `-m` 直接跑模块、绕开坏掉的 `jupyter` 命令 —— 这是你机上「pip 装好了却探测不到 + 启动超时」的根因修复。
  * ⚠️ 需真实 Jupyter,由 main 烟测覆盖(无单测)。
@@ -48,16 +50,20 @@ export async function launchJupyter(
   rootDir?: string,
   timeoutMs = 30000,
   onLog?: (chunk: Buffer) => void,
+  pythonBin?: string,
 ): Promise<{ server: JupyterServer; stop: () => void }> {
+  const bin = pythonBin ?? (await resolvePythonBin())
+  if (!bin) {
+    throw new Error('未找到 python 解释器(试过 python3/python),无法启动 Jupyter;可用 --python=<路径> 或环境变量 CE_PYTHON 指定')
+  }
   // root_dir:传入则用(用户设的工作目录);否则宿主机根(parse(cwd).root → Linux/Mac '/',
   // Windows 当前盘根)——让 Jupyter 服务整个文件系统,手机文件栏从根起浏览。
   // --ServerApp.allow_root=True:root 用户下 Jupyter 默认拒启(要 --allow-root),显式开(非 root 忽略无害)。
   const dir = rootDir ?? parsePath(process.cwd()).root
   const port = await pickFreePort() // ce 自选端口传 Jupyter,避开 --port=0 在某些环境打印 localhost:0
-  const py = await resolvePythonBin() // 生产红线 C1:不写死 'python'(标准发行版只有 python3)
   return new Promise((resolve, reject) => {
     const proc = spawn(
-      py,
+      bin,
       ['-m', 'jupyterlab', '--no-browser', `--port=${port}`, `--ServerApp.root_dir=${dir}`, '--ServerApp.allow_root=True'],
       {
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -104,9 +110,10 @@ export async function launchJupyter(
       if (settled) return
       settled = true
       clearTimeout(timer)
-      // 127 + not found 尾巴 = 解释器缺失(shell:true 下非 ENOENT)→ 翻译成可行动报错(生产红线 C1)
+      // 127 + not found 尾巴 = 解释器缺失(shell:true 下非 ENOENT;生产红线 C1)→ 翻译成可行动报错。
+      // 严格 AND:单看退出码或单看文本都会误报(其他错误的输出也可能含 "not found")。
       if (code === 127 && /not found|no such file|is not recognized/i.test(buf)) {
-        reject(new Error(`未找到 python 解释器(${py} 退出 127)。可用 --python=<路径> 或环境变量 CE_PYTHON 指定。输出:\n${buf.slice(-1500)}`))
+        reject(new Error(`python 解释器不可用:「${bin}」退出码 127(command not found)。可用 --python=<路径> 或环境变量 CE_PYTHON 指定。输出:\n${buf.slice(-1500)}`))
         return
       }
       reject(new Error(`Jupyter 进程提前退出(码 ${code})。输出:\n${buf.slice(-1500)}`))

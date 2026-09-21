@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test'
-import { parseServerList, toLoopback, probePythonBin, resolveOsRoot, sameRoot } from '../src/cli/jupyter-detect'
+import { parseServerList, toLoopback, resolveOsRoot, sameRoot } from '../src/cli/jupyter-detect'
+import { probePythonBin } from '../src/cli/python'
 
 // 解析 `jupyter server list` 文本 → {url, token, root}[]。所有 token 均为假数据。
 test('parseServerList:表驱动(空/单/多/特殊字符)', () => {

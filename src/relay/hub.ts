@@ -235,6 +235,16 @@ export class Hub {
     }
     s.phones.set(phone, phoneId)
     this.wsMeta.set(phone, { sid, role: 'phone', phoneId })
+    // ce 当前离线(session 在但 cli 断着):立即告知新接入的 phone(复用 cliLeft 明文通知)。
+    // 不发则 phone 以为对端在,握手/RPC 全缓冲等 ce 回来 → 连接期只能 15s 超时,无从分辨
+    // 「被控机不在线」(2026-09-21:手机端据 cliLeft 快速失败并给准确话术)。ce 回来后正常握手。
+    if (!s.cli) {
+      try {
+        phone.send(cliLeftNotice())
+      } catch {
+        /* phone ws 已关 */
+      }
+    }
     for (const m of s.phoneBuffer) {
       try {
         phone.send(m)
