@@ -70,6 +70,19 @@ if (Test-Path $exe) {
       $oldRunning | Stop-Process -Force
       $oldRunning | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
     }
+    # ce 已停,但它拉起的 Jupyter 是独立进程(Windows 杀父不连坐子),会活着并被新 ce
+    # 经 jupyter.json 复用 → 本次更新对 Jupyter 的改动(如终端起始目录)被旧进程挡住。
+    # 特征串 --ServerApp.allow_root=True 是 ce 独有启动参数,不误伤用户自己开的 Jupyter。
+    $ceJupyters = @(Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '--ServerApp\.allow_root=True' })
+    if ($ceJupyters.Count -gt 0) {
+      $keep = Ask-Yes("[install] 旧 ce 拉起的 Jupyter 还在运行。继承 = 保留已开终端的会话,但本次更新的 Jupyter 修复(如终端起始目录)需重启它才生效。继承现有 Jupyter")
+      if ($keep) {
+        Write-Host "[install] 继承现有 Jupyter(终端会话保留;新参数待它下次重启生效)" -ForegroundColor Yellow
+      } else {
+        $ceJupyters | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Write-Host "[install] 已停止旧 Jupyter(新 ce 将以新参数重起)" -ForegroundColor Yellow
+      }
+    }
     Write-Host "[install] ce.exe 有更新(本地 $localHash / 远程 $remoteHash),重新下载"
     Invoke-WebRequest -Uri $dlUrl -OutFile $exe
   }
@@ -146,6 +159,10 @@ if ($running -and $rootChanged) {
   $running | Stop-Process -Force
   $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
   $running = $null
+  # 换盘后旧 root 的 Jupyter 不会再被复用(ce 的同根判定挡掉),留着只是泄漏的孤儿进程 → 直接停
+  Get-CimInstance Win32_Process -Filter "Name like 'python%'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match '--ServerApp\.allow_root=True' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 if ($running) {
   Write-Host "[install] ce 已在运行(PID $($running.Id -join ',')),不重复启动" -ForegroundColor Yellow
