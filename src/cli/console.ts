@@ -7,11 +7,12 @@
  */
 import { createInterface } from 'node:readline'
 import { readFileSync, openSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
+import { installWorkshop, defaultWorkshopRoot } from './workshop'
 
 const DAEMON_JSON = join(homedir(), '.ce', 'daemon.json')
 
@@ -143,7 +144,7 @@ async function menu(d: DaemonInfo): Promise<void> {
       `中继 ${C.cyan}${st.relay}${C.reset}`,
       `Jupyter ${C.cyan}${st.jupyter}${C.reset}  模式 ${st.pairingMode}${pinPart}`,
     ])
-    const help = `${C.dim}[s]启 [x]停 [r]重启 [u]更新 [c]二维码 [p]改PIN [w]白名单 [l]日志 [d]体检 [q]退出${C.reset}`
+    const help = `${C.dim}[s]启 [x]停 [r]重启 [u]更新 [c]二维码 [p]改PIN [w]白名单 [o]工坊 [l]日志 [d]体检 [q]退出${C.reset}`
     process.stdout.write(clr + panel + '\n' + help + '\n> ')
     const k = await readKey()
     if (k === 'q') { console.log('\n再见(daemon 继续后台跑)。'); return }
@@ -164,6 +165,7 @@ async function menu(d: DaemonInfo): Promise<void> {
       if (k === 'c') await showQr(d)
       if (k === 'p') await changePin(d)
       if (k === 'w') await whitelist(d)
+      if (k === 'o') await workshopItem(st.relay)
       if (k === 'l') await showLogs(d)
       if (k === 'd') await doctor(d)
     } catch (e) {
@@ -178,6 +180,24 @@ async function changePin(d: DaemonInfo): Promise<void> {
   const r = await api<{ ok: boolean; error?: string }>(d, '/control/pin', { method: 'POST', body: JSON.stringify({ pin }) })
   console.log(r.ok ? C.green + '\n✓ PIN 已改(已配对手机免影响)' + C.reset : C.red + '\n✗ ' + r.error + C.reset)
   await sleep(1500)
+}
+
+/** [o] 工坊:安装/更新插件工坊(选目录;与 CLI `ce --workshop=<目录>` 同一安装器)。
+ *  装完手机工坊页即可用;marker 记集装箱摘要,之后每次安装自动判新旧、幂等更新。 */
+async function workshopItem(relayWs: string): Promise<void> {
+  const def = defaultWorkshopRoot(homedir())
+  const raw = (await prompt(`\n工坊安装目录(回车 = ${def}): `)).trim()
+  const root = raw ? resolve(raw) : def
+  console.log('')
+  try {
+    const r = await installWorkshop({ relayHttp: relayWs.replace(/^ws/, 'http'), root })
+    console.log(r.status === 'up-to-date'
+      ? C.green + '✓ 工坊已是最新,无需重装' + C.reset
+      : C.green + '✓ 工坊安装完成 —— 手机工坊页即可使用' + C.reset)
+  } catch (e) {
+    console.log(C.red + '✗ 工坊安装失败: ' + (e as Error).message + C.reset)
+  }
+  await sleep(2000)
 }
 
 async function whitelist(d: DaemonInfo): Promise<void> {

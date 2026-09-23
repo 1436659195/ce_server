@@ -40,6 +40,7 @@ import { sameDir, resolveWorkdir } from './paths'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 import { resolvePythonBin } from './python'
 import { runConsole } from './console'
+import { installWorkshop, defaultWorkshopRoot } from './workshop'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
 import { ManagedTerms } from './managed-terms'
@@ -1287,9 +1288,30 @@ async function main(): Promise<void> {
   connect()
 }
 
-// 入口分叉:--daemon 跑守护进程(main);否则跑控制台 TUI(console.ts)。
+// 入口分叉:--workshop[=目录] 装/更新插件工坊(装完即退,不进 daemon/控制台;relay 取
+// config.json/--relay);--daemon 跑守护进程(main);否则跑控制台 TUI(console.ts)。
 // daemon 加全局错误兜底:小意外记日志不退,严重错误退出(由控制台/系统拉起)+清 stale daemon.json。
-if (process.argv.includes('--daemon')) {
+const wsFlag = process.argv.find((a) => a === '--workshop' || a.startsWith('--workshop='))
+if (wsFlag) {
+  const relayUrl = arg('relay') ?? loadConfig().relay
+  if (!relayUrl) {
+    console.error('[ce] --workshop 需要中继地址:补 --relay=ws://...(或先跑一次 ce,让 ~/.ce/config.json 记住中继)')
+    process.exit(1)
+  }
+  const raw = (wsFlag === '--workshop' ? '' : wsFlag.slice('--workshop='.length)).trim()
+  const root = raw || defaultWorkshopRoot(homedir())
+  installWorkshop({ relayHttp: relayUrl.replace(/^ws/, 'http'), root })
+    .then((r) => {
+      console.log(r.status === 'up-to-date'
+        ? `[ce] 工坊已是最新:${root}(免重装)`
+        : `[ce] 工坊安装完成:${root} —— 手机工坊页即可使用`)
+      process.exit(0)
+    })
+    .catch((e) => {
+      console.error('[ce] 工坊安装失败:', (e as Error).message)
+      process.exit(1)
+    })
+} else if (process.argv.includes('--daemon')) {
   // 单例锁:占固定端口。listen 成功 = 唯一 daemon;EADDRINUSE = 端口被占,需区分是谁占的。
   //   - daemon.json 里 pid 还活 = 另一个 ce daemon 在跑 → 静默退出(真单例);
   //   - pid 死 / 无 daemon.json = 48731 被别的程序占(假阳性)→ 警告并继续(放弃端口锁,单例降级),
