@@ -40,7 +40,7 @@ import { sameDir, resolveWorkdir } from './paths'
 import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
 import { resolvePythonBin } from './python'
 import { runConsole } from './console'
-import { installWorkshop, defaultWorkshopRoot } from './workshop'
+import { installWorkshop, defaultWorkshopRoot, resolveWorkshopDir } from './workshop'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
 import { ManagedTerms } from './managed-terms'
@@ -1299,14 +1299,15 @@ if (wsFlag) {
     process.exit(1)
   }
   const raw = (wsFlag === '--workshop' ? '' : wsFlag.slice('--workshop='.length)).trim()
-  const root = raw || defaultWorkshopRoot(homedir())
-  installWorkshop({ relayHttp: relayUrl.replace(/^ws/, 'http'), root })
-    .then((r) => {
-      console.log(r.status === 'up-to-date'
-        ? `[ce] 工坊已是最新:${root}(免重装)`
-        : `[ce] 工坊安装完成:${root} —— 手机工坊页即可使用`)
-      process.exit(0)
-    })
+  resolveWorkshopDir(raw || defaultWorkshopRoot(homedir()))
+    .then((root) =>
+      installWorkshop({ relayHttp: relayUrl.replace(/^ws/, 'http'), root }).then((r) => {
+        console.log(r.status === 'up-to-date'
+          ? `[ce] 工坊已是最新:${root}(免重装)`
+          : `[ce] 工坊安装完成:${root} —— 手机工坊页即可使用`)
+        process.exit(0)
+      }),
+    )
     .catch((e) => {
       console.error('[ce] 工坊安装失败:', (e as Error).message)
       process.exit(1)

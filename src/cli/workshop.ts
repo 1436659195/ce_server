@@ -22,6 +22,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { detectServers, isAlive } from './jupyter-detect'
 
 /** CLI 交互未指定目录时的缺省工坊根(用户家目录下,无机器假设)。 */
 export function defaultWorkshopRoot(home: string): string {
@@ -215,4 +216,42 @@ export function isDir(p: string): boolean {
   } catch {
     return false
   }
+}
+
+/** resolveWorkshopDir 的可注入探测面(测试喂假 jupyter/假 fs)。 */
+export interface ResolveDirDeps {
+  detectServersFn?: typeof detectServers
+  isAliveFn?: typeof isAlive
+  isDirFn?: (p: string) => boolean
+}
+
+/**
+ * 解析工坊根(OS 绝对目录)—— 路径语义收口(J 视角 ↔ OS 视角)。
+ *
+ * 同一路径字符串在两个世界各有所指:手机目录选择器/文件栏展示的是 **jupyter 视角**
+ * (相对 root_dir、去前缀),`--workshop=` 落盘要用 **OS 绝对路径**。ce 是唯一同时
+ * 认识两个世界的组件(它就跑在 jupyter 旁边)→ 换算收口在这里;与手机端核验/货架的
+ * 读径候选(jupyterPathCandidates)同 rationale,读侧写侧对称。
+ *
+ * 规则:
+ *  ① 原样(OS 绝对)存在 → 用它(显式 OS 路径是用户明确意愿);
+ *  ② 否则换算到 jupyter 视角(root_dir + 路径):存在 → 用;不存在 → 也归一到它
+ *     (新建必须落在手机文件栏看得见的世界,否则核验/货架永远对不上);
+ *  ③ 无存活 jupyter(手机侧一切读写都依赖它)→ 退回原样。
+ */
+export async function resolveWorkshopDir(raw: string, deps: ResolveDirDeps = {}): Promise<string> {
+  const isDirFn = deps.isDirFn ?? isDir
+  const direct = resolve(raw)
+  if (isDirFn(direct)) return direct
+  try {
+    const servers = await (deps.detectServersFn ?? detectServers)()
+    for (const s of servers) {
+      if (!(await (deps.isAliveFn ?? isAlive)(s.url, s.token))) continue
+      // 活着的 jupyter 即本机「手机可见世界」的根:存在与否都归一到它下面(新建同理)
+      return join(s.root, direct.replace(/^\/+/, ''))
+    }
+  } catch {
+    /* 探测失败(jupyter 未装/未起)→ 退回原样 */
+  }
+  return direct
 }

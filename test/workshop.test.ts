@@ -1,9 +1,9 @@
-import { test, expect } from 'bun:test'
+import { test, describe, expect } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
-import { installWorkshop, readMarker, verifyThreePiece, defaultWorkshopRoot } from '../src/cli/workshop'
+import { installWorkshop, readMarker, verifyThreePiece, defaultWorkshopRoot, resolveWorkshopDir } from '../src/cli/workshop'
 
 /**
  * 工坊安装器测试:fetch 注入假中继(摘要 + 集装箱),npm 注入记录器,tar 用真命令
@@ -235,4 +235,68 @@ test('中继未上架(sha256 404)→ 明说「未上架」而非模糊报错', a
 
 test('defaultWorkshopRoot:家目录下 ce-workshop(无机器假设)', () => {
   expect(defaultWorkshopRoot('/home/x')).toBe('/home/x/ce-workshop')
+})
+
+describe('resolveWorkshopDir(J 视角 ↔ OS 视角 收口)', () => {
+  /** 造一个「jupyter root_dir」临时世界 + 注入探测面。 */
+  function makeWorld(opts?: { jupyterRoot?: string; alive?: boolean }) {
+    const base = mkdtempSync(join(tmpdir(), 'ws-res-'))
+    const jupyterRoot = opts?.jupyterRoot ?? join(base, 'root')
+    mkdirSync(jupyterRoot, { recursive: true })
+    return {
+      base,
+      jupyterRoot,
+      deps: {
+        detectServersFn: (async () => [{ url: 'http://127.0.0.1:8888', token: 't', root: jupyterRoot }]) as never,
+        isAliveFn: (async () => opts?.alive ?? true) as never,
+      },
+    }
+  }
+
+  test('① 原样(OS 绝对)存在 → 直接用(jupyter 探测不发生)', async () => {
+    const w = makeWorld()
+    const dir = mkdirSync(join(w.base, 'os-root', 'ce-workshop'), { recursive: true }) as string
+    let probed = false
+    const r = await resolveWorkshopDir(dir, {
+      ...w.deps,
+      detectServersFn: (async () => { probed = true; return [] }) as never,
+    })
+    expect(r).toBe(dir)
+    expect(probed).toBe(false) // 存在即定,不探测
+    rmSync(w.base, { recursive: true, force: true })
+  })
+
+  test('② 原样不存在 + jupyter 视角存在 → 归一到 root_dir 下(手机看得见的世界)', async () => {
+    const w = makeWorld()
+    // 原样路径必须是 jupyter 视角形态(/xxx 且 OS 上确定不存在)
+    const raw = `/ws-res-no-such-${process.pid}/ce-workshop`
+    mkdirSync(join(w.jupyterRoot, `ws-res-no-such-${process.pid}/ce-workshop`), { recursive: true })
+    const r = await resolveWorkshopDir(raw, w.deps)
+    expect(r).toBe(join(w.jupyterRoot, `ws-res-no-such-${process.pid}/ce-workshop`))
+    rmSync(w.base, { recursive: true, force: true })
+  })
+
+  test('②′ 两边都不存在 → 也归一到 jupyter 视角(新建落在手机看得见的世界)', async () => {
+    const w = makeWorld()
+    const r = await resolveWorkshopDir('/fresh/ce-workshop', w.deps)
+    expect(r).toBe(join(w.jupyterRoot, 'fresh/ce-workshop'))
+    expect(existsSync(r)).toBe(false) // 本函数不建目录(建目录归 installWorkshop)
+    rmSync(w.base, { recursive: true, force: true })
+  })
+
+  test('③ 无存活 jupyter → 退回原样 OS 路径', async () => {
+    const w = makeWorld({ alive: false })
+    const r = await resolveWorkshopDir('/fresh/ce-workshop', w.deps)
+    expect(r).toBe('/fresh/ce-workshop')
+    rmSync(w.base, { recursive: true, force: true })
+  })
+
+  test('③′ jupyter 探测抛错(未装/未起)→ 退回原样,不炸', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'ws-res-'))
+    const r = await resolveWorkshopDir(join(base, 'x'), {
+      detectServersFn: (async () => { throw new Error('no jupyter') }) as never,
+    })
+    expect(r).toBe(join(base, 'x'))
+    rmSync(base, { recursive: true, force: true })
+  })
 })

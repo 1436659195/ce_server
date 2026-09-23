@@ -12,7 +12,7 @@ import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
-import { installWorkshop, defaultWorkshopRoot } from './workshop'
+import { installWorkshop, defaultWorkshopRoot, resolveWorkshopDir } from './workshop'
 
 const DAEMON_JSON = join(homedir(), '.ce', 'daemon.json')
 
@@ -187,9 +187,9 @@ async function changePin(d: DaemonInfo): Promise<void> {
 async function workshopItem(relayWs: string): Promise<void> {
   const def = defaultWorkshopRoot(homedir())
   const raw = (await prompt(`\n工坊安装目录(回车 = ${def}): `)).trim()
-  const root = raw ? resolve(raw) : def
   console.log('')
   try {
+    const root = await resolveWorkshopDir(raw ? resolve(raw) : def)
     const r = await installWorkshop({ relayHttp: relayWs.replace(/^ws/, 'http'), root })
     console.log(r.status === 'up-to-date'
       ? C.green + '✓ 工坊已是最新,无需重装' + C.reset
