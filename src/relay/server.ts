@@ -11,6 +11,27 @@ export function renderInstallScript(template: string, relayWs: string): string {
 }
 
 /**
+ * 静态文件响应:200 + Content-Type/Length,HEAD 只回头;不可读 → 404(文件未上传/路径未配)。
+ * /dl/* 与 /workshop/* 静态分发共用(插件工坊集装箱/校验和/货架清单,见下方路由)。
+ */
+function serveStatic(res: ServerResponse, req: IncomingMessage, filePath: string, contentType: string, label: string): void {
+  try {
+    const body = readFileSync(filePath)
+    res.setHeader('Content-Type', contentType)
+    res.setHeader('Content-Length', body.length)
+    if (req.method === 'HEAD') {
+      // install.sh 防呆 B 同款:HEAD 拿 Content-Length 比对,不回 body 免浪费带宽
+      res.end()
+      return
+    }
+    res.end(body)
+  } catch {
+    res.writeHead(404)
+    res.end(`${label} 不可读`)
+  }
+}
+
+/**
  * 把 Hub(纯逻辑)接到真实 WebSocket 上。
  *
  * URL 约定:
@@ -34,13 +55,18 @@ export function createRelayServer(
     sha256Path?: string
     installShPath?: string
     lanPyPath?: string
+    /** 插件工坊分发(缺一该路由 404):脚手架集装箱 / 其 sha256(即版本标识)/ 货架清单 */
+    workshopScaffoldPath?: string
+    workshopScaffoldSha256Path?: string
+    workshopIndexPath?: string
     publicUrl?: string // 对外中继 ws 地址(防 Host 头注入 install 脚本);不配则回退请求 Host
     /** 心跳:每 intervalMs ping 一次,连续 maxMissed 次无 pong 判死 terminate。缺省 30s/2。
      *  测试注入小值加速;治 half-open 死连接(断网/热点切换/NAT 超时,双方无数据则永不发现)。 */
     heartbeat?: { intervalMs: number; maxMissed: number }
   }
 ): { server: Server; close: () => Promise<void> } {
-  // 静态下载路由:/install.ps1 + /install.sh(注入 __RELAY_URL__)、/lan.py(纯静态,无占位)、/dl/ce-{windows-x64.exe,linux-x64,linux-arm64};其余 404。
+  // 静态下载路由:/install.ps1 + /install.sh(注入 __RELAY_URL__)、/lan.py(纯静态,无占位)、
+  // /dl/ce-{windows-x64.exe,linux-x64,linux-arm64}、/workshop/{scaffold.tgz,scaffold.tgz.sha256,index.json};其余 404。
   // ws upgrade 仍由下方 WebSocketServer({server}) 接管,与 http requestListener 不冲突。
   const requestListener = (req: IncomingMessage, res: ServerResponse): void => {
     const host = req.headers.host ?? 'localhost'
@@ -187,6 +213,22 @@ export function createRelayServer(
         res.writeHead(404)
         res.end('sha256.txt 不可读')
       }
+      return
+    }
+    // ── 插件工坊分发(工坊自成服务:手机 APK / ce 二进制都不携带脚手架,ce 从这里提货)──
+    // 版本即内容:scaffold.tgz.sha256 的摘要就是版本标识,ce 装完把摘要写进工坊 marker,
+    // 下次比对「远端摘要 vs 本机 marker」判新旧 → 不同则重装(幂等),无需独立版本号体系。
+    if (path === '/workshop/scaffold.tgz' && opts?.workshopScaffoldPath) {
+      serveStatic(res, req, opts.workshopScaffoldPath, 'application/gzip', 'scaffold.tgz')
+      return
+    }
+    if (path === '/workshop/scaffold.tgz.sha256' && opts?.workshopScaffoldSha256Path) {
+      serveStatic(res, req, opts.workshopScaffoldSha256Path, 'text/plain; charset=utf-8', 'scaffold.tgz.sha256')
+      return
+    }
+    if (path === '/workshop/index.json' && opts?.workshopIndexPath) {
+      // 货架清单(插件 id/名/版本/描述/工件 sha256);ce 拉它给手机工坊页陈列,及取 .ceplugin 工件
+      serveStatic(res, req, opts.workshopIndexPath, 'application/json; charset=utf-8', 'index.json')
       return
     }
     res.writeHead(404)

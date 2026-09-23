@@ -143,3 +143,92 @@ test('中继静态路由：/dl/sha256.txt 返回哈希清单(install 据此判�
     rmSync(shaPath, { force: true })
   }
 })
+
+// ── 插件工坊分发:/workshop/{scaffold.tgz,scaffold.tgz.sha256,index.json} ──
+
+test('中继静态路由：/workshop/scaffold.tgz 返回集装箱二进制', async () => {
+  const hub = new Hub()
+  const scaffoldPath = join(tmpdir(), `scaffold-test-${process.pid}.tgz`)
+  await Bun.write(scaffoldPath, 'fake-tgz-bytes')
+
+  const { server, close } = createRelayServer(hub, { workshopScaffoldPath: scaffoldPath })
+  const port = await listenPort(server)
+  try {
+    const resp = await fetch(`http://localhost:${port}/workshop/scaffold.tgz`)
+    const body = await resp.text()
+
+    expect(body).toBe('fake-tgz-bytes')
+    expect(resp.headers.get('content-type')).toBe('application/gzip')
+  } finally {
+    await close()
+    rmSync(scaffoldPath, { force: true })
+  }
+})
+
+test('中继静态路由：/workshop/scaffold.tgz.sha256 返回版本标识(即摘要)', async () => {
+  const hub = new Hub()
+  const shaPath = join(tmpdir(), `scaffold-sha-test-${process.pid}`)
+  await Bun.write(shaPath, 'deadbeef  scaffold.tgz\n')
+
+  const { server, close } = createRelayServer(hub, { workshopScaffoldSha256Path: shaPath })
+  const port = await listenPort(server)
+  try {
+    const resp = await fetch(`http://localhost:${port}/workshop/scaffold.tgz.sha256`)
+    const body = await resp.text()
+
+    expect(resp.ok).toBe(true)
+    expect(body).toContain('deadbeef')
+    expect(resp.headers.get('content-type')).toBe('text/plain; charset=utf-8')
+  } finally {
+    await close()
+    rmSync(shaPath, { force: true })
+  }
+})
+
+test('中继静态路由：/workshop/index.json 返回货架清单 JSON', async () => {
+  const hub = new Hub()
+  const indexPath = join(tmpdir(), `workshop-index-test-${process.pid}.json`)
+  await Bun.write(indexPath, JSON.stringify({ plugins: [{ id: 'cc-review', version: '1.0.0' }] }))
+
+  const { server, close } = createRelayServer(hub, { workshopIndexPath: indexPath })
+  const port = await listenPort(server)
+  try {
+    const resp = await fetch(`http://localhost:${port}/workshop/index.json`)
+    const body = (await resp.json()) as { plugins: { id: string }[] }
+
+    expect(resp.headers.get('content-type')).toBe('application/json; charset=utf-8')
+    expect(body.plugins[0]!.id).toBe('cc-review')
+  } finally {
+    await close()
+    rmSync(indexPath, { force: true })
+  }
+})
+
+test('中继静态路由：/workshop/* 未配路径(未上传文件)→ 404,不崩进程', async () => {
+  const hub = new Hub()
+  const { server, close } = createRelayServer(hub, {})
+  const port = await listenPort(server)
+  try {
+    const resp = await fetch(`http://localhost:${port}/workshop/scaffold.tgz`)
+    expect(resp.status).toBe(404)
+  } finally {
+    await close()
+  }
+})
+
+test('中继静态路由：/workshop/scaffold.tgz 支持 HEAD(只回头不回 body)', async () => {
+  const hub = new Hub()
+  const scaffoldPath = join(tmpdir(), `scaffold-head-test-${process.pid}.tgz`)
+  await Bun.write(scaffoldPath, 'fake-tgz-bytes')
+
+  const { server, close } = createRelayServer(hub, { workshopScaffoldPath: scaffoldPath })
+  const port = await listenPort(server)
+  try {
+    const resp = await fetch(`http://localhost:${port}/workshop/scaffold.tgz`, { method: 'HEAD' })
+    expect(resp.headers.get('content-length')).toBe(String('fake-tgz-bytes'.length))
+    expect(await resp.text()).toBe('')
+  } finally {
+    await close()
+    rmSync(scaffoldPath, { force: true })
+  }
+})
