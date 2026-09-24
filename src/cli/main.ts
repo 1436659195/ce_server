@@ -22,6 +22,7 @@ import { encodeFrame, decodeFrame, FrameType, type Frame } from '../shared/frame
 import { detectServers, isAlive, toLoopback, resolveOsRoot } from './jupyter-detect'
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, listTerminalsRetry, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
+import { runPreflight, type PreflightItem } from './preflight'
 import { UploadSessions } from './uploads'
 import { ButlerManager } from './butler'
 import { AgentRunner } from './agent-runner'
@@ -1289,6 +1290,16 @@ async function main(): Promise<void> {
                   )
                 },
               )
+            }
+          } else if (req.op === 'plugin.preflight') {
+            // 插件环境检测(2026-09-24 安装门禁):手机装「服务器级插件」前逐项验证 requirements。
+            // 无状态只读、每项 10s 超时;script 档与 exec 同语义(execFile 无 shell,白名单在手机侧)。
+            // 旧 ce(无此 op)→ 手机侧收到未知操作错误,降级为「跳过检测直接装」(见 app 侧门禁)。
+            const items = (req as { items?: PreflightItem[] }).items
+            if (!Array.isArray(items)) {
+              resp = { ok: false, error: 'plugin.preflight: items 必须是数组' }
+            } else {
+              resp = { ok: true, data: { results: await runPreflight(items) } }
             }
           } else if (
             req.op === 'uploadBegin' ||
