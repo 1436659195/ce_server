@@ -1,8 +1,8 @@
 import { test, expect } from 'bun:test'
 import { TermRegistry, gateAttach } from '../src/cli/term-registry'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { join } from 'node:path'
 
 // TermRegistry:终端实例指纹 + 归属,持久化。治两件事:
 //  ① Jupyter 数字终端名被复用(杀 5 建 5 还是 "5")→ 手机改名错粘到无关新终端;

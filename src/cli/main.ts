@@ -31,6 +31,7 @@ import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
 import { TermRegistry, gateAttach } from './term-registry'
+import { CloseProbe } from './close-probe'
 import { loadAuthorized, loadPaired, addAuthorized, removeAuthorized, authorize, loadPin, savePin, type PairingMode } from './pairing'
 import { spawn, execFile } from 'node:child_process'
 import { createServer } from 'node:net'
@@ -802,14 +803,14 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── 终端验活轮询(60s):治「电脑端杀终端,手机 tab 永远白屏」──────────────────────
-  // 周期对账 Jupyter live 列表:消失的名字 = 死亡(整条出册:指纹与归属一起解除)+ 广播
+  // ── 终端对账(验活):60s 轮询兜底 + WS 断开即时触发,共用一次 reconcile ────────────
+  // 对账 Jupyter live 列表:消失的名字 = 死亡(整条出册:指纹与归属一起解除)+ 广播
   // termGone;新名字收养(下次 listTerminals 带 finger 给手机)。拉取失败跳过本轮
-  // (Jupyter 重启中 ≠ 全部死亡)。启动 ~5s 先对账一次(收养存量终端,手机随即拿到 finger)。
-  let termPollBusy = false
-  async function termPollTick(): Promise<void> {
-    if (termPollBusy) return // 上轮未完(单次 fetchTimeout 15s)不堆叠
-    termPollBusy = true
+  // (Jupyter 重启中 ≠ 全部死亡)。
+  let reconcileBusy = false
+  async function reconcileTerminals(): Promise<void> {
+    if (reconcileBusy) return // 上轮未完(单次 fetchTimeout 15s)不堆叠;漏掉的死亡由 60s 轮询兜底
+    reconcileBusy = true
     try {
       const names = (await listTerminalsRetry(jupyter)).map((t) => t.name)
       const died = termRegistry.observe(names)
@@ -821,11 +822,19 @@ async function main(): Promise<void> {
     } catch {
       /* 本轮跳过 */
     } finally {
-      termPollBusy = false
+      reconcileBusy = false
     }
   }
-  setInterval(() => void termPollTick(), 60_000)
-  setTimeout(() => void termPollTick(), 5_000)
+  // ① 周期轮询(兜底:手机从没开过的终端没有 WS,其死亡只有点名能发现)。
+  //    启动 ~5s 先对账一次(收养存量终端,手机随即拿到 finger)。
+  setInterval(() => void reconcileTerminals(), 60_000)
+  setTimeout(() => void reconcileTerminals(), 5_000)
+  // ② 即时路径:手机开着的终端死亡 → Jupyter 在进程退出瞬间挂断其 terminado WS(OS 级推
+  //    事件)→ 非预期断开立刻点名,死亡发现从「≤60s」提到秒级 —— 堵「电脑端杀旧建新同号
+  //    复用挤进轮询间隙」的错粘窗口。预期内的关闭(ce 主动 detach/硬删)不点名,见
+  //    expectedCloses;close 成串(Jupyter 重启断全部 WS)由 CloseProbe 合并成一次点名。
+  const expectedCloses = new Set<string>()
+  const closeProbe = new CloseProbe(() => reconcileTerminals())
 
   // 按 terminal name 懒开/重连 terminado WS(路径无 /api 前缀);输出加密回传。
   // 健壮性:① cached 断开(CLOSING/CLOSED)则重连,不复用死连接;② WS 还在 CONNECTING 时
@@ -874,7 +883,13 @@ async function main(): Promise<void> {
       // 手机关终端 / 进程退出 → terminado WS 断 → 释放占用,别人可重新接管。
       // 守卫:仅当关闭的仍是 terms 当前登记的本条 WS 才释放 —— ensureTerm 重连时,
       // 旧 WS 的延迟 close 不应误清刚由新 WS 的 attach 设上的新 owner。
-      if (terms.get(name) === tws) terminalOwner.delete(name)
+      if (terms.get(name) !== tws) return
+      terminalOwner.delete(name)
+      // 即时死亡点名:非预期断开(不是 ce 主动 detach/硬删)= 终端多半死了。当场对账:
+      // name 已不在 live 列表 → 秒级出册 + 广播 termGone;还在 → 只是 app 侧刷新的
+      // detach(终端活着),不动。极端竞态(名单更新略晚于挂断)由 60s 轮询兜底。
+      if (expectedCloses.delete(name)) return // ce 主动关的:终端没死(硬删已在 RPC 分支就地出册)
+      closeProbe.trigger()
     })
     tws.on('error', (e) => {
       // 终端 ws 连接失败(Jupyter 里没这个终端名 → upgrade 404;或 Jupyter 重启)必须兜底:
@@ -1134,6 +1149,7 @@ async function main(): Promise<void> {
             } else {
               const tws = terms.get(termName)
               if (tws) {
+                expectedCloses.add(termName) // 主动关闭:close 处理器据此跳过「死亡点名」
                 try {
                   tws.close()
                 } catch {
@@ -1165,6 +1181,7 @@ async function main(): Promise<void> {
             } else {
               const tws = terms.get(termName)
               if (tws) {
+                expectedCloses.add(termName) // 主动关闭:close 处理器据此跳过「死亡点名」
                 try {
                   tws.close()
                 } catch {

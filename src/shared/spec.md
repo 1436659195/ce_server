@@ -75,8 +75,12 @@ Jupyter 终端只有数字名且**编号会复用**(杀 5 建 5 还是 "5",重�
 - **归属建立**:创建终端(创建者即属主)/ 接管游离终端(首条 resize/stdin 先到先得)。
 - **归属解除**:软移除「移除」(releaseOwner,归属 → 游离)/ 关闭终端 / 终端死亡 / 解绑手机
   (`releaseAllOf`,防被踢手机锁死终端)。
-- **对账**:`observe(liveNames)`(60s 轮询 + listTerminals RPC 双触发点,拉取失败绝不调用
-  —— Jupyter 不可达 ≠ 全死):live 缺席 = 死亡(整条出册)+ 广播 `termGone`;live 新名字 =
+- **对账**:`observe(liveNames)`,三个触发点,拉取失败绝不调用(Jupyter 不可达 ≠ 全死):
+  ① 60s 轮询(兜底:手机从没开过的终端没有 WS,其死亡只有点名能发现);② **WS 断开即时触发**
+  —— 手机开着的终端死亡时 Jupyter 在进程退出瞬间挂断其 terminado WS(OS 级推事件),ce 据此
+  秒级点名(死亡发现 ≤60s → 秒级,堵「电脑端杀旧建新同号复用挤进轮询间隙」的错粘窗口);
+  预期内的关闭(ce 主动 detach/硬删)不点名;close 成串(Jupyter 重启断全部 WS)由 CloseProbe
+  合并成一次;③ listTerminals RPC。live 缺席 = 死亡(整条出册)+ 广播 `termGone`;live 新名字 =
   收养(分配 finger,游离态)。
 - **接管门禁**(`gateAttach`,resize/stdin 入口):别人的归属 → `attachDenied`;指纹不符 /
   不在册(刷新一次仍不在)→ `termGone`;其余放行。
