@@ -56,18 +56,39 @@ payload = nacl.secretbox.open(ct, nonce, sharedKey)   // 失败返回 null → �
 - **`uploadAbort`**(`{ uploadId }`):删临时文件、会话作废。**幂等**(未知 id 也 ok)——手机端 fire-and-forget 清理;`chunk`/`end` 对未知 id 则报错(那是真失败)。
 - 版本注记:**旧版 ce 对这四个 op 返 `{ok:false, error:'未知操作: uploadBegin'}`**(bridge.ts default 分支,文案形状已钉死),手机端据此提示「机器端 ce 版本过旧,请更新」;小文件(≤2MB)走 `saveFile`,所有版本兼容。已知残余:上传期间 `.part` 会短暂出现在该目录的 listDir(不做过滤)。
 
-- **`listTerminals`**(特例,`main.ts` 处理 —— 需访问 ce 的 `terms` map 算 `managed`):返回 `{ ok: true, data: { terminals: RemoteTerminalInfo[] } }`,其中
-  - `RemoteTerminalInfo = { name: string; lastActivityAt: number | null; managed: boolean; occupiedBy: string | null }`
-  - ce 转发本地 `GET /api/terminals`,用 `toRemoteTerminals(all, managedSet)`(`bridge.ts`)映射:`name` = 终端名(= terminado session name = 隧道 TermOutput 的 sid);`lastActivityAt` = 解析 `last_activity` 的 ms 时间戳(无则 null);`managed` = 该终端是否在 ce `terms` map 里(= ce 经手过、有 terminado WS);`occupiedBy` = 当前占用者显示名(按 `terminalOwner` map 查 phone 显示名;空闲=`null`)。
-  - 手机:**杀 app 重开自动恢复只挑 `managed=true`**(零回归);**「+」面板显示全部**,并据 `occupiedBy` 灰显别人正在用的(自己占用的仍可切)。
-- **`deleteTerminal`**(`{ name }`,特例):关 ce 端 terminado WS + 本地 `DELETE /api/terminals/{name}`(硬删:杀服务器终端进程)。
-- **`detachTerminal`**(`{ name }`,特例):只关 ce 端 terminado WS + 从 ce `terms` map 移除,**不** Jupyter DELETE(软移除:服务器终端保留)。→ 该终端 `managed` 变 false(杀 app 重开不自动恢复),但 `GET /api/terminals` 仍返回 →「+」面板可见、可重新接管。
+- **`listTerminals`**(特例,`main.ts` 处理 —— 需访问 ce 的 `terms` map 算 `managed`、`termRegistry` 算指纹/归属):返回 `{ ok: true, data: { terminals: RemoteTerminalInfo[] } }`,其中
+  - `RemoteTerminalInfo = { name: string; lastActivityAt: number | null; managed: boolean; occupiedBy: string | null; finger?: string; ownedByMe?: boolean }`
+  - ce 转发本地 `GET /api/terminals`,用 `toRemoteTerminals(all, managedSet)`(`bridge.ts`)映射:`name` = 终端名(= terminado session name = 隧道 TermOutput 的 sid);`lastActivityAt` = 解析 `last_activity` 的 ms 时间戳(无则 null);`managed` = 该终端是否在 ce `terms` map 里(= ce 经手过、有 terminado WS)。后三个字段在 `main.ts` spread 处追加:`finger` = 实例指纹(`termRegistry` 分配的 uuid;cc-* 合成会话 = sid);`ownedByMe` = 请求手机是否属主;`occupiedBy` = **持久属主显示名**(归属态)/`null`(游离态)。
+  - 手机:**杀 app 重开自动恢复挑 `managed=true` 且(属主是我 或 游离)**(旧手机无新字段 → 维持只挑 managed,零回归);**「+」面板显示全部**,据 `occupiedBy` 灰显别人的归属终端(自己/游离的可点)。
+- **`createTerminal`**(`{ cwd, type? }`)→ `{ ok, data: { name, finger } }`:`name` = Jupyter 分配的终端名(cc/workshop 走 agent-runner 时 `finger = sid`);**创建者即属主**(`termRegistry.setOwner`)。旧版 ce 只返 `{ name }`(手机按缺 finger 兼容)。
+- **`deleteTerminal`**(`{ name }`,特例):关 ce 端 terminado WS + 本地 `DELETE /api/terminals/{name}`(硬删:杀服务器终端进程)→ `termRegistry.remove`(指纹/归属随终端一起出册)。
+- **`detachTerminal`**(`{ name }`,特例):只关 ce 端 terminado WS + 从 ce `terms` map 移除,**不** Jupyter DELETE(软移除:服务器终端保留)→ `termRegistry.releaseOwner`(**释放归属:归属 → 游离,别人可接管;finger 保留**,属主再接管凭它找回改名)。→ 该终端 `managed` 变 false(杀 app 重开不自动恢复),但 `GET /api/terminals` 仍返回 →「+」面板可见、可重新接管。
+
+### 5.1 终端归属模型(多端;2026-09-24)
+
+Jupyter 终端只有数字名且**编号会复用**(杀 5 建 5 还是 "5",重启后从头计数)。ce 用
+`~/.ce/terminal-registry.json`(`term-registry.ts`,纯本地可单测)给每个**终端实例**记
+`{ finger: uuid, owner?: { id, name } }`,中继**零参与**(纯 ce 磁盘态;中继只透传加密帧):
+
+- **两态**:**游离态**(无 owner,任何手机可接管)/ **归属态**(有 owner,只有属主能接);
+  属主杀 app、手机离线、中继抖动、ce 重启都**不**丢归属(磁盘态)。
+- **归属建立**:创建终端(创建者即属主)/ 接管游离终端(首条 resize/stdin 先到先得)。
+- **归属解除**:软移除「移除」(releaseOwner,归属 → 游离)/ 关闭终端 / 终端死亡 / 解绑手机
+  (`releaseAllOf`,防被踢手机锁死终端)。
+- **对账**:`observe(liveNames)`(60s 轮询 + listTerminals RPC 双触发点,拉取失败绝不调用
+  —— Jupyter 不可达 ≠ 全死):live 缺席 = 死亡(整条出册)+ 广播 `termGone`;live 新名字 =
+  收养(分配 finger,游离态)。
+- **接管门禁**(`gateAttach`,resize/stdin 入口):别人的归属 → `attachDenied`;指纹不符 /
+  不在册(刷新一次仍不在)→ `termGone`;其余放行。
+- **升级迁移**:存量终端首次 observe 收养为游离态;旧手机不带指纹跳过指纹校验;旧手机恢复
+  逻辑维持「只挑 managed」零回归。
 
 ## 6. Control 帧的密文 op(ce→手机,定向加密 + targetPhoneId 路由)
 
 除手机→ce 的握手(明文 phonePub)/resize(密文)外,ce→手机 也用 `FrameType.Control` 发密文控制通知:
 
-- **`attachDenied`**(`{ op:'attachDenied', name, occupiedBy }`):race 反馈。两手机近乎同时接管同一空闲终端,ce `tryAcquire` 按先到先得裁决,落败方(loser)此前已在本地建会话(接管面板点的)→ ce 给 loser 发此通知(用 loser 的 sharedKey 加密 + `targetPhoneId=loser` 路由)。loser 收到后**本地回滚该 session(软移除,`localOnly=true`:不再对 ce 发 `detachTerminal`,否则会误杀 winner 刚抢到的终端/占用)** + 弹 toast(`「name」刚被 occupiedBy 占用了`)。`occupiedBy` = winner 的显示名。
+- **`attachDenied`**(`{ op:'attachDenied', name, occupiedBy }`):race 反馈。两手机近乎同时接管同一空闲终端,ce `tryAcquire` 按先到先得裁决,落败方(loser)此前已在本地建会话(接管面板点的)→ ce 给 loser 发此通知(用 loser 的 sharedKey 加密 + `targetPhoneId=loser` 路由)。loser 收到后**本地回滚该 session(软移除,`localOnly=true`:不再对 ce 发 `detachTerminal`,否则会误杀 winner 刚抢到的终端/占用)** + 弹 toast(`「name」刚被 occupiedBy 占用了`)。`occupiedBy` = winner 的显示名。接管门禁的「别人的归属终端」拒绝也走此 op( occupiedBy = 持久属主显示名)。
+- **`termGone`**(`{ op:'termGone', name }`):终端死亡通知。来源:① 60s 验活轮询(或 listTerminals RPC 对账)发现 live 列表缺席 → **广播**给所有已配对手机(不按 terminalOwner 定向——死亡时该映射已被 terminado close 清掉,定向必丢);② 接管门禁判死(resize/stdin 对着已死/被同名重建的编号)。手机收到后:把对应 tab 标死(死面板,不自动删,留残留输出)+ **清该编号的持久改名/类型/指纹**(实例没了,编号可能被新终端复用,不许错粘)。手机离线由中继 directedBuffer 补放(既有机制)。
 
 ## 7. AI 管家(ce 托管,Agent SDK 工具化版)
 

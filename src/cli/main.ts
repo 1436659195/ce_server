@@ -30,6 +30,7 @@ import { generateHooksConfig, handleHookBody } from './cc-hooks'
 import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { tryAcquire } from './ownership'
+import { TermRegistry, gateAttach } from './term-registry'
 import { loadAuthorized, loadPaired, addAuthorized, removeAuthorized, authorize, loadPin, savePin, type PairingMode } from './pairing'
 import { spawn, execFile } from 'node:child_process'
 import { createServer } from 'node:net'
@@ -498,6 +499,10 @@ async function main(): Promise<void> {
   // listTerminals 全员 managed=false → 手机杀 app 重开不自动恢复(会话管理「清空」观感)。
   // 重启后由它合并标注;终端真没了(Jupyter 列表不含)由 listTerminals 顺手 prune。
   const managedTerms = new ManagedTerms(join(homedir(), '.ce', 'managed-terminals.json'))
+  // 终端注册表落盘(~/.ce/terminal-registry.json):实例指纹(治编号复用错粘改名)+ 归属
+  // (多端模型:游离=没人接管过,任何人可接;归属=只有属主能用,杀 app 仍在,软移除才释放)。
+  // 由 60s 验活轮询 + listTerminals RPC 对账维护;中继不参与(零存储,只透传加密帧)。
+  const termRegistry = new TermRegistry(join(homedir(), '.ce', 'terminal-registry.json'))
   // 终端输出环形缓冲:转发 TermOutput 时旁路 append(与 owner 无关);read_terminal 工具读它(ce 本地,不回程问手机)。
   const buffers = new TermBuffers(500)
   // AI 管家:每台手机一个 cc(stream-json,全 pipe 由 ce spawn),ce 桥接 ButlerStdin/ButlerOutput。
@@ -651,7 +656,11 @@ async function main(): Promise<void> {
         if (!phoneId) return json({ ok: false, error: '缺 phoneId' }, 400)
         removeAuthorized(phoneId)
         authorized.delete(phoneId) // 内存同步:此前踢掉的手机在 ce 不重启期间仍能白名单命中重连
+        // 释放该手机的全部终端归属(防被踢/离职手机把终端锁死在归属态;finger 保留 → 终端
+        // 回到游离态,任何人可接管,原属主改名仍可被新属主经收养路径找回)。
+        const freed = termRegistry.releaseAllOf(phoneId)
         phoneKeys.delete(phoneId)
+        if (freed.length > 0) console.log(`[ce] 解绑 ${phoneId}:释放归属终端 ${freed.join(',')}`)
         return json({ ok: true, paired: loadPaired() })
       }
       if (path === '/control/logs') {
@@ -744,21 +753,79 @@ async function main(): Promise<void> {
   }
 
   /** race loser 通知:两手机近乎同时接管同一空闲终端,先到先得裁决后,给落败方(loserPhoneId)
-   *  发一条加密 Control{op:'attachDenied'},载 winner 显示名。loser 收到后本地回滚会话 + 提示用户。
-   *  用 loser 自己的 sharedKey 加密 + targetPhoneId 路由(中继据此寻路)。 */
-  function denyAttach(name: string, loserPhoneId: string, winnerPhoneId: string): void {
+   *  发一条加密 Control{op:'attachDenied'},载占用者显示名(竞争胜者或持久属主)。loser 收到后
+   *  本地回滚会话 + 提示用户。用 loser 自己的 sharedKey 加密 + targetPhoneId 路由(中继据此寻路)。 */
+  function denyAttach(name: string, loserPhoneId: string, occupiedByName: string): void {
     encryptThenSend(
       FrameType.Control,
       enc.encode(
         JSON.stringify({
           op: 'attachDenied',
           name,
-          occupiedBy: phoneKeys.get(winnerPhoneId)?.name ?? '?',
+          occupiedBy: occupiedByName,
         })
       ),
       { targetPhoneId: loserPhoneId }
     )
   }
+
+  /** 终端死亡通知:Control{op:'termGone'}。手机据此把对应 tab 标死(死面板)+ 清该编号的
+   *  持久改名/类型(实例没了,编号可能被新终端复用,不许错粘)。 */
+  function sendTermGone(name: string, phoneId: string): void {
+    encryptThenSend(
+      FrameType.Control,
+      enc.encode(JSON.stringify({ op: 'termGone', name })),
+      { targetPhoneId: phoneId }
+    )
+  }
+
+  /** 广播 termGone 给所有已配对手机(死亡是全局事实,谁知道谁清理;不按 terminalOwner 定向
+   *  —— 死亡时该映射已被 terminado close 清掉,定向必丢)。 */
+  function broadcastTermGone(name: string): void {
+    for (const phoneId of phoneKeys.keys()) sendTermGone(name, phoneId)
+  }
+
+  /** 接管成功登记:transient 占用(输出寻路用)+ 持久归属(游离 → 归属态;幂等)。 */
+  function acquireTerm(name: string, phoneId: string): boolean {
+    if (!tryAcquire(terminalOwner, name, phoneId).ok) return false
+    termRegistry.setOwner(name, { id: phoneId, name: phoneKeys.get(phoneId)?.name ?? '' })
+    return true
+  }
+
+  /** 现拉一次 Jupyter live 列表并 observe。接管验活的 unknown 兜底:不在册可能只是对账陈旧
+   *  (终端刚在 PC 端创建),刷新一次再判;失败静默(维持旧 registry,失败 ≠ 全死)。 */
+  async function refreshRegistry(): Promise<void> {
+    try {
+      termRegistry.observe((await listTerminalsRetry(jupyter)).map((t) => t.name))
+    } catch {
+      /* Jupyter 不可达/重启中:维持旧对账结果 */
+    }
+  }
+
+  // ── 终端验活轮询(60s):治「电脑端杀终端,手机 tab 永远白屏」──────────────────────
+  // 周期对账 Jupyter live 列表:消失的名字 = 死亡(整条出册:指纹与归属一起解除)+ 广播
+  // termGone;新名字收养(下次 listTerminals 带 finger 给手机)。拉取失败跳过本轮
+  // (Jupyter 重启中 ≠ 全部死亡)。启动 ~5s 先对账一次(收养存量终端,手机随即拿到 finger)。
+  let termPollBusy = false
+  async function termPollTick(): Promise<void> {
+    if (termPollBusy) return // 上轮未完(单次 fetchTimeout 15s)不堆叠
+    termPollBusy = true
+    try {
+      const names = (await listTerminalsRetry(jupyter)).map((t) => t.name)
+      const died = termRegistry.observe(names)
+      managedTerms.prune(names) // 顺手同源对账,防 managed 文件膨胀(与 listTerminals RPC 同约定)
+      for (const name of died) {
+        console.log(`[ce] 终端死亡 ${name} → 广播 termGone`)
+        broadcastTermGone(name)
+      }
+    } catch {
+      /* 本轮跳过 */
+    } finally {
+      termPollBusy = false
+    }
+  }
+  setInterval(() => void termPollTick(), 60_000)
+  setTimeout(() => void termPollTick(), 5_000)
 
   // 按 terminal name 懒开/重连 terminado WS(路径无 /api 前缀);输出加密回传。
   // 健壮性:① cached 断开(CLOSING/CLOSED)则重连,不复用死连接;② WS 还在 CONNECTING 时
@@ -899,6 +966,7 @@ async function main(): Promise<void> {
               op?: string
               rows?: number
               cols?: number
+              finger?: string // 手机自称的实例指纹(旧手机不带 → 跳过指纹校验)
             }
             if (
               msg.op === 'resize' &&
@@ -906,14 +974,34 @@ async function main(): Promise<void> {
               typeof msg.rows === 'number' &&
               typeof msg.cols === 'number'
             ) {
-              // 占用校验:attach(=首条 resize)时按先到先得裁决;别人已占 → 不 ensureTerm,
-              // 并给 loser 发 attachDenied(race 反馈:loser 此前已本地建会话,需回滚 + 提示)。
-              const acq = tryAcquire(terminalOwner, frame.sid, srcPhone)
-              if (acq.ok) {
+              // 接管门禁(归属 + 验活):① 别人的归属终端 → attachDenied(防抢);
+              // ② 指纹不符 / 不在册(刷新后仍不在)= 终端已死或被同名重建 → termGone,
+              //    不 ensureTerm(治「+ 面板陈列表接管死终端变白屏」)。
+              let gate = gateAttach({
+                owner: termRegistry.ownerOf(frame.sid),
+                finger: termRegistry.fingerOf(frame.sid),
+                presentedFinger: msg.finger,
+                phoneId: srcPhone,
+              })
+              if (gate.verdict === 'unknown') {
+                await refreshRegistry()
+                gate = gateAttach({
+                  owner: termRegistry.ownerOf(frame.sid),
+                  finger: termRegistry.fingerOf(frame.sid),
+                  presentedFinger: msg.finger,
+                  phoneId: srcPhone,
+                })
+              }
+              if (gate.verdict === 'denied') {
+                denyAttach(frame.sid, srcPhone, gate.occupiedBy)
+              } else if (gate.verdict === 'gone' || gate.verdict === 'unknown') {
+                sendTermGone(frame.sid, srcPhone)
+              } else if (acquireTerm(frame.sid, srcPhone)) {
                 const tws = ensureTerm(frame.sid)
                 tws.send(JSON.stringify(['set_size', msg.rows, msg.cols])) // ensureTerm 自缓冲(CONNECTING 时)
               } else {
-                denyAttach(frame.sid, srcPhone, acq.occupiedBy)
+                // gate 放行后仍抢输 = 极窄竞态(另一手机同刻先 acquire):按原先到先得拒
+                denyAttach(frame.sid, srcPhone, phoneKeys.get(terminalOwner.get(frame.sid) ?? '')?.name ?? '?')
               }
             }
             return
@@ -994,8 +1082,10 @@ async function main(): Promise<void> {
             // 转发 GET /api/terminals 拿「Jupyter 上所有终端」+ 用 ce 的 terms map 标 managed。
             // 手机「+」面板显示全部;杀 app 重开自动恢复只挑 managed(= ce 经手过的),零回归。
             let all: { name: string; last_activity?: string }[] = []
+            let listOk = false
             try {
               all = await listTerminalsRetry(jupyter) // 首错 300ms×1 重试:治配对瞬间瞬态 404
+              listOk = true
             } catch (e) {
               // 重试后仍失败(Jupyter token 失效(403)/卡死/重启中):别让 listTerminals 抛成
               // unhandledRejection 拖累。退化为空列表(手机暂时看不到终端,但不崩;恢复后下次刷新补全量)。
@@ -1005,22 +1095,32 @@ async function main(): Promise<void> {
             // terms 空但终端仍活在 Jupyter,靠它让手机杀 app 重开还能自动恢复会话)。
             const managedSet = new Set(terms.keys())
             for (const n of managedTerms.values()) managedSet.add(n)
-            // 顺手清理落盘集合:Jupyter 列表已不含的终端名摘掉(终端真没了,防文件无限膨胀)。
-            // 列表获取失败(all 空)不 prune —— 空列表≠终端全死,误清会丢用户会话。
-            if (all.length > 0) managedTerms.prune(all.map((t) => t.name))
-            // 每条加 occupiedBy(占用者显示名;null=空闲)—— 手机「+」面板据此灰显别人在用的
+            // 对账注册表(指纹 + 归属)+ 清理落盘集合:仅在拉取【成功】时 —— 失败退化空列表
+            // ≠ 终端全死,误清会丢用户指纹/归属。对账出的死亡广播 termGone(所有手机清 tab)。
+            if (listOk) {
+              const names = all.map((t) => t.name)
+              for (const name of termRegistry.observe(names)) {
+                console.log(`[ce] 终端死亡 ${name} → 广播 termGone`)
+                broadcastTermGone(name)
+              }
+              managedTerms.prune(names)
+            }
+            // 每条加:实例指纹(手机持久改名/类型绑实例,不绑可复用的编号)、归属
+            // (occupiedBy = 持久属主显示名,游离 = null;ownedByMe = 请求者是否属主)——
+            // 手机「+」面板据此灰显别人在用的、把「我的 ∪ 游离」恢复成 tab。
             const terminals = toRemoteTerminals(all, managedSet).map((t) => ({
               ...t,
-              occupiedBy: terminalOwner.has(t.name)
-                ? (phoneKeys.get(terminalOwner.get(t.name)!)?.name ?? null)
-                : null,
+              finger: termRegistry.fingerOf(t.name),
+              ownedByMe: termRegistry.ownerOf(t.name)?.id === srcPhone,
+              occupiedBy: termRegistry.ownerOf(t.name)?.name ?? null,
             }))
             // CC 对话 agent 会话(cc-*)不是 Jupyter 终端 → 补进列表让手机恢复(标 managed=true,
             //   occupiedBy=null;手机按持久化的 per-sid type:'cc' 套用,渲染走对话组件而非 xterm)。
             //   按 owner 过滤(只返本机 cc,防他机串入)+ 补 cwd(手机 restore 不再硬编码 '/')。
             for (const a of agentRunner.forPhone(srcPhone)) {
               if (!terminals.some((t) => t.name === a.sid)) {
-                terminals.push({ name: a.sid, lastActivityAt: Date.now(), managed: true, occupiedBy: null, cwd: a.cwd })
+                // cc-* 的 sid 本就是 uuid:即指纹(天然免疫编号复用);本就按 srcPhone 过滤 → 归属自己
+                terminals.push({ name: a.sid, lastActivityAt: Date.now(), managed: true, occupiedBy: null, cwd: a.cwd, finger: a.sid, ownedByMe: true })
               }
             }
             resp = { ok: true, data: { terminals } }
@@ -1042,6 +1142,7 @@ async function main(): Promise<void> {
                 terms.delete(termName)
               }
               terminalOwner.delete(termName) // 释放占用(终端已删,owner 无意义)
+              termRegistry.remove(termName) // 硬删 → 出册(指纹/归属随终端一起消失)
               managedTerms.remove(termName) // 硬删 → 不再 managed(杀 app 重开不恢复)
               try {
                 await fetch(`${baseUrl}/api/terminals/${encodeURIComponent(termName)}`, {
@@ -1072,6 +1173,7 @@ async function main(): Promise<void> {
                 terms.delete(termName)
               }
               terminalOwner.delete(termName) // 软移除也释放占用:别人可从「+」面板重新接管
+              termRegistry.releaseOwner(termName) // 释放归属(归属 → 游离,别人可接管);finger 保留 —— 终端还活着,属主再接管凭它找回改名
               managedTerms.remove(termName) // 软移除 = 用户显式不要 → 不再 managed(同硬删语义)
               resp = { ok: true }
             }
@@ -1085,7 +1187,7 @@ async function main(): Promise<void> {
               // 自动加载)、首条发言由工坊插件自己组织(分档/资源评估提示词在手机侧插件里,ce 保持哑管道)。
               const sid = agentRunner.start(srcPhone, (req as { cwd?: string }).cwd)
               console.log(`[ce] createTerminal(${termType}) → agentRunner sid=${sid} (phone=${srcPhone})`)
-              resp = { ok: true, data: { name: sid } }
+              resp = { ok: true, data: { name: sid, finger: sid } }
             } else {
               // 普通终端:Jupyter 分配的新 name 必空闲 → 创建者即 owner(先到先得天然满足)。
               // 成功后【不】在此 eager 开 terminado WS(懒开:等手机首条 resize/stdin 才开,对齐直连,
@@ -1096,8 +1198,12 @@ async function main(): Promise<void> {
                 resp.data &&
                 typeof (resp.data as { name?: string }).name === 'string'
               ) {
-                terminalOwner.set((resp.data as { name: string }).name, srcPhone)
-                managedTerms.add((resp.data as { name: string }).name) // 新建即经手 → managed
+                const newName = (resp.data as { name: string }).name
+                terminalOwner.set(newName, srcPhone)
+                const finger = termRegistry.assign(newName) // 新实例入册(分配指纹)
+                termRegistry.setOwner(newName, { id: srcPhone, name: phoneKeys.get(srcPhone)?.name ?? '' }) // 创建者即属主
+                managedTerms.add(newName) // 新建即经手 → managed
+                resp = { ok: true, data: { name: newName, finger } }
               }
             }
           } else if (req.op === 'butlerStart') {
@@ -1207,11 +1313,31 @@ async function main(): Promise<void> {
             agentRunner.writeStdin(name, ccText)
             break
           }
-          // 占用校验:懒开 WS 时按先到先得裁决;别人占用的终端其 stdin 不转发,并给 loser 发
-          // attachDenied(race 反馈:loser 可能已本地建会话,需回滚 + 提示)。
-          const acq = tryAcquire(terminalOwner, name, srcPhone)
-          if (!acq.ok) {
-            denyAttach(name, srcPhone, acq.occupiedBy)
+          // 接管门禁(同 resize):归属校验(防抢)+ 验活(死了/被同名重建 → termGone,不懒开)。
+          // stdin 不带指纹(旧协议就是裸文本),指纹校验由「在册与否」承担。
+          let gate = gateAttach({
+            owner: termRegistry.ownerOf(name),
+            finger: termRegistry.fingerOf(name),
+            phoneId: srcPhone,
+          })
+          if (gate.verdict === 'unknown') {
+            await refreshRegistry()
+            gate = gateAttach({
+              owner: termRegistry.ownerOf(name),
+              finger: termRegistry.fingerOf(name),
+              phoneId: srcPhone,
+            })
+          }
+          if (gate.verdict === 'denied') {
+            denyAttach(name, srcPhone, gate.occupiedBy)
+            break
+          }
+          if (gate.verdict === 'gone' || gate.verdict === 'unknown') {
+            sendTermGone(name, srcPhone)
+            break
+          }
+          if (!acquireTerm(name, srcPhone)) {
+            denyAttach(name, srcPhone, phoneKeys.get(terminalOwner.get(name) ?? '')?.name ?? '?')
             break
           }
           const tws = ensureTerm(name)
@@ -1276,6 +1402,7 @@ async function main(): Promise<void> {
       console.log(`[ce] 中继断开,${reconnectDelay}ms 后重连`)
       phoneKeys.clear() // 中继断了:所有 phone 通道失效,重连后手机重新握手派生
       terminalOwner.clear() // 占用随连接重置(手机重连后重新 attach/tryAcquire)
+      // 【不清 termRegistry】:指纹/归属是磁盘态,跨断连/重启存活 —— 归属保护不因中继抖动失效。
       approvals.cancelAll('deny') // 挂起的 hook 审批全拒:手机此刻不可达,deny 让 CC 早结(不干等 55s 超时)
       // 【不杀管家】(同 phoneLeft 理由:管家是 ce 侧长驻进程)。中继重连后手机也重连,管家按 owner 续接;
       //   ce 若整体重启则进程死、管家自然没了,手机端会超时→重开 respawn(useButler.open 见 dead 即重建)。
