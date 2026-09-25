@@ -79,24 +79,46 @@ describe('normalizeKernelMsg 分档', () => {
 
 // ─── live 冒烟(默认跳过;CE_KERNEL_LIVE=1 bun test test/kernels.test.ts)────
 describe.skipIf(!process.env.CE_KERNEL_LIVE)('KernelManager live 冒烟(本机真 Jupyter)', () => {
-  test('start → execute → 输出流 → shutdown 全链', async () => {
+  const NB_PATH = 'Qlib/test.ipynb' // 真实存在的 notebook(会话绑定要求路径在盘)
+  const mk = async (events: unknown[]) => {
     const { KernelManager } = await import('../src/cli/kernels')
-    const events: unknown[] = []
-    const km = new KernelManager({
+    return new KernelManager({
       baseUrl: process.env.CE_JUPYTER_URL ?? 'http://localhost:8888',
       token: process.env.CE_JUPYTER_TOKEN ?? '66668888!?',
       push: (e) => events.push(e),
     })
-    const kernelId = await km.start()
+  }
+  test('start → execute → 输出流 → shutdown 全链', async () => {
+    const events: unknown[] = []
+    const km = await mk(events)
+    const { kernelId } = await km.start()
     expect(kernelId).toBeTruthy()
     const msgId = await km.execute(kernelId, 'print("ce-kernel-smoke")\n1+1')
     expect(msgId).toBeTruthy()
-    // 等输出+reply 到齐(真机 2s 足够)
     await new Promise((r) => setTimeout(r, 2500))
     await km.shutdown(kernelId)
     const text = JSON.stringify(events)
     expect(text).toContain('ce-kernel-smoke')
     expect(text).toContain('kernelReply')
     expect(text).toContain('"phase":"idle"')
+  })
+  test('跨端接管:同 notebookPath 二次 start 接同一内核,变量状态继承', async () => {
+    const ev1: unknown[] = []
+    const km = await mk(ev1)
+    const first = await km.start({ notebookPath: NB_PATH })
+    expect(first.attached).toBe(false)
+    await km.execute(first.kernelId, 'smoke_var = 12345')
+    await new Promise((r) => setTimeout(r, 1500))
+    // "另一端"(新 manager 实例 = 模拟手机重开/他端)带同路径 start → 接管
+    const ev2: unknown[] = []
+    const km2 = await mk(ev2)
+    const second = await km2.start({ notebookPath: NB_PATH })
+    expect(second.attached).toBe(true)
+    expect(second.kernelId).toBe(first.kernelId)
+    const msgId = await km2.execute(second.kernelId, 'print("inherit", smoke_var)')
+    expect(msgId).toBeTruthy()
+    await new Promise((r) => setTimeout(r, 2000))
+    await km2.shutdown(second.kernelId)
+    expect(JSON.stringify(ev2)).toContain('inherit 12345') // 变量从首端继承
   })
 })

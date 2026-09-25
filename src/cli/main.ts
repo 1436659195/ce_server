@@ -1302,8 +1302,12 @@ async function main(): Promise<void> {
           } else if (req.op === 'kernelStart') {
             // Jupyter 内核起停/执行(jupyter-ide 插件,2026-09-25):REST 控制面;输出走
             // AgentEvent 推流(载荷 {kind:'kernel…',kernelId}),RPC 只回启动结果。
+            // notebookPath 在场 = 跨端接管优先(电脑跑过的内核直接接,变量状态继承)。
             try {
-              resp = { ok: true, data: { kernelId: await kernelManager.start() } }
+              resp = {
+                ok: true,
+                data: await kernelManager.start({ notebookPath: req.notebookPath }),
+              }
             } catch (e) {
               resp = { ok: false, error: (e as Error).message }
             }

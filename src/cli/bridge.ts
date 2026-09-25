@@ -45,6 +45,7 @@ export interface RpcRequest {
   totalSize?: number // uploadBegin:声明的总字节数
   kernelId?: string // kernelExecute/Interrupt/Shutdown:内核 id(kernels.ts)
   code?: string // kernelExecute:要执行的代码
+  notebookPath?: string // kernelStart:notebook 路径(跨端接管优先,见 kernels.ts)
 }
 
 /** ce 回的 RPC 响应(明文 JSON,加密前)。 */

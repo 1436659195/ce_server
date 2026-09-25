@@ -2,7 +2,10 @@
  * Jupyter Kernel 桥(jupyter-ide 插件的 ce 侧半边,2026-09-25)—— kernel 会话管理 + 执行 + 输出推流。
  *
  * 能力面(手机侧契约 write/subscribe 的 kernel 档):
- * - start():POST /api/kernels 起 python3 内核 → kernelId
+ * - start({notebookPath}):**跨端接管优先** —— 该 notebook 已有 Jupyter session 绑定的活内核
+ *   (如电脑浏览器刚跑过)→ 直接接管它(变量状态继承,浏览器与手机同内核、输出双收);
+ *   没有 → POST /api/kernels 新建 + POST /api/sessions 绑到该路径(电脑侧打开同一本即接同一个内核)。
+ *   Jupyter session 的 path 相对 root_dir(无前导 /),入参的手机路径含前导 / 需剥。
  * - execute():连 /api/kernels/{id}/channels WS 发 execute_request,**每条回包归一成
  *   KernelEvent 经注入的 push 回调推给手机**(复用 AgentEvent 帧:载荷 {kind:'kernel…',kernelId});
  *   RPC 本身立即返回 msgId(输出异步流到,shell execute_reply 到达即该轮完结)
@@ -45,6 +48,8 @@ interface KernelConn {
   ws: WebSocket | null
   /** 重连前保留的最近 parent msg_id(重连后 resume 用;v1 记录不续跑,新一轮重新执行) */
   lastMsgId: string | null
+  /** 本管理器自建的 Jupyter session 绑定(关内核时连带清);接管别人的内核 = 无,不动他人会话 */
+  sessionId: string | null
 }
 
 export class KernelManager {
@@ -52,15 +57,47 @@ export class KernelManager {
 
   constructor(private readonly opts: KernelManagerOpts) {}
 
-  /** 起一个内核 → kernelId。失败抛错(main.ts 分发层捕获回 ok:false)。 */
-  async start(): Promise<string> {
+  /**
+   * 起一个内核 → {kernelId, attached}。失败抛错(main.ts 分发层捕获回 ok:false)。
+   * notebookPath 在场:先查 /api/sessions 找该路径的既有绑定 → 活内核**接管**(attached=true,
+   * 变量状态从电脑侧继承);没有 → 新建内核 + 建绑定(电脑侧开同一本即接同一内核)。
+   */
+  async start(opts: { notebookPath?: string } = {}): Promise<{ kernelId: string; attached: boolean }> {
+    const rel = opts.notebookPath ? opts.notebookPath.replace(/^\/+/, '') : ''
+    if (rel) {
+      const sessions = (await this.fetchJson('GET', '/api/sessions')) as unknown
+      const hit = Array.isArray(sessions)
+        ? (sessions as { path?: string; kernel?: { id?: string } }[]).find(
+            (s) => s.path === rel && s.kernel?.id,
+          )
+        : undefined
+      if (hit?.kernel?.id) {
+        this.kernels.set(hit.kernel.id, { id: hit.kernel.id, ws: null, lastMsgId: null, sessionId: null })
+        return { kernelId: hit.kernel.id, attached: true }
+      }
+    }
     const res = await this.fetchJson('POST', '/api/kernels', {
       name: this.opts.kernelName ?? 'python3',
     })
     const id = (res as { id?: string }).id
     if (!id) throw new Error('Jupyter 未返回 kernel id')
-    this.kernels.set(id, { id, ws: null, lastMsgId: null })
-    return id
+    this.kernels.set(id, { id, ws: null, lastMsgId: null, sessionId: null })
+    if (rel) {
+      // 绑定 kernel↔notebook 路径:电脑 JupyterLab 打开同一本 = 接同一个内核(跨端共享状态)。
+      // 失败不阻断(内核可用,只是电脑侧无关联显示)。
+      try {
+        const sess = (await this.fetchJson('POST', '/api/sessions', {
+          type: 'notebook',
+          name: rel,
+          path: rel,
+          kernel: { id },
+        })) as { id?: string }
+        this.kernels.get(id)!.sessionId = sess.id ?? null
+      } catch {
+        /* 绑定失败静默 */
+      }
+    }
+    return { kernelId: id, attached: false }
   }
 
   /**
@@ -84,7 +121,7 @@ export class KernelManager {
     await this.fetchJson('POST', `/api/kernels/${kernelId}/interrupt`, {})
   }
 
-  /** 关内核 + 断 WS(幂等)。 */
+  /** 关内核 + 断 WS(幂等);自建的 session 绑定连带清,接管的他人会话不动。 */
   async shutdown(kernelId: string): Promise<void> {
     const conn = this.kernels.get(kernelId)
     if (!conn) return
@@ -93,6 +130,13 @@ export class KernelManager {
       conn.ws?.close()
     } catch {
       /* 已断 */
+    }
+    if (conn.sessionId) {
+      try {
+        await this.fetchJson('DELETE', `/api/sessions/${conn.sessionId}`)
+      } catch {
+        /* 会话已被 Jupyter 清(内核死连带)→ 静默 */
+      }
     }
     await this.fetchJson('DELETE', `/api/kernels/${kernelId}`)
     this.opts.push({ kind: 'kernelStatus', kernelId, msgId: '', phase: 'dead' })
