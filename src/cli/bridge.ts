@@ -43,6 +43,8 @@ export interface RpcRequest {
   sid?: string // butlerStart/butlerStop:管家 sid(butlerStop 指定杀哪个 cc)
   uploadId?: string // 分段上传会话 id(uploads.ts)
   totalSize?: number // uploadBegin:声明的总字节数
+  kernelId?: string // kernelExecute/Interrupt/Shutdown:内核 id(kernels.ts)
+  code?: string // kernelExecute:要执行的代码
 }
 
 /** ce 回的 RPC 响应(明文 JSON,加密前)。 */

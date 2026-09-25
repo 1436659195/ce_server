@@ -23,6 +23,7 @@ import { detectServers, isAlive, toLoopback, resolveOsRoot } from './jupyter-det
 import { launchJupyter } from './jupyter-launch'
 import { makeJupyterClient, handleRpc, listTerminalsRetry, toRemoteTerminals, type RpcRequest, type RpcResponse } from './bridge'
 import { runPreflight, type PreflightItem } from './preflight'
+import { KernelManager } from './kernels'
 import { UploadSessions } from './uploads'
 import { ButlerManager } from './butler'
 import { AgentRunner } from './agent-runner'
@@ -556,6 +557,13 @@ async function main(): Promise<void> {
       sendFrame({ type: FrameType.AgentEvent, sid, targetPhoneId: phoneId, payload: seal(info.sharedKey, plaintext) })
     }
   }
+  // Jupyter Kernel 桥(jupyter-ide 插件 ce 侧,2026-09-25):起停/执行走 REST+channels WS,
+  // 输出/状态/reply 事件复用 AgentEvent 帧广播(载荷 {kind:'kernel…',kernelId},手机按 kernelId demux)。
+  const kernelManager = new KernelManager({
+    baseUrl,
+    token,
+    push: (e) => broadcastAgentEvent(enc.encode(JSON.stringify(e))),
+  })
   const approvals = new ApprovalDispatcher({
     // 审批请求 → 包成 AgentEvent 广播(PreToolUse 事件 = 手机审批卡数据源:tool+input 即够渲染)。
     onPending: (req) =>
@@ -1290,6 +1298,34 @@ async function main(): Promise<void> {
                   )
                 },
               )
+            }
+          } else if (req.op === 'kernelStart') {
+            // Jupyter 内核起停/执行(jupyter-ide 插件,2026-09-25):REST 控制面;输出走
+            // AgentEvent 推流(载荷 {kind:'kernel…',kernelId}),RPC 只回启动结果。
+            try {
+              resp = { ok: true, data: { kernelId: await kernelManager.start() } }
+            } catch (e) {
+              resp = { ok: false, error: (e as Error).message }
+            }
+          } else if (req.op === 'kernelExecute' && req.kernelId && typeof req.code === 'string') {
+            try {
+              resp = { ok: true, data: { msgId: await kernelManager.execute(req.kernelId, req.code) } }
+            } catch (e) {
+              resp = { ok: false, error: (e as Error).message }
+            }
+          } else if (req.op === 'kernelInterrupt' && req.kernelId) {
+            try {
+              await kernelManager.interrupt(req.kernelId)
+              resp = { ok: true }
+            } catch (e) {
+              resp = { ok: false, error: (e as Error).message }
+            }
+          } else if (req.op === 'kernelShutdown' && req.kernelId) {
+            try {
+              await kernelManager.shutdown(req.kernelId)
+              resp = { ok: true }
+            } catch (e) {
+              resp = { ok: false, error: (e as Error).message }
             }
           } else if (req.op === 'plugin.preflight') {
             // 插件环境检测(2026-09-24 安装门禁):手机装「服务器级插件」前逐项验证 requirements。
