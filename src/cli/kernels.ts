@@ -24,14 +24,24 @@ import { randomUUID } from 'node:crypto'
 export type KernelEvent =
   | { kind: 'kernelOutput'; kernelId: string; msgId: string; output: KernelOutputItem }
   | { kind: 'kernelStatus'; kernelId: string; msgId: string; phase: 'busy' | 'idle' | 'dead' }
-  | { kind: 'kernelReply'; kernelId: string; msgId: string; ok: boolean; error?: string }
+  | {
+      kind: 'kernelReply'
+      kernelId: string
+      msgId: string
+      ok: boolean
+      error?: string
+      /** 内核执行序号(execute_reply.execution_count;In[n] 的 n,跨 cell 全局递增,
+       *  内核重启归 1 —— 手机端据此更新 cell 头部计数)。 */
+      execCount?: number
+    }
 
 /** 单条输出(与手机端 NbOutput 归一形状一致,跨端同构省一层翻译)。 */
 export type KernelOutputItem =
   | { kind: 'stream'; text: string }
   | { kind: 'error'; ename: string; evalue: string; traceback: string }
   | { kind: 'image'; mime: 'image/png' | 'image/jpeg'; base64: string }
-  | { kind: 'text'; text: string }
+  /** execute_result 的文本档(execCount = 内核执行序号,execute_result 也带)。 */
+  | { kind: 'text'; text: string; execCount?: number }
 
 export interface KernelManagerOpts {
   /** Jupyter base(http://loopback:port) */
@@ -199,7 +209,14 @@ export class KernelManager {
     if (item.kind === 'status') {
       this.opts.push({ kind: 'kernelStatus', kernelId: conn.id, msgId: parent, phase: item.phase })
     } else if (item.kind === 'reply') {
-      this.opts.push({ kind: 'kernelReply', kernelId: conn.id, msgId: parent, ok: item.ok, error: item.error })
+      this.opts.push({
+        kind: 'kernelReply',
+        kernelId: conn.id,
+        msgId: parent,
+        ok: item.ok,
+        error: item.error,
+        execCount: item.execCount,
+      })
     } else {
       this.opts.push({ kind: 'kernelOutput', kernelId: conn.id, msgId: parent, output: item })
     }
@@ -251,7 +268,11 @@ type RawMsg = {
 /** iopub/shell 回包 → 归一事件;无关消息(status:starting 等前置)返回 null。 */
 export function normalizeKernelMsg(
   msg: unknown
-): KernelOutputItem | { kind: 'status'; phase: 'busy' | 'idle' | 'dead' } | { kind: 'reply'; ok: boolean; error?: string } | null {
+):
+  | KernelOutputItem
+  | { kind: 'status'; phase: 'busy' | 'idle' | 'dead' }
+  | { kind: 'reply'; ok: boolean; error?: string; execCount?: number }
+  | null {
   const m = msg as RawMsg
   const type = m?.header?.msg_type
   const c = m?.content ?? {}
@@ -268,6 +289,7 @@ export function normalizeKernelMsg(
     case 'display_data':
     case 'execute_result': {
       const data = (c.data ?? {}) as Record<string, unknown>
+      const ec = typeof c.execution_count === 'number' ? c.execution_count : undefined
       if (typeof data['image/png'] === 'string') {
         return { kind: 'image', mime: 'image/png', base64: data['image/png'] }
       }
@@ -275,7 +297,9 @@ export function normalizeKernelMsg(
         return { kind: 'image', mime: 'image/jpeg', base64: data['image/jpeg'] }
       }
       const plain = data['text/plain']
-      if (typeof plain === 'string') return { kind: 'text', text: plain }
+      if (typeof plain === 'string') {
+        return { kind: 'text', text: plain, ...(ec !== undefined ? { execCount: ec } : {}) }
+      }
       return null // 富媒体 v1 不推(与 notebook 查看器同取舍)
     }
     case 'status': {
@@ -291,6 +315,7 @@ export function normalizeKernelMsg(
         kind: 'reply',
         ok,
         ...(ok ? {} : { error: typeof c.ename === 'string' ? `${c.ename}: ${String(c.evalue ?? '')}` : '执行失败' }),
+        ...(typeof c.execution_count === 'number' ? { execCount: c.execution_count } : {}),
       }
     }
     default:
