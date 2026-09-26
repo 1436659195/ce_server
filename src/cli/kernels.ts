@@ -54,6 +54,10 @@ interface KernelConn {
 
 export class KernelManager {
   private readonly kernels = new Map<string, KernelConn>()
+  /** 在途 WS 连接(kernelId → Promise):并发 ensureWs 去重 —— 没有它,快速连跑两格时
+   *  第二个 execute 看到 readyState=CONNECTING 又建一条通道,双通道 = 每条消息双收
+   *  (真机「输出部分重复」的根因:首格单份、竞态后全双份)。 */
+  private readonly connecting = new Map<string, Promise<WebSocket>>()
 
   constructor(private readonly opts: KernelManagerOpts) {}
 
@@ -149,8 +153,17 @@ export class KernelManager {
 
   // ─── 内部:WS 懒连接 + 分发 ─────────────────────────────────────────
 
-  private async ensureWs(conn: KernelConn): Promise<WebSocket> {
-    if (conn.ws && conn.ws.readyState === WebSocket.OPEN) return conn.ws
+  private ensureWs(conn: KernelConn): Promise<WebSocket> {
+    if (conn.ws && conn.ws.readyState === WebSocket.OPEN) return Promise.resolve(conn.ws)
+    const inflight = this.connecting.get(conn.id)
+    if (inflight) return inflight // 并发请求共享同一条在途连接,不建第二条
+    const p = this.openWs(conn).finally(() => this.connecting.delete(conn.id))
+    this.connecting.set(conn.id, p)
+    return p
+  }
+
+  /** 真建一条 channels WS(连接 → 挂监听 → 记入 conn.ws)。 */
+  private async openWs(conn: KernelConn): Promise<WebSocket> {
     const wsBase = this.opts.baseUrl.replace(/^http/, 'ws')
     const ws = new WebSocket(`${wsBase}/api/kernels/${conn.id}/channels?token=${encodeURIComponent(this.opts.token)}`)
     await new Promise<void>((resolve, reject) => {

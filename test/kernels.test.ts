@@ -77,6 +77,57 @@ describe('normalizeKernelMsg 分档', () => {
   })
 })
 
+// ─── 并发建连去重(「输出部分重复」回归锁)────────────────────────────────────
+describe('ensureWs 并发去重(双通道 = 输出重复的根因)', () => {
+  /** 假 WebSocket:readyState=CONNECTING,open 由定时器异步触发 —— 复刻真竞态窗口。 */
+  class FakeWS {
+    static created = 0
+    static readonly CONNECTING = 0 // 源码用 WebSocket.OPEN/CONNECTING 常量判态,假件必须有
+    static readonly OPEN = 1
+    readyState = 0 // CONNECTING
+    listeners = new Map<string, (() => void)[]>()
+    constructor() {
+      FakeWS.created += 1
+      setTimeout(() => {
+        this.readyState = 1 // OPEN
+        ;(this.listeners.get('open') ?? []).forEach((f) => f())
+      }, 20)
+    }
+    addEventListener(type: string, f: () => void): void {
+      ;(this.listeners.get(type) ?? this.listeners.set(type, []).get(type)!).push(f)
+    }
+    send(): void {}
+    close(): void {}
+  }
+
+  test('两格快速连跑(并发 execute)只建一条通道', async () => {
+    FakeWS.created = 0
+    const realWS = globalThis.WebSocket
+    globalThis.WebSocket = FakeWS as unknown as typeof WebSocket
+    try {
+      const { KernelManager } = await import('../src/cli/kernels')
+      const km = new KernelManager({ baseUrl: 'http://x', token: 't', push: () => {} })
+      // 注入一个已存在的内核(绕过 start 的网络调用)
+      ;(km as unknown as { kernels: Map<string, unknown> }).kernels.set('kk', {
+        id: 'kk',
+        ws: null,
+        lastMsgId: null,
+        sessionId: null,
+      })
+      // 并发两笔 execute(复刻:第一笔还在建通道,第二笔已到)
+      const [a, b] = await Promise.all([km.execute('kk', 'x=1'), km.execute('kk', 'y=2')])
+      expect(a).toBeTruthy()
+      expect(b).toBeTruthy()
+      expect(FakeWS.created).toBe(1) // 只建了一条 —— 双通道即输出重复
+      // 再跑第三笔:复用已开通道,仍是一条
+      await km.execute('kk', 'z=3')
+      expect(FakeWS.created).toBe(1)
+    } finally {
+      globalThis.WebSocket = realWS
+    }
+  })
+})
+
 // ─── live 冒烟(默认跳过;CE_KERNEL_LIVE=1 bun test test/kernels.test.ts)────
 describe.skipIf(!process.env.CE_KERNEL_LIVE)('KernelManager live 冒烟(本机真 Jupyter)', () => {
   const NB_PATH = 'Qlib/test.ipynb' // 真实存在的 notebook(会话绑定要求路径在盘)
