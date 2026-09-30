@@ -12,14 +12,27 @@
  * 设计参考 Happy Coder 的 session-protocol 事件集,取最小完备子集 + 审批。
  */
 
-/** 工具调用生命周期:start(assistant tool_use)→ [approval-request] → end(user tool_result)。callId 贯穿。 */
+/** 工具调用生命周期:start(assistant tool_use)→ [approval-request] → end(user tool_result)。callId 贯穿。
+ *  2026-10-01 加菜(向后兼容:未知 kind 老手机忽略):
+ *   - text-delta / thinking-delta:流式增量(includePartialMessages;子代理的带 parentCallId)。
+ *   - session-init:模型名 + SDK 会话 id(system/init 提炼)。
+ *   - turn-end.usage:token 用量 / 成本 / numTurns(SDK result 提炼)。
+ *   - 全事件:子代理消息带 parentCallId(此前漏打,子代理输出平铺进主对话)。 */
 export type AgentEvent =
   | { kind: 'turn-start' }
-  | { kind: 'turn-end'; status: 'completed' | 'failed'; durationMs?: number }
-  | { kind: 'text'; text: string }
-  | { kind: 'thinking'; text: string }
-  | { kind: 'tool-call-start'; callId: string; tool: string; input: Record<string, unknown> }
-  | { kind: 'tool-call-end'; callId: string; result?: unknown; isError?: boolean }
+  | {
+      kind: 'turn-end';
+      status: 'completed' | 'failed';
+      durationMs?: number;
+      usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number; numTurns?: number };
+    }
+  | { kind: 'text'; text: string; parentCallId?: string }
+  | { kind: 'thinking'; text: string; parentCallId?: string }
+  | { kind: 'text-delta'; text: string; parentCallId?: string }
+  | { kind: 'thinking-delta'; text: string; parentCallId?: string }
+  | { kind: 'session-init'; model: string; sessionId?: string }
+  | { kind: 'tool-call-start'; callId: string; tool: string; input: Record<string, unknown>; parentCallId?: string }
+  | { kind: 'tool-call-end'; callId: string; result?: unknown; isError?: boolean; parentCallId?: string }
   | { kind: 'approval-request'; reqId: string; callId: string; tool: string; input: Record<string, unknown> }
   | { kind: 'approval-resolved'; reqId: string; resolved: 'approved' | 'denied' }
   | { kind: string; [k: string]: unknown };

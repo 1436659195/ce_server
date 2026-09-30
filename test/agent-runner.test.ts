@@ -93,10 +93,91 @@ describe('mapSdkMessageToEvents', () => {
     expect((out[0] as { status: string }).status).toBe('failed')
   })
 
-  it('system.init / status / 未知类型 → 忽略(噪声不转发)', () => {
-    expect(mapSdkMessageToEvents(msg({ type: 'system', subtype: 'init', tools: [] }))).toEqual([])
+  it('system.init → session-init(model/sessionId 提炼);status / api_retry / 未知 → 忽略', () => {
+    expect(
+      mapSdkMessageToEvents(msg({ type: 'system', subtype: 'init', model: 'claude-sonnet-4-5', session_id: 's-1', tools: [] })),
+    ).toEqual([{ kind: 'session-init', model: 'claude-sonnet-4-5', sessionId: 's-1' }])
+    expect(mapSdkMessageToEvents(msg({ type: 'system', subtype: 'other' }))).toEqual([])
     expect(mapSdkMessageToEvents(msg({ type: 'status', subtype: 'whatever' }))).toEqual([])
     expect(mapSdkMessageToEvents(msg({ type: 'api_retry' }))).toEqual([])
+  })
+
+  it('stream_event 的 text_delta / thinking_delta → text-delta / thinking-delta;其余增量忽略', () => {
+    const out = mapSdkMessageToEvents(
+      msg({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '你' } },
+        parent_tool_use_id: null,
+      }),
+    )
+    expect(out).toEqual([{ kind: 'text-delta', text: '你' }])
+    const th = mapSdkMessageToEvents(
+      msg({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: '想' } },
+        parent_tool_use_id: null,
+      }),
+    )
+    expect(th).toEqual([{ kind: 'thinking-delta', text: '想' }])
+    // input_json_delta / signature_delta(工具入参与签名)是噪声
+    expect(
+      mapSdkMessageToEvents(
+        msg({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{}' } } }),
+      ),
+    ).toEqual([])
+  })
+
+  it('子代理消息(parent_tool_use_id)→ 全事件带 parentCallId(不再平铺进主对话)', () => {
+    const sub = { parent_tool_use_id: 'toolu_parent' }
+    expect(
+      mapSdkMessageToEvents(
+        msg({ ...sub, type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '子代理说' }] } }),
+      ),
+    ).toEqual([{ kind: 'text', text: '子代理说', parentCallId: 'toolu_parent' }])
+    expect(
+      mapSdkMessageToEvents(
+        msg({
+          ...sub,
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'tool_use', id: 't9', name: 'Read', input: {} }] },
+        }),
+      ),
+    ).toEqual([{ kind: 'tool-call-start', callId: 't9', tool: 'Read', input: {}, parentCallId: 'toolu_parent' }])
+    expect(
+      mapSdkMessageToEvents(
+        msg({
+          ...sub,
+          type: 'user',
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't9', content: 'ok' }] },
+        }),
+      ),
+    ).toEqual([{ kind: 'tool-call-end', callId: 't9', result: 'ok', isError: false, parentCallId: 'toolu_parent' }])
+    expect(
+      mapSdkMessageToEvents(
+        msg({ ...sub, type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '流' } } }),
+      ),
+    ).toEqual([{ kind: 'text-delta', text: '流', parentCallId: 'toolu_parent' }])
+  })
+
+  it('result 带 usage/成本/numTurns → turn-end.usage(手机状态条展示)', () => {
+    const out = mapSdkMessageToEvents(
+      msg({
+        type: 'result',
+        subtype: 'success',
+        duration_ms: 8000,
+        num_turns: 3,
+        total_cost_usd: 0.0123,
+        usage: { input_tokens: 1200, output_tokens: 560 },
+      }),
+    )
+    expect(out).toEqual([
+      {
+        kind: 'turn-end',
+        status: 'completed',
+        durationMs: 8000,
+        usage: { inputTokens: 1200, outputTokens: 560, costUsd: 0.0123, numTurns: 3 },
+      },
+    ])
   })
 
   it('assistant 无 content / 非数组 → 空数组(防御,不抛)', () => {
@@ -248,5 +329,75 @@ describe('AgentRunner.claudeBin=null', () => {
     expect((events[1] as { status: string }).status).toBe('failed')
     expect(queryCalled).toBe(false) // 绝不裸 spawn
     expect(runner.sids()).toEqual([]) // proc 已收尾
+  })
+})
+
+// ── AgentRunner.interrupt(2026-10-01 加菜,手机「停止」按钮)──────────────────
+describe('AgentRunner.interrupt', () => {
+  it('query 已起 → 调 conversation.interrupt() 并返回 true;会话未起/未知 sid → false', async () => {
+    let interrupted = 0
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const fakeQuery = (params: { prompt: AsyncIterable<SDKMessage> }) => {
+      const obj: AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> } = {
+        async *[Symbol.asyncIterator]() {
+          const it = params.prompt[Symbol.asyncIterator]()
+          const first = await it.next() // 首条用户消息(启动触发)
+          if (!first.done) yield first.value
+          await gate // 挂住:模拟回合进行中,interrupt 之后放行收尾
+          yield { type: 'result', subtype: 'success', duration_ms: 1 } as unknown as SDKMessage
+        },
+        interrupt: () => {
+          interrupted++
+          return Promise.resolve(undefined)
+        },
+      }
+      return obj
+    }
+    const runner = new AgentRunner({ onEvent: () => {}, onExit: () => {}, claudeBin: '/x', cwd: '/tmp', query: fakeQuery as any })
+    const sid = runner.start('phoneA', '/')
+    expect(runner.interrupt(sid)).toBe(false) // 会话未起(懒启动)→ false
+    runner.writeStdin(sid, '跑个长任务')
+    await new Promise((r) => setTimeout(r, 10)) // 让 query 迭代走到 gate
+    expect(runner.interrupt(sid)).toBe(true)
+    expect(interrupted).toBe(1)
+    release()
+    expect(runner.interrupt('cc-nope')).toBe(false) // 未知 sid
+  })
+
+  it('interrupt 后回合以 interrupted result 收尾 → turn-end(failed);agent 不被杀(可继续下一轮)', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const events: AgentEvent[] = []
+    const fakeQuery = (params: { prompt: AsyncIterable<SDKMessage> }) => {
+      const obj: AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> } = {
+        async *[Symbol.asyncIterator]() {
+          const it = params.prompt[Symbol.asyncIterator]()
+          const first = await it.next()
+          if (!first.done) yield first.value
+          await gate
+          yield { type: 'result', subtype: 'error_during_execution', duration_ms: 2 } as unknown as SDKMessage
+        },
+        interrupt: () => Promise.resolve(undefined),
+      }
+      return obj
+    }
+    let exitCode: number | null | undefined
+    const runner = new AgentRunner({
+      onEvent: (_o, _s, ev) => events.push(ev as AgentEvent),
+      onExit: (_sid, _o, code) => (exitCode = code),
+      claudeBin: '/x',
+      cwd: '/tmp',
+      query: fakeQuery as any,
+    })
+    const sid = runner.start('phoneA', '/')
+    runner.writeStdin(sid, '干')
+    await new Promise((r) => setTimeout(r, 10))
+    runner.interrupt(sid)
+    release()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(events.map((e) => e.kind)).toEqual(['turn-end'])
+    expect((events[0] as { status: string }).status).toBe('failed')
+    expect(exitCode).toBe(0) // 正常收尾(流结束),非崩溃
   })
 })

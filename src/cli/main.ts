@@ -1256,6 +1256,11 @@ async function main(): Promise<void> {
             const allow = (req as { decision?: 'allow' | 'deny' }).decision === 'allow'
             const hit = agentRunner.resolveApproval(reqId, allow) || approvals.resolve(reqId, allow ? 'allow' : 'deny')
             resp = { ok: true, data: { resolved: hit } }
+          } else if (req.op === 'agentInterrupt' && (req as { sid?: string }).sid) {
+            // 中断 agent 当前回合(2026-10-01 加菜,手机「停止」按钮):sid = agent sid(cc-*)。
+            // false = 会话未起 / 老版 SDK 无 interrupt → ok:false,手机侧提示降级。
+            const hit = agentRunner.interrupt((req as { sid: string }).sid)
+            resp = hit ? { ok: true, data: { interrupted: true } } : { ok: false, error: '当前没有在跑的任务' }
           } else if (req.op === 'exec') {
             // 通用 exec(被控机跑一条命令,无 shell、捕 stdout/stderr/exitCode)。
             // 无 shell(execFile)→ args 无法链式起别的程序,手机侧程序名白名单是唯一闸门。

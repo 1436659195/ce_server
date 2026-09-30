@@ -52,20 +52,38 @@ class InputQueue {
 }
 
 /** SDKMessage → AgentEvent[] 纯映射(易测;runner 的核心 = 「口子」的翻译逻辑)。
- *  只关心 assistant(text/thinking/tool_use)/ user(tool_result)/ result;system/status/噪声忽略。 */
+ *  关心 assistant(text/thinking/tool_use)/ user(tool_result)/ result / stream_event(流式增量,
+ *  2026-10-01 加菜)/ system.init(模型名/会话 id);status/api_retry/hook_* 等噪声忽略。 */
 export function mapSdkMessageToEvents(msg: SDKMessage): AgentEvent[] {
   const type = (msg as { type?: string }).type
   const out: AgentEvent[] = []
   if (type === 'assistant') {
     const content = (msg as { message?: { content?: Array<{ type: string; text?: string; thinking?: string; id?: string; name?: string; input?: Record<string, unknown> }> } }).message?.content
     if (!Array.isArray(content)) return out
+    // 子代理(Tool 派生)的 assistant 消息带 parent_tool_use_id → 打 parentCallId,
+    // 手机归进父 Task 卡的 children(2026-10-01 修正:此前漏打 → 子代理输出平铺进主对话,串台)。
+    const raw = msg as unknown as Record<string, unknown>
     for (const b of content) {
-      if (b.type === 'text' && typeof b.text === 'string') out.push({ kind: 'text', text: b.text })
-      else if (b.type === 'thinking' && typeof b.thinking === 'string') out.push({ kind: 'thinking', text: b.thinking })
+      if (b.type === 'text' && typeof b.text === 'string') out.push(maybeChild(raw, { kind: 'text', text: b.text }))
+      else if (b.type === 'thinking' && typeof b.thinking === 'string') out.push(maybeChild(raw, { kind: 'thinking', text: b.thinking }))
       else if (b.type === 'tool_use' && typeof b.id === 'string' && typeof b.name === 'string') {
-        out.push({ kind: 'tool-call-start', callId: b.id, tool: b.name, input: b.input ?? {} })
+        out.push(maybeChild(raw, { kind: 'tool-call-start', callId: b.id, tool: b.name, input: b.input ?? {} }))
       }
       // redacted_thinking / 未知块 → 忽略
+    }
+    return out
+  }
+  if (type === 'stream_event') {
+    // 流式增量(includePartialMessages,2026-10-01 加菜):只转发文本/思考 delta,
+    // input_json_delta(工具入参增量)/ 签名等噪声忽略 —— 手机要的是「打字机」,不是原始流。
+    // 子代理的流带 parent_tool_use_id → 照顶层事件一样打 parentCallId(手机归到父工具卡 children)。
+    const ev = (msg as { event?: { type?: string; delta?: { type?: string; text?: string; thinking?: string } } }).event
+    const delta = ev?.delta
+    if (ev?.type !== 'content_block_delta' || !delta) return out
+    if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+      out.push(maybeChild(msg as unknown as Record<string, unknown>, { kind: 'text-delta', text: delta.text }))
+    } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+      out.push(maybeChild(msg as unknown as Record<string, unknown>, { kind: 'thinking-delta', text: delta.thinking }))
     }
     return out
   }
@@ -74,20 +92,55 @@ export function mapSdkMessageToEvents(msg: SDKMessage): AgentEvent[] {
     if (!Array.isArray(content)) return out
     for (const b of content) {
       if (b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
-        out.push({ kind: 'tool-call-end', callId: b.tool_use_id, result: b.content, isError: b.is_error === true })
+        out.push(maybeChild(msg as unknown as Record<string, unknown>, { kind: 'tool-call-end', callId: b.tool_use_id, result: b.content, isError: b.is_error === true }))
       }
       // user 的 text 块 = 手机已发的用户消息回显 → 忽略(手机本地已显,免重复)
     }
     return out
   }
-  if (type === 'result') {
-    const subtype = (msg as { subtype?: string }).subtype
-    const durationMs = (msg as { duration_ms?: number }).duration_ms
-    out.push({ kind: 'turn-end', status: subtype === 'success' ? 'completed' : 'failed', durationMs })
+  if (type === 'system' && (msg as { subtype?: string }).subtype === 'init') {
+    // 会话元信息(2026-10-01 加菜):模型名 + SDK 会话 id,手机状态条/空态展示用。其余字段不需要。
+    const m = msg as { model?: unknown; session_id?: unknown }
+    if (typeof m.model === 'string') {
+      out.push({ kind: 'session-init', model: m.model, sessionId: typeof m.session_id === 'string' ? m.session_id : undefined })
+    }
     return out
   }
-  // system.init / status / api_retry / partial / hook_* / … → 噪声,忽略(不转发,免撑爆手机)
+  if (type === 'result') {
+    const r = msg as {
+      subtype?: string
+      duration_ms?: number
+      num_turns?: number
+      total_cost_usd?: number
+      usage?: { input_tokens?: number; output_tokens?: number }
+    }
+    // 用量/成本(2026-10-01 加菜):手机状态条「这轮 12s · ↑1.2K ↓5.6K」展示;老手机忽略多余字段。
+    const usage =
+      r.usage && (typeof r.usage.input_tokens === 'number' || typeof r.usage.output_tokens === 'number')
+        ? {
+            inputTokens: r.usage.input_tokens,
+            outputTokens: r.usage.output_tokens,
+            costUsd: typeof r.total_cost_usd === 'number' ? r.total_cost_usd : undefined,
+            numTurns: typeof r.num_turns === 'number' ? r.num_turns : undefined,
+          }
+        : undefined
+    out.push({
+      kind: 'turn-end',
+      status: r.subtype === 'success' ? 'completed' : 'failed',
+      durationMs: r.duration_ms,
+      ...(usage ? { usage } : {}),
+    })
+    return out
+  }
+  // status / api_retry / hook_* / … → 噪声,忽略(不转发,免撑爆手机)
   return out
+}
+
+/** stream_event / user 消息若带 parent_tool_use_id(子代理)→ 打上 parentCallId;顶层 → 原样。 */
+function maybeChild(msg: Record<string, unknown>, ev: AgentEvent): AgentEvent {
+  const p = msg.parent_tool_use_id
+  if (typeof p === 'string' && p) return { ...ev, parentCallId: p } as AgentEvent
+  return ev
 }
 
 interface Approval {
@@ -106,6 +159,8 @@ interface AgentProc {
   approvals: Map<string, Approval>
   started: boolean
   stopping: boolean
+  /** SDK query 句柄(2026-10-01 加菜:interrupt 用;runConversation 起来后赋值)。 */
+  conversation: (AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> }) | null
 }
 
 export interface AgentRunnerOpts {
@@ -135,7 +190,7 @@ export class AgentRunner {
   start(owner: string, rel?: string): string {
     const sid = `cc-${randomBytes(4).toString('hex')}`
     const cwd = rel ? path.resolve(this.opts.cwd, rel) : this.opts.cwd
-    this.procs.set(sid, { sid, owner, cwd, queue: new InputQueue(), approvals: new Map(), started: false, stopping: false })
+    this.procs.set(sid, { sid, owner, cwd, queue: new InputQueue(), approvals: new Map(), started: false, stopping: false, conversation: null })
     console.log(`[ce:agent-runner] 新建 agent sid=${sid} (owner=${owner}, cwd=${cwd}, claude=${this.opts.claudeBin})`)
     return sid
   }
@@ -186,9 +241,11 @@ export class AgentRunner {
         cwd: proc.cwd,
         pathToClaudeCodeExecutable: this.opts.claudeBin,
         includeHookEvents: false, // 不转发 hook 噪声(我们直接映射 SDKMessage)
+        includePartialMessages: true, // 流式增量(2026-10-01 加菜):stream_event → text/thinking delta → 手机打字机
         canUseTool: async (toolName, input, options) => this.canUseTool(proc, toolName, input, options),
       } as Options,
     })
+    proc.conversation = conversation as AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> }
     try {
       for await (const msg of conversation) {
         if (proc.stopping) break
@@ -275,6 +332,19 @@ export class AgentRunner {
   stop(sid: string): void {
     const proc = this.procs.get(sid)
     if (proc) this.finish(proc, null)
+  }
+
+  /** 中断当前回合(2026-10-01 加菜,手机「停止」按钮):SDK query.interrupt() ——
+   *  生成/工具停在最近边界,SDK 以 interrupted result 收尾本回合 → 手机收 turn-end(failed)。
+   *  不杀 agent 本体(queue 不断,下一条用户消息照常起新回合)。返回是否真发了中断。
+   *  老版本 SDK query 无 interrupt 方法 / 会话未起 → false(手机提示「当前没有在跑的任务」)。 */
+  interrupt(sid: string): boolean {
+    const proc = this.procs.get(sid)
+    const fn = proc?.conversation?.interrupt
+    if (!proc || typeof fn !== 'function') return false
+    console.log(`[ce:agent-runner] ${proc.sid} interrupt(手机请求中断当前回合)`)
+    void fn.call(proc.conversation).catch((e) => console.warn(`[ce:agent-runner] ${proc.sid} interrupt 异常:`, (e as Error).message))
+    return true
   }
   stopAllForPhone(phoneId: string): void {
     for (const p of [...this.procs.values()]) if (p.owner === phoneId) this.stop(p.sid)
