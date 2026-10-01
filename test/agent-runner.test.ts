@@ -332,6 +332,60 @@ describe('AgentRunner.claudeBin=null', () => {
   })
 })
 
+// ── setMode 权限模式(2026-10-01 加菜,对齐 TUI 四档;Happy 同道)──
+describe('AgentRunner.setMode', () => {
+  function makeRunnerWithCanUseTool(capture: (tool: string) => void) {
+    const events: AgentEvent[] = []
+    const fakeQuery = (params: { prompt: AsyncIterable<SDKMessage>; options: { canUseTool: (t: string, i: Record<string, unknown>, o: { toolUseID?: string }) => Promise<unknown> } }) => {
+      const obj = {
+        async *[Symbol.asyncIterator]() {
+          const it = params.prompt[Symbol.asyncIterator]()
+          await it.next()
+          // 会话里连跑两个工具:Write(改文件)→ canUseTool
+          capture('write')
+          await params.options.canUseTool('Write', { file_path: '/a' }, { toolUseID: 'c1' })
+          yield { type: 'result', subtype: 'success' } as unknown as SDKMessage
+        },
+      }
+      return obj as never
+    }
+    const runner = new AgentRunner({ onEvent: (_o, _s, ev) => events.push(ev as AgentEvent), onExit: () => {}, claudeBin: '/x', cwd: '/tmp', query: fakeQuery as never })
+    return { runner, events }
+  }
+
+  it('非法模式 → false;未知 sid → false', () => {
+    const { runner } = makeRunnerWithCanUseTool(() => {})
+    expect(runner.setMode(runner.start('p', '/'), 'yolo')).toBe(false) // 不在合法集
+    expect(runner.setMode('cc-nope', 'default')).toBe(false)
+  })
+
+  it('acceptEdits:canUseTool 对改文件本地放行(不问手机);bypassPermissions:全放', async () => {
+    let asked = 0
+    const { runner, events } = makeRunnerWithCanUseTool(() => {})
+    const sid = runner.start('phoneA', '/')
+    expect(runner.setMode(sid, 'acceptEdits')).toBe(true)
+    runner.writeStdin(sid, '改文件')
+    await new Promise((r) => setTimeout(r, 30))
+    asked = events.filter((e) => (e as { kind: string }).kind === 'approval-request').length
+    expect(asked).toBe(0) // 本地放行,没问手机
+
+    const runner2 = makeRunnerWithCanUseTool(() => {}).runner
+    const sid2 = runner2.start('phoneA', '/')
+    expect(runner2.setMode(sid2, 'bypassPermissions')).toBe(true)
+    runner2.writeStdin(sid2, '全自动')
+    await new Promise((r) => setTimeout(r, 30))
+    void asked
+  })
+
+  it('default 档照常问手机(approval-request 照发)', async () => {
+    const { runner, events } = makeRunnerWithCanUseTool(() => {})
+    const sid = runner.start('phoneA', '/')
+    runner.writeStdin(sid, '改')
+    await new Promise((r) => setTimeout(r, 30))
+    expect(events.some((e) => (e as { kind: string }).kind === 'approval-request')).toBe(true)
+  })
+})
+
 // ── resolveApproval 带 answers(AskUserQuestion 正道回传,Happy 同道)──
 describe('AgentRunner.resolveApproval answers', () => {
   /** 造一个会触发 canUseTool 的假 query:消费首条用户消息 → canUseTool(捕获返回)→ result。 */

@@ -1268,6 +1268,11 @@ async function main(): Promise<void> {
             // false = 会话未起 / 老版 SDK 无 interrupt → ok:false,手机侧提示降级。
             const hit = agentRunner.interrupt((req as { sid: string }).sid)
             resp = hit ? { ok: true, data: { interrupted: true } } : { ok: false, error: '当前没有在跑的任务' }
+          } else if (req.op === 'agentSetMode' && (req as { sid?: string }).sid) {
+            // 切权限模式(2026-10-01 加菜,Happy 同道):default 手动 / acceptEdits 自动改文件 /
+            // bypassPermissions 全自动免审批。手机 UI 三档;ce 本地兜底 + 推 SDK。
+            const hit = agentRunner.setMode((req as { sid: string }).sid, (req as { mode?: string }).mode ?? '')
+            resp = hit ? { ok: true, data: { applied: true } } : { ok: false, error: '会话不存在或模式非法' }
           } else if (req.op === 'exec') {
             // 通用 exec(被控机跑一条命令,无 shell、捕 stdout/stderr/exitCode)。
             // 无 shell(execFile)→ args 无法链式起别的程序,手机侧程序名白名单是唯一闸门。

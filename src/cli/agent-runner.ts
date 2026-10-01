@@ -28,6 +28,10 @@ const RECLAIM_MS = 6 * 60 * 60 * 1000
 /** 读类工具:canUseTool 直接放行(不问手机)。permissionMode='default' 下读类本就不触发 canUseTool,
  *  这里是 belt(防止某些工具意外触达时也无害放行)。 */
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch', 'TodoWrite'])
+/** 改文件工具:acceptEdits 模式下 canUseTool 本地放行(Happy handler 同款 belt;CC 自身也会按模式放)。 */
+const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
+/** 合法权限模式(SDK PermissionMode 的可切子集)。 */
+const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'bypassPermissions', 'plan'])
 
 /** 推入式异步队列:writeStdin push,query 当 AsyncIterable<SDKUserMessage> 消费。永不 end → cc 长驻。 */
 class InputQueue {
@@ -160,7 +164,13 @@ interface AgentProc {
   started: boolean
   stopping: boolean
   /** SDK query 句柄(2026-10-01 加菜:interrupt 用;runConversation 起来后赋值)。 */
-  conversation: (AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> }) | null
+  conversation: (AsyncIterable<SDKMessage> & {
+    interrupt?: () => Promise<unknown>
+    setPermissionMode?: (mode: string) => Promise<void>
+  }) | null
+  /** 权限模式(Happy 同道,2026-10-01 加菜):default 手动 / acceptEdits 自动改文件 /
+   *  bypassPermissions 全自动免审批 / plan 只规划。canUseTool 按它本地兜底 + setPermissionMode 推给 SDK。 */
+  mode: string
 }
 
 export interface AgentRunnerOpts {
@@ -190,7 +200,7 @@ export class AgentRunner {
   start(owner: string, rel?: string): string {
     const sid = `cc-${randomBytes(4).toString('hex')}`
     const cwd = rel ? path.resolve(this.opts.cwd, rel) : this.opts.cwd
-    this.procs.set(sid, { sid, owner, cwd, queue: new InputQueue(), approvals: new Map(), started: false, stopping: false, conversation: null })
+    this.procs.set(sid, { sid, owner, cwd, queue: new InputQueue(), approvals: new Map(), started: false, stopping: false, conversation: null, mode: 'default' })
     console.log(`[ce:agent-runner] 新建 agent sid=${sid} (owner=${owner}, cwd=${cwd}, claude=${this.opts.claudeBin})`)
     return sid
   }
@@ -242,10 +252,23 @@ export class AgentRunner {
         pathToClaudeCodeExecutable: this.opts.claudeBin,
         includeHookEvents: false, // 不转发 hook 噪声(我们直接映射 SDKMessage)
         includePartialMessages: true, // 流式增量(2026-10-01 加菜):stream_event → text/thinking delta → 手机打字机
+        allowDangerouslySkipPermissions: true, // 预埋 bypass 闸(SDK 要求;permissionMode='default' 下无副作用,
+        //   运行时 setMode 切 bypass 才真正生效 —— Happy 同款)
         canUseTool: async (toolName, input, options) => this.canUseTool(proc, toolName, input, options),
       } as Options,
     })
-    proc.conversation = conversation as AsyncIterable<SDKMessage> & { interrupt?: () => Promise<unknown> }
+    proc.conversation = conversation as AsyncIterable<SDKMessage> & {
+      interrupt?: () => Promise<unknown>
+      setPermissionMode?: (mode: string) => Promise<void>
+    }
+    // 会话懒启动前的 setMode 记在 proc.mode;此刻补推给 SDK(手机先切模式再发首条的顺序)
+    if (proc.mode !== 'default') {
+      const fn = proc.conversation.setPermissionMode
+      if (typeof fn === 'function') {
+        void fn.call(proc.conversation, proc.mode).catch((e) =>
+          console.warn(`[ce:agent-runner] ${proc.sid} 初始 setPermissionMode(${proc.mode}) 失败(canUseTool 本地兜底仍在):`, (e as Error).message))
+      }
+    }
     try {
       for await (const msg of conversation) {
         if (proc.stopping) break
@@ -261,8 +284,9 @@ export class AgentRunner {
     }
   }
 
-  /** canUseTool 单门:读类直接放行;其余 → 问手机审批(带 callId)。allow 回灌 updatedInput
-   *  (否则 SDK 以 undefined 调工具 → ZodError,butler 踩过)。 */
+  /** canUseTool 单门:读类直接放行;权限模式兜底(bypass 全放 / acceptEdits 放改文件,Happy handler
+   *  同款 belt —— setPermissionMode 推给 SDK 后 CC 自身多数不再问,这里是双保险);其余 → 问手机审批
+   *  (带 callId)。allow 回灌 updatedInput(否则 SDK 以 undefined 调工具 → ZodError,butler 踩过)。 */
   private async canUseTool(
     proc: AgentProc,
     toolName: string,
@@ -273,8 +297,33 @@ export class AgentRunner {
       console.log(`[ce:agent-runner] ${proc.sid} canUseTool(${toolName}) 读类直接放行`)
       return { behavior: 'allow', updatedInput: input }
     }
+    if (proc.mode === 'bypassPermissions') {
+      console.log(`[ce:agent-runner] ${proc.sid} canUseTool(${toolName}) 全自动模式本地放行`)
+      return { behavior: 'allow', updatedInput: input }
+    }
+    if (proc.mode === 'acceptEdits' && EDIT_TOOLS.has(toolName)) {
+      console.log(`[ce:agent-runner] ${proc.sid} canUseTool(${toolName}) 自动改文件模式本地放行`)
+      return { behavior: 'allow', updatedInput: input }
+    }
     console.log(`[ce:agent-runner] ${proc.sid} canUseTool(${toolName}) → 问手机审批(callId=${options.toolUseID ?? '?'})`)
     return this.requestApproval(proc, toolName, input, options.toolUseID ?? '')
+  }
+
+  /** 切权限模式(Happy 同道,2026-10-01 加菜):记 proc.mode(canUseTool 本地兜底即刻生效)+
+   *  setPermissionMode 推给 SDK(CC 自身停止询问对应类工具)。会话未起 → 只记模式(懒启动时补推)。
+   *  返回 false = sid 不存在 / mode 非法。 */
+  setMode(sid: string, mode: string): boolean {
+    if (!PERMISSION_MODES.has(mode)) return false
+    const proc = this.procs.get(sid)
+    if (!proc) return false
+    proc.mode = mode
+    console.log(`[ce:agent-runner] ${proc.sid} 权限模式 → ${mode}`)
+    const fn = proc.conversation?.setPermissionMode
+    if (typeof fn === 'function') {
+      void fn.call(proc.conversation, mode).catch((e) =>
+        console.warn(`[ce:agent-runner] ${proc.sid} setPermissionMode(${mode}) 失败(canUseTool 本地兜底仍在):`, (e as Error).message))
+    }
+    return true
   }
 
   /** 发 approval-request 问手机,**无超时**等 resolveApproval(用户慢慢批)。
