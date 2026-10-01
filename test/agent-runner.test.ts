@@ -332,6 +332,27 @@ describe('AgentRunner.claudeBin=null', () => {
   })
 })
 
+// ── query 崩溃要通知手机(2026-10-01 修:CC 秒死 → 手机计时器空转)──
+describe('AgentRunner query 崩溃', () => {
+  it('query 抛错 → 手机收到死因 text + turn-end failed(状态条收敛,不再空转)', async () => {
+    const events: AgentEvent[] = []
+    const boom = async function* (): AsyncGenerator<SDKMessage> {
+      // 启动即死(root+bypass 被拒的场景):一条消息都没吐
+      throw new Error('Claude Code process exited with code 1')
+      yield { type: 'result', subtype: 'success' } as unknown as SDKMessage
+    }
+    const runner = new AgentRunner({ onEvent: (_o, _s, ev) => events.push(ev as AgentEvent), onExit: () => {}, claudeBin: '/x', cwd: '/tmp', query: boom as never })
+    const sid = runner.start('phoneA', '/')
+    runner.writeStdin(sid, 'hi')
+    await new Promise((r) => setTimeout(r, 20))
+    const kinds = events.map((e) => e.kind)
+    expect(kinds).toEqual(['text', 'turn-end'])
+    expect((events[0] as { text: string }).text).toContain('CC 进程异常退出')
+    expect((events[0] as { text: string }).text).toContain('exited with code 1')
+    expect((events[1] as { status: string }).status).toBe('failed')
+  })
+})
+
 // ── setMode 权限模式(2026-10-01 加菜,对齐 TUI 四档;Happy 同道)──
 describe('AgentRunner.setMode', () => {
   function makeRunnerWithCanUseTool(capture: (tool: string) => void) {

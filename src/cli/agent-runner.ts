@@ -254,6 +254,13 @@ export class AgentRunner {
         includePartialMessages: true, // 流式增量(2026-10-01 加菜):stream_event → text/thinking delta → 手机打字机
         allowDangerouslySkipPermissions: true, // 预埋 bypass 闸(SDK 要求;permissionMode='default' 下无副作用,
         //   运行时 setMode 切 bypass 才真正生效 —— Happy 同款)
+        env: {
+          ...process.env,
+          // root + bypass 的官方口子:CC 对「root/sudo + --dangerously-skip-permissions」默认拒绝
+          // (exit 1,治 2026-10-01「切绕过权限后会话秒死」);IS_SANDBOX=1 = 声明「由宿主接管安全」。
+          // 采纳理由:被控机是用户自己的开发机,ce 只在用户手机端显式切「绕过权限」(红标警示)时才走 bypass。
+          IS_SANDBOX: '1',
+        },
         canUseTool: async (toolName, input, options) => this.canUseTool(proc, toolName, input, options),
       } as Options,
     })
@@ -280,6 +287,13 @@ export class AgentRunner {
       this.finish(proc, 0)
     } catch (e) {
       console.error(`[ce:agent-runner] ${proc.sid} query/遍历抛错:`, (e as Error).message)
+      // 死因要上手机(2026-10-01 修:CC 进程秒死时手机没收到任何事件 → 状态条计时器空转一小时,
+      // 用户对着「推敲中…」干等)。text 说明死因 + turn-end failed 收敛状态条。
+      this.opts.onEvent(proc.owner, proc.sid, {
+        kind: 'text',
+        text: `[ce] CC 进程异常退出:${(e as Error).message}`,
+      })
+      this.opts.onEvent(proc.owner, proc.sid, { kind: 'turn-end', status: 'failed', durationMs: 0 })
       this.finish(proc, -2)
     }
   }
