@@ -442,11 +442,13 @@ describe('AgentRunner.supportedModels', () => {
 
 // ── setThinking / setModel(2026-10-01 加菜,思考强度 + 模型热切)──
 describe('AgentRunner.setThinking / setModel', () => {
-  it('setThinking:合法档过/非法档拒;档记录在 proc(懒启动补推由 runConversation 走)', () => {
+  it('setThinking:官方档过/非法档拒;deep(老手机档)兼容映射为 xhigh', () => {
     const runner = new AgentRunner({ onEvent: () => {}, onExit: () => {}, claudeBin: '/x', cwd: '/tmp' })
     const sid = runner.start('p', '/')
     expect(runner.setThinking(sid, 'off')).toBe(true)
-    expect(runner.setThinking(sid, 'deep')).toBe(true)
+    expect(runner.setThinking(sid, 'medium')).toBe(true)
+    expect(runner.setThinking(sid, 'max')).toBe(true)
+    expect(runner.setThinking(sid, 'deep')).toBe(true) // v75 老档 → xhigh
     expect(runner.setThinking(sid, 'ultra')).toBe(false) // 非法档
     expect(runner.setThinking('cc-nope', 'low')).toBe(false)
   })

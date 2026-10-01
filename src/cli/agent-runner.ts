@@ -32,10 +32,27 @@ const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch
 const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 /** 合法权限模式(SDK PermissionMode 的可切子集)。 */
 const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'bypassPermissions', 'plan'])
-/** 思考强度档 → maxThinkingTokens 预算(2026-10-01 加菜;运行时 setMaxThinkingTokens 热调)。
- *  注意:自适应思考模型(Opus 4.6+/Sonnet 4.6+)上 SDK 退化为 开/关(0=关,其他=自适应),
- *  老模型是真预算 —— 两态生效是常态,档位保留以兼容。 */
-const THINKING_BUDGET: Record<string, number | null> = { off: 0, low: 4096, default: null, deep: 32768 }
+/** 思考强度:官方 effort 档(applyFlagSettings 热切,2026-10-01 晚升级,替换 setMaxThinkingTokens 预算代餐)。
+ *  v75 老手机档 → 官方档兼容映射(default = 清除覆盖回默认;deep ≈ xhigh)。 */
+const THINKING_LEVELS = new Set(['off', 'default', 'low', 'medium', 'high', 'xhigh', 'max'])
+const THINKING_COMPAT: Record<string, string> = { deep: 'xhigh' }
+
+/** 官方思考档热切(applyFlagSettings,2026-10-01 晚):off = alwaysThinkingEnabled:false;
+ *  其余 = 开思考 + effortLevel('default' 传 null 清除覆盖,回模型默认;档位集含 max ——
+ *  settings 类型只列 4 档,运行时由 CC 静默降级处理)。失败只 warn,不影响对话主链路。 */
+function applyThinking(proc: AgentProc, level: string): void {
+  const fn = proc.conversation?.applyFlagSettings
+  if (typeof fn !== 'function') return
+  const settings: Record<string, unknown> =
+    level === 'off'
+      ? { alwaysThinkingEnabled: false }
+      : level === 'default'
+        ? { alwaysThinkingEnabled: true, effortLevel: null }
+        : { alwaysThinkingEnabled: true, effortLevel: level }
+  void fn
+    .call(proc.conversation, settings)
+    .catch((e) => console.warn(`[ce:agent-runner] ${proc.sid} applyFlagSettings(思考 ${level}) 失败:`, (e as Error).message))
+}
 
 /** 推入式异步队列:writeStdin push,query 当 AsyncIterable<SDKUserMessage> 消费。永不 end → cc 长驻。 */
 class InputQueue {
@@ -171,19 +188,30 @@ interface AgentProc {
   conversation: (AsyncIterable<SDKMessage> & {
     interrupt?: () => Promise<unknown>
     setPermissionMode?: (mode: string) => Promise<void>
-    setMaxThinkingTokens?: (n: number | null, display?: 'summarized' | 'omitted' | null) => Promise<void>
     setModel?: (model?: string) => Promise<void>
-    supportedModels?: () => Promise<Array<{ value: string; displayName?: string; description?: string; resolvedModel?: string }>>
+    /** 官方思考档热切(2026-10-01 晚升级):effortLevel ∈ low/medium/high/xhigh(max 启动期专属);
+     *  alwaysThinkingEnabled:false = 关思考。 */
+    applyFlagSettings?: (settings: Record<string, unknown>) => Promise<void>
+    supportedModels?: () => Promise<
+      Array<{
+        value: string
+        displayName?: string
+        description?: string
+        resolvedModel?: string
+        supportsEffort?: boolean
+        supportedEffortLevels?: string[]
+      }>
+    >
   }) | null
   /** 权限模式(Happy 同道,2026-10-01 加菜):default 手动 / acceptEdits 自动改文件 /
    *  bypassPermissions 全自动免审批 / plan 只规划。canUseTool 按它本地兜底 + setPermissionMode 推给 SDK。 */
   mode: string
-  /** 思考强度档(off/low/default/deep → THINKING_BUDGET;default = 跟随会话默认)。 */
+  /** 思考强度档(off/low/medium/high/xhigh/max;default = 跟随会话默认)。 */
   thinking: string
   /** 模型覆盖(undefined = 跟随底座;SDK setModel 运行时热切)。 */
   model?: string
   /** 会话可用模型缓存(supportedModels 一次;/model 列表,极少变)。 */
-  modelCache?: Array<{ value: string; displayName: string; description: string; resolvedModel?: string }>
+  modelCache?: Array<{ value: string; displayName: string; description: string; resolvedModel?: string; supportsEffort?: boolean; supportedEffortLevels?: string[] }>
 }
 
 export interface AgentRunnerOpts {
@@ -292,11 +320,7 @@ export class AgentRunner {
       }
     }
     if (proc.thinking !== 'default') {
-      const fn = proc.conversation.setMaxThinkingTokens
-      if (typeof fn === 'function') {
-        void fn.call(proc.conversation, THINKING_BUDGET[proc.thinking] ?? null).catch((e) =>
-          console.warn(`[ce:agent-runner] ${proc.sid} 初始 setMaxThinkingTokens(${proc.thinking}) 失败:`, (e as Error).message))
-      }
+      applyThinking(proc, proc.thinking)
     }
     if (proc.model) {
       const fn = proc.conversation.setModel
@@ -369,19 +393,16 @@ export class AgentRunner {
     return true
   }
 
-  /** 切思考强度(2026-10-01 加菜):off/low/default/deep → setMaxThinkingTokens 运行时热调。
+  /** 切思考强度(2026-10-01 晚升级:官方 effort 档,applyFlagSettings 热切;替换预算代餐)。
    *  会话未起 → 只记档(懒启动补推)。false = sid 不存在 / 档非法。 */
   setThinking(sid: string, level: string): boolean {
-    if (!(level in THINKING_BUDGET)) return false
+    const normalized = THINKING_COMPAT[level] ?? level
+    if (!THINKING_LEVELS.has(normalized)) return false
     const proc = this.procs.get(sid)
     if (!proc) return false
-    proc.thinking = level
-    console.log(`[ce:agent-runner] ${proc.sid} 思考强度 → ${level}`)
-    const fn = proc.conversation?.setMaxThinkingTokens
-    if (typeof fn === 'function') {
-      void fn.call(proc.conversation, THINKING_BUDGET[level] ?? null).catch((e) =>
-        console.warn(`[ce:agent-runner] ${proc.sid} setMaxThinkingTokens(${level}) 失败:`, (e as Error).message))
-    }
+    proc.thinking = normalized
+    console.log(`[ce:agent-runner] ${proc.sid} 思考强度 → ${normalized}`)
+    applyThinking(proc, normalized)
     return true
   }
 
@@ -418,6 +439,8 @@ export class AgentRunner {
           displayName: typeof m.displayName === 'string' && m.displayName ? m.displayName : m.value,
           description: typeof m.description === 'string' ? m.description : '',
           ...(typeof m.resolvedModel === 'string' ? { resolvedModel: m.resolvedModel } : {}),
+          ...(m.supportsEffort === true ? { supportsEffort: true } : {}),
+          ...(Array.isArray(m.supportedEffortLevels) ? { supportedEffortLevels: m.supportedEffortLevels } : {}),
         }))
       return proc.modelCache
     } catch (e) {
