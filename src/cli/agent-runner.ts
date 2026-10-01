@@ -293,15 +293,19 @@ export class AgentRunner {
     })
   }
 
-  /** 手机审批响应(resolveApproval RPC 来,只带 reqId 不带 sid)→ 跨所有 proc 找对应 pending 解掉。 */
-  resolveApproval(reqId: string, allow: boolean): boolean {
+  /** 手机审批响应(resolveApproval RPC 来,只带 reqId 不带 sid)→ 跨所有 proc 找对应 pending 解掉。
+   *  answers(2026-10-01 加菜,Happy 同道):AskUserQuestion 的答案(键=问题原文,值=选中项逗号连接)
+   *  合并进工具入参回灌(updatedInput)→ 答案作为工具结果返回给模型。老手机不带 answers → 原样放行。 */
+  resolveApproval(reqId: string, allow: boolean, answers?: Record<string, string>): boolean {
     for (const proc of this.procs.values()) {
       const a = proc.approvals.get(reqId)
       if (a) {
-        console.log(`[ce:agent-runner] ${proc.sid} 收到手机审批 reqId=${reqId} → ${allow ? 'allow' : 'deny'}`)
+        console.log(`[ce:agent-runner] ${proc.sid} 收到手机审批 reqId=${reqId} → ${allow ? 'allow' : 'deny'}${answers ? ` (带答案 ${Object.keys(answers).length} 问)` : ''}`)
         proc.approvals.delete(reqId)
         this.opts.onEvent(proc.owner, proc.sid, { kind: 'approval-resolved', reqId, resolved: allow ? 'approved' : 'denied' })
-        a.resolve(allow ? { behavior: 'allow', updatedInput: a.input } : { behavior: 'deny', message: '用户拒绝' })
+        const updatedInput =
+          allow && answers && Object.keys(answers).length > 0 ? { ...a.input, answers } : a.input
+        a.resolve(allow ? { behavior: 'allow', updatedInput } : { behavior: 'deny', message: '用户拒绝' })
         return true
       }
     }

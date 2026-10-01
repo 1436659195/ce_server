@@ -1252,9 +1252,16 @@ async function main(): Promise<void> {
           } else if (req.op === 'resolveApproval' && (req as { reqId?: string }).reqId) {
             // 手机人审回传。先查 agent-runner 的 pending(CC 对话 SDK 审批,带 callId);未命中再走旧
             // cc-hooks dispatcher(终端 CC hooks 审批)。两路都未命中也回 ok(幂等:超时迟到 / 他机先解)。
+            // answers(2026-10-01):AskUserQuestion 答案随回程捎带(形状校验:非对象/空 → 视为没带)。
             const reqId = (req as { reqId?: string }).reqId!
             const allow = (req as { decision?: 'allow' | 'deny' }).decision === 'allow'
-            const hit = agentRunner.resolveApproval(reqId, allow) || approvals.resolve(reqId, allow ? 'allow' : 'deny')
+            const rawAnswers = (req as { answers?: unknown }).answers
+            const answers =
+              rawAnswers && typeof rawAnswers === 'object' && !Array.isArray(rawAnswers)
+                ? (rawAnswers as Record<string, string>)
+                : undefined
+            const hit =
+              agentRunner.resolveApproval(reqId, allow, answers) || approvals.resolve(reqId, allow ? 'allow' : 'deny')
             resp = { ok: true, data: { resolved: hit } }
           } else if (req.op === 'agentInterrupt' && (req as { sid?: string }).sid) {
             // 中断 agent 当前回合(2026-10-01 加菜,手机「停止」按钮):sid = agent sid(cc-*)。

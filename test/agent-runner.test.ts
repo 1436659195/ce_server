@@ -332,6 +332,90 @@ describe('AgentRunner.claudeBin=null', () => {
   })
 })
 
+// ── resolveApproval 带 answers(AskUserQuestion 正道回传,Happy 同道)──
+describe('AgentRunner.resolveApproval answers', () => {
+  /** 造一个会触发 canUseTool 的假 query:消费首条用户消息 → canUseTool(捕获返回)→ result。 */
+  function makeQuery(tool: string, input: Record<string, unknown>, capture: (v: unknown) => void) {
+    return (params: {
+      prompt: AsyncIterable<SDKMessage>
+      options: { canUseTool: (t: string, i: Record<string, unknown>, o: { toolUseID?: string }) => Promise<unknown> }
+    }) => {
+      const obj = {
+        async *[Symbol.asyncIterator]() {
+          const it = params.prompt[Symbol.asyncIterator]()
+          await it.next()
+          capture(await params.options.canUseTool(tool, input, { toolUseID: 'call_test' }))
+          yield { type: 'result', subtype: 'success' } as unknown as SDKMessage
+        },
+      }
+      return obj as never
+    }
+  }
+
+  it('allow 带 answers → updatedInput = { ...原input, answers };原入参保留', async () => {
+    let resolveCanUseTool!: (v: unknown) => void
+    const canUseToolResult = new Promise((r) => (resolveCanUseTool = r))
+    const events: AgentEvent[] = []
+    const runner = new AgentRunner({
+      onEvent: (_o, _s, ev) => events.push(ev as AgentEvent),
+      onExit: () => {},
+      claudeBin: '/x',
+      cwd: '/tmp',
+      query: makeQuery('AskUserQuestion', { questions: [{ question: '用哪个框架?' }] }, resolveCanUseTool) as never,
+    })
+    const sid = runner.start('phoneA', '/')
+    runner.writeStdin(sid, '问吧')
+    await new Promise((r) => setTimeout(r, 20))
+    const req = events.find((e) => (e as { kind: string }).kind === 'approval-request') as { reqId: string }
+    expect(req.reqId).toBeTruthy()
+    expect(runner.resolveApproval(req.reqId, true, { '用哪个框架?': 'React, Vue' })).toBe(true)
+    const r = (await canUseToolResult) as { behavior: string; updatedInput: Record<string, unknown> }
+    expect(r.behavior).toBe('allow')
+    expect(r.updatedInput.answers).toEqual({ '用哪个框架?': 'React, Vue' })
+    expect(r.updatedInput.questions).toEqual([{ question: '用哪个框架?' }])
+  })
+
+  it('不带 answers → updatedInput = 原 input(老手机语义零变化)', async () => {
+    let resolveCanUseTool!: (v: unknown) => void
+    const canUseToolResult = new Promise((r) => (resolveCanUseTool = r))
+    const events: AgentEvent[] = []
+    const runner = new AgentRunner({
+      onEvent: (_o, _s, ev) => events.push(ev as AgentEvent),
+      onExit: () => {},
+      claudeBin: '/x',
+      cwd: '/tmp',
+      query: makeQuery('Write', { file_path: '/a', content: 'x' }, resolveCanUseTool) as never,
+    })
+    const sid = runner.start('phoneA', '/')
+    runner.writeStdin(sid, '写')
+    await new Promise((r) => setTimeout(r, 20))
+    const req = events.find((e) => (e as { kind: string }).kind === 'approval-request') as { reqId: string }
+    runner.resolveApproval(req.reqId, true)
+    const r = (await canUseToolResult) as { updatedInput: Record<string, unknown> }
+    expect(r.updatedInput).toEqual({ file_path: '/a', content: 'x' })
+  })
+
+  it('空 answers 对象 → 视为没带(updatedInput = 原 input)', async () => {
+    let resolveCanUseTool!: (v: unknown) => void
+    const canUseToolResult = new Promise((r) => (resolveCanUseTool = r))
+    const events: AgentEvent[] = []
+    const runner = new AgentRunner({
+      onEvent: (_o, _s, ev) => events.push(ev as AgentEvent),
+      onExit: () => {},
+      claudeBin: '/x',
+      cwd: '/tmp',
+      query: makeQuery('Bash', { command: 'ls' }, resolveCanUseTool) as never,
+    })
+    const sid = runner.start('phoneA', '/')
+    runner.writeStdin(sid, '跑')
+    await new Promise((r) => setTimeout(r, 20))
+    const req = events.find((e) => (e as { kind: string }).kind === 'approval-request') as { reqId: string }
+    runner.resolveApproval(req.reqId, true, {})
+    const r = (await canUseToolResult) as { updatedInput: Record<string, unknown> }
+    expect(r.updatedInput).toEqual({ command: 'ls' })
+  })
+})
+
 // ── AgentRunner.interrupt(2026-10-01 加菜,手机「停止」按钮)──────────────────
 describe('AgentRunner.interrupt', () => {
   it('query 已起 → 调 conversation.interrupt() 并返回 true;会话未起/未知 sid → false', async () => {
