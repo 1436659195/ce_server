@@ -173,6 +173,7 @@ interface AgentProc {
     setPermissionMode?: (mode: string) => Promise<void>
     setMaxThinkingTokens?: (n: number | null, display?: 'summarized' | 'omitted' | null) => Promise<void>
     setModel?: (model?: string) => Promise<void>
+    supportedModels?: () => Promise<Array<{ value: string; displayName?: string; description?: string; resolvedModel?: string }>>
   }) | null
   /** 权限模式(Happy 同道,2026-10-01 加菜):default 手动 / acceptEdits 自动改文件 /
    *  bypassPermissions 全自动免审批 / plan 只规划。canUseTool 按它本地兜底 + setPermissionMode 推给 SDK。 */
@@ -181,6 +182,8 @@ interface AgentProc {
   thinking: string
   /** 模型覆盖(undefined = 跟随底座;SDK setModel 运行时热切)。 */
   model?: string
+  /** 会话可用模型缓存(supportedModels 一次;/model 列表,极少变)。 */
+  modelCache?: Array<{ value: string; displayName: string; description: string; resolvedModel?: string }>
 }
 
 export interface AgentRunnerOpts {
@@ -395,6 +398,32 @@ export class AgentRunner {
         console.warn(`[ce:agent-runner] ${proc.sid} setModel(${proc.model ?? 'default'}) 失败:`, (e as Error).message))
     }
     return true
+  }
+
+  /** 列会话可用模型(2026-10-01 加菜;/model 的程序化等价,SDK supportedModels)。
+   *  会话级缓存(进程内一次,模型集极少变);会话未起 / SDK 不支持 → null(手机回落静态快捷档)。 */
+  async supportedModels(sid: string): Promise<Array<{ value: string; displayName: string; description: string; resolvedModel?: string }> | null> {
+    const proc = this.procs.get(sid)
+    if (!proc) return null
+    if (proc.modelCache) return proc.modelCache
+    const fn = proc.conversation?.supportedModels
+    if (typeof fn !== 'function') return null
+    try {
+      const raw = await fn.call(proc.conversation)
+      if (!Array.isArray(raw) || raw.length === 0) return null
+      proc.modelCache = raw
+        .filter((m) => m && typeof m.value === 'string')
+        .map((m) => ({
+          value: m.value,
+          displayName: typeof m.displayName === 'string' && m.displayName ? m.displayName : m.value,
+          description: typeof m.description === 'string' ? m.description : '',
+          ...(typeof m.resolvedModel === 'string' ? { resolvedModel: m.resolvedModel } : {}),
+        }))
+      return proc.modelCache
+    } catch (e) {
+      console.warn(`[ce:agent-runner] ${proc.sid} supportedModels 失败:`, (e as Error).message)
+      return null
+    }
   }
 
   /** 发 approval-request 问手机,**无超时**等 resolveApproval(用户慢慢批)。

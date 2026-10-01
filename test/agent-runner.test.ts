@@ -407,6 +407,39 @@ describe('AgentRunner.setMode', () => {
   })
 })
 
+// ── supportedModels(/model 动态列表,2026-10-01 加菜)──
+describe('AgentRunner.supportedModels', () => {
+  it('SDK 列表透出 + 会话级缓存;未起/不支持 → null', async () => {
+    let calls = 0
+    const fakeQuery = (params: { prompt: AsyncIterable<SDKMessage> }) => {
+      const obj: AsyncIterable<SDKMessage> & { supportedModels?: () => Promise<unknown[]> } = {
+        async *[Symbol.asyncIterator]() {
+          yield* params.prompt
+        },
+        supportedModels: async () => {
+          calls++
+          return [
+            { value: 'sonnet', displayName: 'Sonnet', description: '均衡' },
+            { value: 'opus', displayName: 'Opus', description: '最强' },
+          ]
+        },
+      }
+      return obj as never
+    }
+    const runner = new AgentRunner({ onEvent: () => {}, onExit: () => {}, claudeBin: '/x', cwd: '/tmp', query: fakeQuery })
+    const sid = runner.start('p', '/')
+    expect(await runner.supportedModels(sid)).toBeNull() // 会话未起
+    runner.writeStdin(sid, 'hi')
+    await new Promise((r) => setTimeout(r, 20))
+    const first = await runner.supportedModels(sid)
+    expect(first).toHaveLength(2)
+    expect(first![0]).toEqual({ value: 'sonnet', displayName: 'Sonnet', description: '均衡' })
+    await runner.supportedModels(sid)
+    expect(calls).toBe(1) // 会话级缓存:第二次不再打 SDK
+    expect(await runner.supportedModels('cc-nope')).toBeNull()
+  })
+})
+
 // ── setThinking / setModel(2026-10-01 加菜,思考强度 + 模型热切)──
 describe('AgentRunner.setThinking / setModel', () => {
   it('setThinking:合法档过/非法档拒;档记录在 proc(懒启动补推由 runConversation 走)', () => {

@@ -1281,6 +1281,10 @@ async function main(): Promise<void> {
             // 切模型(2026-10-01 加菜):model 空 = 恢复底座默认(SDK setModel 运行时热切)。
             const hit = agentRunner.setModel((req as { sid: string }).sid, (req as { model?: string }).model)
             resp = hit ? { ok: true, data: { applied: true } } : { ok: false, error: '会话不存在' }
+          } else if (req.op === 'agentSupportedModels' && (req as { sid?: string }).sid) {
+            // 列会话可用模型(2026-10-01 加菜;/model 动态列表)。null = 会话未起/不支持 → 手机回落静态快捷档。
+            const list = await agentRunner.supportedModels((req as { sid: string }).sid)
+            resp = list ? { ok: true, data: list } : { ok: false, error: '会话未启动或 SDK 不支持' }
           } else if (req.op === 'exec') {
             // 通用 exec(被控机跑一条命令,无 shell、捕 stdout/stderr/exitCode)。
             // 无 shell(execFile)→ args 无法链式起别的程序,手机侧程序名白名单是唯一闸门。
