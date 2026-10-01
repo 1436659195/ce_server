@@ -1273,6 +1273,14 @@ async function main(): Promise<void> {
             // bypassPermissions 全自动免审批。手机 UI 三档;ce 本地兜底 + 推 SDK。
             const hit = agentRunner.setMode((req as { sid: string }).sid, (req as { mode?: string }).mode ?? '')
             resp = hit ? { ok: true, data: { applied: true } } : { ok: false, error: '会话不存在或模式非法' }
+          } else if (req.op === 'agentThinking' && (req as { sid?: string }).sid) {
+            // 切思考强度(2026-10-01 加菜):off/low/default/deep → setMaxThinkingTokens 热调。
+            const hit = agentRunner.setThinking((req as { sid: string }).sid, (req as { level?: string }).level ?? 'default')
+            resp = hit ? { ok: true, data: { applied: true } } : { ok: false, error: '会话不存在或档位非法' }
+          } else if (req.op === 'agentSetModel' && (req as { sid?: string }).sid) {
+            // 切模型(2026-10-01 加菜):model 空 = 恢复底座默认(SDK setModel 运行时热切)。
+            const hit = agentRunner.setModel((req as { sid: string }).sid, (req as { model?: string }).model)
+            resp = hit ? { ok: true, data: { applied: true } } : { ok: false, error: '会话不存在' }
           } else if (req.op === 'exec') {
             // 通用 exec(被控机跑一条命令,无 shell、捕 stdout/stderr/exitCode)。
             // 无 shell(execFile)→ args 无法链式起别的程序,手机侧程序名白名单是唯一闸门。

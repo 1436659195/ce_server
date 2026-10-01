@@ -407,6 +407,26 @@ describe('AgentRunner.setMode', () => {
   })
 })
 
+// ── setThinking / setModel(2026-10-01 加菜,思考强度 + 模型热切)──
+describe('AgentRunner.setThinking / setModel', () => {
+  it('setThinking:合法档过/非法档拒;档记录在 proc(懒启动补推由 runConversation 走)', () => {
+    const runner = new AgentRunner({ onEvent: () => {}, onExit: () => {}, claudeBin: '/x', cwd: '/tmp' })
+    const sid = runner.start('p', '/')
+    expect(runner.setThinking(sid, 'off')).toBe(true)
+    expect(runner.setThinking(sid, 'deep')).toBe(true)
+    expect(runner.setThinking(sid, 'ultra')).toBe(false) // 非法档
+    expect(runner.setThinking('cc-nope', 'low')).toBe(false)
+  })
+
+  it('setModel:记录覆盖;空串 = 恢复默认;未知 sid → false', () => {
+    const runner = new AgentRunner({ onEvent: () => {}, onExit: () => {}, claudeBin: '/x', cwd: '/tmp' })
+    const sid = runner.start('p', '/')
+    expect(runner.setModel(sid, 'opus')).toBe(true)
+    expect(runner.setModel(sid, '')).toBe(true) // 恢复底座默认
+    expect(runner.setModel('cc-nope', 'opus')).toBe(false)
+  })
+})
+
 // ── resolveApproval 带 answers(AskUserQuestion 正道回传,Happy 同道)──
 describe('AgentRunner.resolveApproval answers', () => {
   /** 造一个会触发 canUseTool 的假 query:消费首条用户消息 → canUseTool(捕获返回)→ result。 */

@@ -32,6 +32,10 @@ const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'WebSearch', 'WebFetch
 const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 /** 合法权限模式(SDK PermissionMode 的可切子集)。 */
 const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'bypassPermissions', 'plan'])
+/** 思考强度档 → maxThinkingTokens 预算(2026-10-01 加菜;运行时 setMaxThinkingTokens 热调)。
+ *  注意:自适应思考模型(Opus 4.6+/Sonnet 4.6+)上 SDK 退化为 开/关(0=关,其他=自适应),
+ *  老模型是真预算 —— 两态生效是常态,档位保留以兼容。 */
+const THINKING_BUDGET: Record<string, number | null> = { off: 0, low: 4096, default: null, deep: 32768 }
 
 /** 推入式异步队列:writeStdin push,query 当 AsyncIterable<SDKUserMessage> 消费。永不 end → cc 长驻。 */
 class InputQueue {
@@ -167,10 +171,16 @@ interface AgentProc {
   conversation: (AsyncIterable<SDKMessage> & {
     interrupt?: () => Promise<unknown>
     setPermissionMode?: (mode: string) => Promise<void>
+    setMaxThinkingTokens?: (n: number | null, display?: 'summarized' | 'omitted' | null) => Promise<void>
+    setModel?: (model?: string) => Promise<void>
   }) | null
   /** 权限模式(Happy 同道,2026-10-01 加菜):default 手动 / acceptEdits 自动改文件 /
    *  bypassPermissions 全自动免审批 / plan 只规划。canUseTool 按它本地兜底 + setPermissionMode 推给 SDK。 */
   mode: string
+  /** 思考强度档(off/low/default/deep → THINKING_BUDGET;default = 跟随会话默认)。 */
+  thinking: string
+  /** 模型覆盖(undefined = 跟随底座;SDK setModel 运行时热切)。 */
+  model?: string
 }
 
 export interface AgentRunnerOpts {
@@ -200,7 +210,7 @@ export class AgentRunner {
   start(owner: string, rel?: string): string {
     const sid = `cc-${randomBytes(4).toString('hex')}`
     const cwd = rel ? path.resolve(this.opts.cwd, rel) : this.opts.cwd
-    this.procs.set(sid, { sid, owner, cwd, queue: new InputQueue(), approvals: new Map(), started: false, stopping: false, conversation: null, mode: 'default' })
+    this.procs.set(sid, { sid, owner, cwd, queue: new InputQueue(), approvals: new Map(), started: false, stopping: false, conversation: null, mode: 'default', thinking: 'default' })
     console.log(`[ce:agent-runner] 新建 agent sid=${sid} (owner=${owner}, cwd=${cwd}, claude=${this.opts.claudeBin})`)
     return sid
   }
@@ -267,13 +277,29 @@ export class AgentRunner {
     proc.conversation = conversation as AsyncIterable<SDKMessage> & {
       interrupt?: () => Promise<unknown>
       setPermissionMode?: (mode: string) => Promise<void>
+      setMaxThinkingTokens?: (n: number | null, display?: 'summarized' | 'omitted' | null) => Promise<void>
+      setModel?: (model?: string) => Promise<void>
     }
-    // 会话懒启动前的 setMode 记在 proc.mode;此刻补推给 SDK(手机先切模式再发首条的顺序)
+    // 会话懒启动前手机侧已定的模式/思考/模型,此刻补推给 SDK(手机先设置再发首条的顺序)
     if (proc.mode !== 'default') {
       const fn = proc.conversation.setPermissionMode
       if (typeof fn === 'function') {
         void fn.call(proc.conversation, proc.mode).catch((e) =>
           console.warn(`[ce:agent-runner] ${proc.sid} 初始 setPermissionMode(${proc.mode}) 失败(canUseTool 本地兜底仍在):`, (e as Error).message))
+      }
+    }
+    if (proc.thinking !== 'default') {
+      const fn = proc.conversation.setMaxThinkingTokens
+      if (typeof fn === 'function') {
+        void fn.call(proc.conversation, THINKING_BUDGET[proc.thinking] ?? null).catch((e) =>
+          console.warn(`[ce:agent-runner] ${proc.sid} 初始 setMaxThinkingTokens(${proc.thinking}) 失败:`, (e as Error).message))
+      }
+    }
+    if (proc.model) {
+      const fn = proc.conversation.setModel
+      if (typeof fn === 'function') {
+        void fn.call(proc.conversation, proc.model).catch((e) =>
+          console.warn(`[ce:agent-runner] ${proc.sid} 初始 setModel(${proc.model}) 失败:`, (e as Error).message))
       }
     }
     try {
@@ -336,6 +362,37 @@ export class AgentRunner {
     if (typeof fn === 'function') {
       void fn.call(proc.conversation, mode).catch((e) =>
         console.warn(`[ce:agent-runner] ${proc.sid} setPermissionMode(${mode}) 失败(canUseTool 本地兜底仍在):`, (e as Error).message))
+    }
+    return true
+  }
+
+  /** 切思考强度(2026-10-01 加菜):off/low/default/deep → setMaxThinkingTokens 运行时热调。
+   *  会话未起 → 只记档(懒启动补推)。false = sid 不存在 / 档非法。 */
+  setThinking(sid: string, level: string): boolean {
+    if (!(level in THINKING_BUDGET)) return false
+    const proc = this.procs.get(sid)
+    if (!proc) return false
+    proc.thinking = level
+    console.log(`[ce:agent-runner] ${proc.sid} 思考强度 → ${level}`)
+    const fn = proc.conversation?.setMaxThinkingTokens
+    if (typeof fn === 'function') {
+      void fn.call(proc.conversation, THINKING_BUDGET[level] ?? null).catch((e) =>
+        console.warn(`[ce:agent-runner] ${proc.sid} setMaxThinkingTokens(${level}) 失败:`, (e as Error).message))
+    }
+    return true
+  }
+
+  /** 切模型(2026-10-01 加菜;SDK setModel 运行时热切,streaming 模式专属)。
+   *  model 空 → 恢复底座默认。false = sid 不存在。 */
+  setModel(sid: string, model?: string): boolean {
+    const proc = this.procs.get(sid)
+    if (!proc) return false
+    proc.model = model || undefined
+    console.log(`[ce:agent-runner] ${proc.sid} 模型 → ${proc.model ?? '底座默认'}`)
+    const fn = proc.conversation?.setModel
+    if (typeof fn === 'function') {
+      void fn.call(proc.conversation, proc.model).catch((e) =>
+        console.warn(`[ce:agent-runner] ${proc.sid} setModel(${proc.model ?? 'default'}) 失败:`, (e as Error).message))
     }
     return true
   }
