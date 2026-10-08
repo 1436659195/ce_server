@@ -1520,20 +1520,26 @@ if (wsFlag) {
   const relayUrl = arg('relay') ?? loadConfig().relay
   if (!relayUrl) {
     console.error('[ce] --workshop 需要中继地址:补 --relay=ws://...(或先跑一次 ce,让 ~/.ce/config.json 记住中继)')
+    console.log('CE_WS_FAIL')
     process.exit(1)
   }
   const raw = (wsFlag === '--workshop' ? '' : wsFlag.slice('--workshop='.length)).trim()
+  // 成败 marker(独立成行;手机安装流水线判行级全等)。2026-10-09 起 marker 由 ce 自己打 ——
+  // 此前手机命令是 `ce --workshop=… && echo OK || echo FAIL`,Windows PowerShell 5.1 不支持
+  // &&/||(真机事故),命令整条没跑。单条命令 POSIX sh / PowerShell / cmd 通吃。
   resolveWorkshopDir(raw || defaultWorkshopRoot(homedir()))
     .then((root) =>
       installWorkshop({ relayHttp: relayUrl.replace(/^ws/, 'http'), root }).then((r) => {
         console.log(r.status === 'up-to-date'
           ? `[ce] 工坊已是最新:${root}(免重装)`
           : `[ce] 工坊安装完成:${root} —— 手机工坊页即可使用`)
+        console.log('CE_WS_OK')
         process.exit(0)
       }),
     )
     .catch((e) => {
       console.error('[ce] 工坊安装失败:', (e as Error).message)
+      console.log('CE_WS_FAIL')
       process.exit(1)
     })
 } else if (process.argv.includes('--daemon')) {
