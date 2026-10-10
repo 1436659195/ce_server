@@ -64,10 +64,11 @@ const { server, close } = createRelayServer(hub, {
   sha256Path: join(here, '..', '..', 'dist', 'sha256.txt'),
   installShPath: join(here, '..', '..', 'scripts', 'install.sh'),
   lanPyPath: join(here, '..', '..', 'scripts', 'lan.py'),
-  // 插件工坊分发(文件由 ce-platform 的打包脚本产出后上传到同目录;缺文件路由 404)
-  workshopScaffoldPath: join(here, '..', '..', 'dist', 'workshop', 'scaffold.tgz'),
-  workshopScaffoldSha256Path: join(here, '..', '..', 'dist', 'workshop', 'scaffold.tgz.sha256'),
-  workshopIndexPath: join(here, '..', '..', 'dist', 'workshop', 'index.json'),
+  // 插件工坊分发(2026-10-09 起改读 workshop-release/ 入库目录:文件由 ce-platform 打包脚本自动
+  //   同步进来并 commit/push —— 中继 git pull 即上架,不再依赖「从开发机手动传文件」;缺文件 404)
+  workshopScaffoldPath: join(here, '..', '..', 'workshop-release', 'scaffold.tgz'),
+  workshopScaffoldSha256Path: join(here, '..', '..', 'workshop-release', 'scaffold.tgz.sha256'),
+  workshopIndexPath: join(here, '..', '..', 'workshop-release', 'index.json'),
   publicUrl,
 })
 if (bindHost) {
