@@ -182,7 +182,9 @@ export async function installWorkshop(args: InstallWorkshopArgs, deps: WorkshopD
   if (actual !== digest) throw new Error(`集装箱 sha256 不符(远端声明 ${digest.slice(0, 12)}…,实收 ${actual.slice(0, 12)}…),已中止,老安装原样保留`)
 
   // ── ⑤ 落盘 + 解包(mkdir -p root;tar 覆盖同路径 = 幂等;成功后删临时文件)──
-  mkdirSync(root, { recursive: true })
+  // 目录已存在则跳过 mkdir:Bun 在 Windows 上对已存在的盘根(如 D:\)mkdir 会抛
+  // EPERM(真机事故 2026-10-11,Node 静默跳过的场景 Bun 不跳)。
+  if (!isDir(root)) mkdirSync(root, { recursive: true })
   const tmp = join(root, SCAFFOLD_TMP)
   writeFileSync(tmp, bytes)
   const tarBin = process.platform === 'win32' ? 'tar.exe' : 'tar'
