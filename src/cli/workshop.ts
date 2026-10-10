@@ -200,6 +200,10 @@ export async function installWorkshop(args: InstallWorkshopArgs, deps: WorkshopD
     runCollect('npm', ['install', '--no-audit', '--no-fund'], { cwd: r, shell: process.platform === 'win32', timeoutMs: 20 * 60_000 }).then((out) => {
       const tail = out.trim().split('\n').slice(-3).join('\n')
       if (tail) lg(`[ce:workshop] npm:${tail}`)
+    }).catch((e) => {
+      // 失败输出原样上屏(2026-10-11:Windows 首跑失败原因只在捕获里,终端看不到 → 没法排障)
+      lg(`[ce:workshop] npm install 失败:${(e as Error).message}`)
+      throw e
     }))
   await runNpmFn(root, log)
 
