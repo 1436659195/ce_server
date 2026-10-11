@@ -253,8 +253,12 @@ export async function resolveWorkshopDir(raw: string, deps: ResolveDirDeps = {})
     const servers = await (deps.detectServersFn ?? detectServers)()
     for (const s of servers) {
       if (!(await (deps.isAliveFn ?? isAlive)(s.url, s.token))) continue
-      // 活着的 jupyter 即本机「手机可见世界」的根:存在与否都归一到它下面(新建同理)
-      return join(s.root, direct.replace(/^\/+/, ''))
+      // 活着的 jupyter 即本机「手机可见世界」的根:存在与否都归一到它下面(新建同理)。
+      // ★ 必须拼**原始 raw**(jupyter 视角),不能拼 resolve(raw)——后者按 ce 进程 cwd 解析:
+      // cwd 在目标目录里时路径翻倍(真机 2026-10-12:'wxauto/workshop' + cwd D:\wxauto\workshop
+      // → D:\wxauto\workshop\wxauto\workshop → join 盘根 → D:\D:\… → mkdir 'D:' EPERM)。
+      // Linux 侥幸不炸只因 jupyter 根是 '/',raw 恒带前导 / 本就是 OS 绝对。
+      return join(s.root, raw.replace(/^\/+/, ''))
     }
   } catch {
     /* 探测失败(jupyter 未装/未起)→ 退回原样 */

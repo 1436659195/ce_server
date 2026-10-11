@@ -284,6 +284,19 @@ describe('resolveWorkshopDir(J 视角 ↔ OS 视角 收口)', () => {
     rmSync(w.base, { recursive: true, force: true })
   })
 
+  test('②″ 相对形态 raw(Windows 手机选择器)→ 拼原始 raw,不按 ce 进程 cwd 解析(2026-10-12 真机回归)', async () => {
+    // 真机事故:手机发 'wxauto/workshop',ce 进程 cwd 恰在目标目录里 → 旧代码 resolve(raw)
+    // 翻倍成 cwd/wxauto/workshop,再 join 盘根 → D:\D:\… → mkdir 'D:' EPERM。
+    // 本测试无法伪造进程 cwd,但可验证核心语义:相对 raw 归一为 join(jupyterRoot, raw),
+    // 与 cwd 无关(cwd 恰好含同名子目录也不受影响 —— 旧实现会先命中 ① direct 存在而走错)。
+    const w = makeWorld()
+    // cwd 侧造一个同名「目标目录」(模拟 ce 跑在 D:\wxauto\workshop 里):
+    // resolve(raw) 相对本测试进程 cwd 会指向别处不存在 → 走 ② → 必须拼 raw 而非 resolve(raw)
+    const r = await resolveWorkshopDir('wxauto/workshop', w.deps)
+    expect(r).toBe(join(w.jupyterRoot, 'wxauto/workshop'))
+    rmSync(w.base, { recursive: true, force: true })
+  })
+
   test('③ 无存活 jupyter → 退回原样 OS 路径', async () => {
     const w = makeWorld({ alive: false })
     const r = await resolveWorkshopDir('/fresh/ce-workshop', w.deps)
