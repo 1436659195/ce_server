@@ -31,6 +31,7 @@ import { ApprovalDispatcher } from './approval'
 import { generateHooksConfig, handleHookBody } from './cc-hooks'
 import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
+import { handleHttpProxy, type HttpProxyRequest } from './http-proxy'
 import { tryAcquire } from './ownership'
 import { TermRegistry, gateAttach } from './term-registry'
 import { CloseProbe } from './close-probe'
@@ -1370,6 +1371,11 @@ async function main(): Promise<void> {
             } else {
               resp = { ok: true, data: { results: await runPreflight(items) } }
             }
+          } else if (req.op === 'httpProxy') {
+            // 本地 API 转发(套壳 APP 场景:手机经隧道调被控机本地 HTTP 服务,与 Jupyter 无关)。
+            // 上游白名单用启动时 cfg.apiUpstreams(~/.ce/config.json;改配置须重启 ce 生效)。
+            // 契约:HTTP 4xx/5xx 以 ok:true+status 传回(业务错误),ok:false 只留传输/配置错误 —— spec.md §5.2。
+            resp = await handleHttpProxy(req as HttpProxyRequest, cfg.apiUpstreams)
           } else if (
             req.op === 'uploadBegin' ||
             req.op === 'uploadChunk' ||

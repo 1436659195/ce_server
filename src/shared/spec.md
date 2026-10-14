@@ -87,6 +87,17 @@ Jupyter 终端只有数字名且**编号会复用**(杀 5 建 5 还是 "5",重�
 - **升级迁移**:存量终端首次 observe 收养为游离态;旧手机不带指纹跳过指纹校验;旧手机恢复
   逻辑维持「只挑 managed」零回归。
 
+### 5.2 httpProxy —— 本地 API 转发(2026-10-14;套壳 APP 场景)
+
+配对手机把 HTTP 请求经隧道转发到被控机的**本地** HTTP 服务(与 Jupyter/agent 业务无关)。手机端不限于 ce-platform —— 任何实现了本规格隧道层的套壳 APP(如「凡鲜凡美」)都能用。
+
+- **`httpProxy`**(`{ method, path, headers?, bodyBase64? }`)→ `{ ok, data: { status, headers, bodyBase64 } }`
+  - `path`:含 query 的绝对路径(`/api/campaigns?status=open`),**不含 host** —— host 由被控机侧配置决定,手机无权指定目标。
+  - 上游白名单:`~/.ce/config.json` 的 `apiUpstreams: string[]`(默认无 = **功能关闭**,存量安装零行为变化;改后须重启 ce)。请求不带目标 → 转发 `apiUpstreams[0]`;预留未来请求带 `upstream` 字段与白名单精确匹配(多服务自助)。
+  - **语义红线**:HTTP 4xx/5xx 以 `ok:true` + `status` 原样传回(业务错误,APP 展示 `detail`);`ok:false` 只留给传输/配置层错误(未配上游 / path・method 非法 / 上游不可达 / 超时 60s / body 超 8MB)。**两边都别单方面改这条** —— APP 靠它区分「API 返回 409」与「隧道坏了」。
+  - body 双向 base64(二进制安全);响应头丢弃 `content-encoding`/`content-length`/`transfer-encoding`/`connection`(fetch 已解压,长度与原头不符)。
+  - 实现住 `src/cli/http-proxy.ts`(fetch 注入可单测),分发在 main.ts RPC 链。旧版 ce 对此 op 回 `{ok:false, error:'未知操作: httpProxy'}`(bridge default)→ APP 据此提示「被控机 ce 需升级」。
+
 ## 6. Control 帧的密文 op(ce→手机,定向加密 + targetPhoneId 路由)
 
 除手机→ce 的握手(明文 phonePub)/resize(密文)外,ce→手机 也用 `FrameType.Control` 发密文控制通知:

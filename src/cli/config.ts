@@ -14,6 +14,9 @@ export interface CeConfig {
   /** Jupyter 工作目录(root_dir)覆盖;CLI --workdir 传入时写入(绝对路径),优先级高于 root。
    *  开机自启(注册表 Run / systemd)不携带任何 CLI 参数 → 不落盘则重启即丢;删除本字段 = 恢复默认。 */
   workdir?: string
+  /** httpProxy RPC 的本地上游白名单(套壳 APP 远程调被控机本地 HTTP 服务;见 src/cli/http-proxy.ts)。
+   *  默认无 = 功能关闭(现存安装零行为变化);改本字段须重启 ce 生效(daemon 启动时读一次)。 */
+  apiUpstreams?: string[]
 }
 
 /** 读 config;不存在/损坏 → 空对象(不抛)。path 可注入便于测试。 */
