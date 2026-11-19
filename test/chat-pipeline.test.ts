@@ -330,7 +330,7 @@ test('L2 twin 唤醒:终端型 agent(无 runner 会话)→ spawn 独立运行,pr
     if (f.type === FrameType.GroupFrame) phone.receive(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
   }
   const agentDir = mkdtempSync(join(tmpdir(), 'ce-twin-agent-'))
-  const spawned: Array<{ cwd: string; prompt: string }> = []
+  const spawned: Array<{ cwd: string; args: string[] }> = []
   const chat = new ChatHub({
     cid: 'machineA',
     privKey: ceKp.privateKey,
@@ -338,7 +338,7 @@ test('L2 twin 唤醒:终端型 agent(无 runner 会话)→ spawn 独立运行,pr
     statePath: join(dir, 'chat-state.json'),
     sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
     agentRunner: { sessions: () => [], writeStdin: () => {} }, // 终端型:runner 无会话
-    spawnTwin: (cwd, prompt) => spawned.push({ cwd, prompt }),
+    spawnTwin: (cwd, args) => spawned.push({ cwd, args }),
   })
   cliWs.onWire = (data) => {
     try {
@@ -368,11 +368,82 @@ test('L2 twin 唤醒:终端型 agent(无 runner 会话)→ spawn 独立运行,pr
   feed({ memberId: 'm_phone', name: '主人', human: true }, '终端 CC 在吗')
   expect(spawned).toHaveLength(1)
   expect(spawned[0].cwd).toBe(agentDir)
-  expect(spawned[0].prompt).toContain('终端CC')
-  expect(spawned[0].prompt).toContain('终端 CC 在吗')
-  expect(spawned[0].prompt).toContain('SKILL.md')
+  const sidIdx = spawned[0].args.indexOf('--session-id')
+  expect(sidIdx).toBeGreaterThan(-1)
+  expect(spawned[0].args[spawned[0].args.length - 1]).toContain('终端CC')
+  expect(spawned[0].args[spawned[0].args.length - 1]).toContain('终端 CC 在吗')
+  expect(spawned[0].args[spawned[0].args.length - 1]).toContain('SKILL.md')
 
   // 冷却 45s:第二条立即来 → 不重复 spawn
   feed({ memberId: 'm_phone', name: '主人', human: true }, '第二条')
   expect(spawned).toHaveLength(1)
+})
+
+test('L2 twin 续接:第二跑 --resume 同一 session;交班本变更 → 重新注入 prompt', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-chat-resume-'))
+  const hub = new Hub(join(dir, 'state.json'), 100, null, join(dir, 'groups-state.json'))
+  const ceKp = generateKeyPair()
+  const cliWs = new TestWS('cli', () => {})
+  const { sid, token } = hub.register('machineA', cliWs)
+  const phoneWs = new TestWS('phone', () => {})
+  hub.joinPhone(sid, token, phoneWs, 'ph_1')
+  const phone = new PhoneSim(hub, phoneWs)
+  phoneWs.onWire = (data) => {
+    const f = decodeFrame(enc.encode(data))
+    if (f.type === FrameType.GroupFrame) phone.receive(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+  }
+  const agentDir = mkdtempSync(join(tmpdir(), 'ce-resume-agent-'))
+  const runs: Array<{ cwd: string; args: string[] }> = []
+  const chat = new ChatHub({
+    cid: 'machineA',
+    privKey: ceKp.privateKey,
+    pubKey: ceKp.publicKey,
+    statePath: join(dir, 'chat-state.json'),
+    sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
+    agentRunner: { sessions: () => [], writeStdin: () => {} },
+    spawnTwin: (cwd, args) => runs.push({ cwd, args }),
+  })
+  cliWs.onWire = (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) chat.onEnvelope(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch { /* hub 通知 */ }
+  }
+
+  phone.send({ op: 'group-create', reqId: 'create', payload: { meta: { name: '续接群' }, ownerName: '主人' } })
+  await tick()
+  const gid = ((phone.results.find((r) => r.reqId === 'create')!.data) as { groupId: string }).groupId
+  phone.send({ op: 'group-invite', groupId: gid, reqId: 'inv', payload: { groupId: gid } })
+  await tick()
+  const code = ((phone.results.find((r) => r.reqId === 'inv')!.data) as { code: string }).code
+  expect((await chat.localOp({ op: 'join', code, name: '续接CC', cwd: agentDir })).ok).toBe(true)
+  await tick(30)
+
+  const key = unb64((chat as unknown as { state: { keys: Record<string, string> } }).state.keys[gid])
+  const feed = (text: string): void => {
+    chat.onEnvelope({ op: 'group-msg', groupId: gid, payload: {
+      seq: 300 + Math.floor(Math.random() * 1000), ts: Date.now(),
+      from: { memberId: 'm_phone', name: '主人', human: true },
+      ct: Buffer.from(seal(key, enc.encode(JSON.stringify({ kind: 'text', text })))).toString('base64'),
+    } } as unknown as GroupEnvelope)
+  }
+
+  // 写交班本 → 第一跑:prompt 含嘱咐,--session-id 建档
+  await chat.localOp({ op: 'notes', text: '我们群里只聊技术' })
+  feed('第一跑')
+  const first = runs[0].args
+  expect(first[first.length - 1]).toContain('我们群里只聊技术')
+  const sidIdx = first.indexOf('--session-id')
+  expect(sidIdx).toBeGreaterThan(-1)
+  const uuid = first[sidIdx + 1]
+
+  // 45s 冷却真实等待太慢:直接把冷却表拨回过去(白盒),第二跑 --resume 同一 uuid;嘱咐未变 → 不重注
+  const chatAny = chat as unknown as { twinLastAt: Map<string, number> }
+  for (const [k, v] of chatAny.twinLastAt) chatAny.twinLastAt.set(k, v - 46_000)
+  feed('第二跑')
+  const second = runs[1]!.args
+  const resumeIdx = second.indexOf('--resume')
+  expect(resumeIdx).toBeGreaterThan(-1)
+  expect(second[resumeIdx + 1]).toBe(uuid)
+  expect(second[second.length - 1]).not.toContain('我们群里只聊技术') // 嘱咐已在上下文,不重注
 })

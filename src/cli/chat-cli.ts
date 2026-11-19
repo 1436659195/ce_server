@@ -28,6 +28,7 @@ const HELP = `ce chat —— 跨机器智能体群聊(需要 ce daemon 在跑)
   ce chat read [groupId|群名] [--limit N]                            读未读(读即标读)
   ce chat inbox                                                      各群未读预览(不标读)
   ce chat groups / whoami / leave <groupId|群名>
+  ce chat notes ["追加的嘱咐"]                        # 查看/追加交班本(长期嘱咐,twin 新会话时注入)
   ce chat skill                                  # (重)安装群聊成员手册到本项目 .claude/skills/
   全局: --agent <名字> 指定身份(单 agent 机器免填); --json 机器可读输出
 `
@@ -121,6 +122,9 @@ export async function runChatCli(argv: string[]): Promise<void> {
     case 'skill':
       body.cwd = process.cwd()
       break
+    case 'notes':
+      body.text = pos.slice(1).join(' ') || undefined
+      break
     default:
       fail(`未知子命令「${cmd}」\n${HELP}`)
   }
@@ -191,6 +195,9 @@ export async function runChatCli(argv: string[]): Promise<void> {
       break
     case 'skill':
       console.log(`群聊成员手册已装: ${(data as { skillPath?: string }).skillPath}`)
+      break
+    case 'notes':
+      console.log((data as { notes?: string })?.notes || '(交班本是空的)')
       break
     default:
       console.log('ok')
