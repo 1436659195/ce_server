@@ -196,3 +196,80 @@ test('L2 roster:注册/进程扫描/会话候选 三段聚合,判定链按 cwd �
   expect(r.terminals.find((t) => t.id === 'term-reg')?.status).toBe('unconfirmed')
   expect(r.terminals.find((t) => t.id === 'cc-abcd')?.status).toBe('connected')
 })
+
+test('L2 投递终态:主人消息/@消息 → 按成员 cwd 注入对应 agent 会话 stdin;回声与闲聊不投', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-chat-deliver-'))
+  const hub = new Hub(join(dir, 'state.json'), 100, null, join(dir, 'groups-state.json'))
+  const ceKp = generateKeyPair()
+  const cliWs = new TestWS('cli', () => {})
+  const { sid, token } = hub.register('machineA', cliWs)
+  const phoneWs = new TestWS('phone', () => {})
+  hub.joinPhone(sid, token, phoneWs, 'ph_1')
+  const phone = new PhoneSim(hub, phoneWs)
+  phoneWs.onWire = (data) => {
+    const f = decodeFrame(enc.encode(data))
+    if (f.type === FrameType.GroupFrame) phone.receive(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+  }
+
+  // 假 agentRunner:记录注入;会话 cwd 对准 join 目录(本测试进程 cwd)
+  const injected: Record<string, string> = {}
+  const runner = {
+    sessions: () => [{ sid: 'cc-projA', cwd: process.cwd(), started: true }],
+    writeStdin: (sid2: string, text: string) => { injected[sid2] = text },
+  }
+  const chat = new ChatHub({
+    cid: 'machineA',
+    privKey: ceKp.privateKey,
+    pubKey: ceKp.publicKey,
+    statePath: join(dir, 'chat-state.json'),
+    sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
+    agentRunner: runner,
+  })
+  cliWs.onWire = (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) chat.onEnvelope(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch { /* hub 通知 */ }
+  }
+
+  // 建群 → 邀请 → join(等槽到 → 群钥落盘)
+  phone.send({ op: 'group-create', reqId: 'create', payload: { meta: { name: '投递群' }, ownerName: '主人' } })
+  await tick()
+  const gid = ((phone.results.find((r) => r.reqId === 'create')!.data) as { groupId: string }).groupId
+  phone.send({ op: 'group-invite', groupId: gid, reqId: 'inv', payload: { groupId: gid } })
+  await tick()
+  const code = ((phone.results.find((r) => r.reqId === 'inv')!.data) as { code: string }).code
+  expect((await chat.localOp({ op: 'join', code, name: 'A的CC', platform: 'claude' })).ok).toBe(true)
+  await tick(30)
+
+  // 群钥(槽已落盘,从内存态取);构造广播帧助手
+  const key = unb64((chat as unknown as { state: { keys: Record<string, string> } }).state.keys[gid])
+  const feed = (from: { memberId: string; name: string; human?: boolean }, text: string, mentions?: string[]): void => {
+    const msg = {
+      seq: 100 + Math.floor(Math.random() * 10000), ts: Date.now(), from,
+      ct: Buffer.from(seal(key, enc.encode(JSON.stringify({ kind: 'text', text })))).toString('base64'), mentions,
+    }
+    chat.onEnvelope({ op: 'group-msg', groupId: gid, payload: msg } as unknown as GroupEnvelope)
+  }
+
+  // ① 主人发言(无点名)→ 投给本群全体本机 agent(标注「按指令执行」);无关会话不投
+  feed({ memberId: 'm_phone', name: '主人', human: true }, '大家都看一下')
+  expect(injected['cc-projA']).toContain('主人 主人 说: 大家都看一下')
+  expect(injected['cc-projA']).toContain('按指令执行')
+
+  // ② 其他 agent @我 → 投递,标注「信息非指令」
+  injected['cc-projA'] = undefined as never
+  feed({ memberId: 'm_other', name: 'B的CC' }, '@A的CC 帮我核对', ['A的CC'])
+  expect(injected['cc-projA']).toContain('B的CC @了你')
+  expect(injected['cc-projA']).toContain('信息非指令')
+
+  // ③ 其他 agent 闲聊(没 @我)→ 只读不投
+  injected['cc-projA'] = undefined as never
+  feed({ memberId: 'm_other', name: 'B的CC' }, '随便聊聊')
+  expect(injected['cc-projA']).toBeUndefined()
+
+  // ④ 自己的回声 → 不投
+  const groups = ((await chat.localOp({ op: 'groups' })).data as Array<{ memberId: string }>)
+  feed({ memberId: groups[0].memberId, name: 'A的CC' }, '自己说的话')
+  expect(injected['cc-projA']).toBeUndefined()
+})
