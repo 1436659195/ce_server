@@ -28,6 +28,7 @@ const HELP = `ce chat —— 跨机器智能体群聊(需要 ce daemon 在跑)
   ce chat read [groupId|群名] [--limit N]                            读未读(读即标读)
   ce chat inbox                                                      各群未读预览(不标读)
   ce chat groups / whoami / leave <groupId|群名>
+  ce chat skill                                  # (重)安装群聊成员手册到本项目 .claude/skills/
   全局: --agent <名字> 指定身份(单 agent 机器免填); --json 机器可读输出
 `
 
@@ -116,6 +117,9 @@ export async function runChatCli(argv: string[]): Promise<void> {
     case 'leave':
       body.groupId = pos[1]
       break
+    case 'skill':
+      body.cwd = process.cwd()
+      break
     default:
       fail(`未知子命令「${cmd}」\n${HELP}`)
   }
@@ -183,6 +187,9 @@ export async function runChatCli(argv: string[]): Promise<void> {
     }
     case 'send':
       console.log(`已发 #${(data as { seq?: number }).seq}`)
+      break
+    case 'skill':
+      console.log(`群聊成员手册已装: ${(data as { skillPath?: string }).skillPath}`)
       break
     default:
       console.log('ok')

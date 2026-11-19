@@ -28,6 +28,7 @@ import {
   type GroupStoredMsg,
 } from '../shared/group'
 import { classifySession, osProcLister, scanAgentProcsAll, type ProcEntry } from './session-scan'
+import { CE_CHAT_SKILL_MD, CE_CHAT_SKILL_NAME } from './chat-skill'
 
 /** 单 agent 的群成员身份(一 agent 可入多群)。 */
 interface AgentGroupRec {
@@ -197,6 +198,25 @@ export class ChatHub {
     }
   }
 
+  /**
+   * 邀请直投(用户定案:免复制粘贴):手机「添加成员」选中本机 cc-* 会话 → 隧道 RPC 到此,
+   * 把 join 指令塞进该会话 stdin 队列(InputQueue 等回合边界 = 安全点)。agent 自己执行即入群。
+   * 只投 ce 管辖的在册会话(sessions() 命中 sid);纯终端不在册 → false(手机端回落手动粘贴)。
+   */
+  deliverInvite(sid: string, code: string, name: string, groupName: string): boolean {
+    const runner = this.opts.agentRunner
+    if (!runner) return false
+    const known = runner.sessions().some((x) => x.sid === sid)
+    if (!known) return false
+    const instruction = `[群聊邀请] 你被邀请加入群「${groupName}」—— 执行下面这条命令入群(身份即「${name}」):\nce chat join ${code} --name "${name}"\n(入群后群消息会自动投递给你;回应用 ce chat send)`
+    try {
+      runner.writeStdin(sid, instruction)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   private groupNameOf(gid: string): string {
     for (const rec of Object.values(this.state.agents)) {
       const g = rec.groups[gid]
@@ -279,6 +299,12 @@ export class ChatHub {
           }))
         case 'roster':
           return { ok: true, data: await this.roster() }
+        case 'skill': {
+          // 手动(重)安装:--cwd 缺省 = 当前目录
+          const cwd = body.cwd ? String(body.cwd) : process.cwd()
+          this.writeSkill(cwd)
+          return { ok: true, data: { skillPath: join(cwd, '.claude', 'skills', CE_CHAT_SKILL_NAME, 'SKILL.md') } }
+        }
         case 'whoami':
           return {
             ok: true,
@@ -360,6 +386,7 @@ export class ChatHub {
     }
     rec.groups[gid] = { memberId: me.memberId, groupName: data.snapshot.meta.name, lastReadSeq: data.snapshot.seq }
     this.save()
+    this.writeSkill(rec.cwd ?? cwd)
     return { ok: true, data: { groupId: gid, groupName: data.snapshot.meta.name, memberId: me.memberId, members: data.snapshot.members } }
   }
 
@@ -472,6 +499,20 @@ export class ChatHub {
     delete rec.groups[gid]
     this.save()
     return { ok: true }
+  }
+
+  // ─── 技能安装(join 即装,agent 每次运行自带手册)──────────────────────────────
+
+  /** 把 ce-chat 成员手册写进项目 .claude/skills/(CC 自动加载项目技能)。幂等,可重装修订。 */
+  private writeSkill(cwd?: string): void {
+    if (!cwd) return
+    try {
+      const dir = join(cwd, '.claude', 'skills', CE_CHAT_SKILL_NAME)
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'SKILL.md'), CE_CHAT_SKILL_MD)
+    } catch (e) {
+      console.warn('[ce] ce-chat 技能写入失败(不影响入群):', (e as Error).message)
+    }
   }
 
   // ─── roster(识别判定链聚合;S2)──────────────────────────────────────────────
