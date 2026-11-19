@@ -97,6 +97,8 @@ export interface ChatHubOpts {
    * 绑定方式:join 时记录的 cwd ↔ 会话 cwd 匹配。
    */
   agentRunner?: GroupAgentRunner
+  /** 群广播挂载心跳间隔 ms(默认 60s;测试可调小)。 */
+  syncIntervalMs?: number
 }
 
 /** 会话运行器的最小接口(与 cli/agent-runner.ts AgentRunner 结构兼容)。 */
@@ -112,6 +114,31 @@ export class ChatHub {
 
   constructor(private readonly opts: ChatHubOpts) {
     this.load()
+    // 群广播挂载自愈心跳:daemon 每次启动/重连后,relay 侧的群扇出集需要重新挂;
+    // 周期性 sync(markRead:false,不动已读游标)保证「重启后群消息不漏」。挂载即到,
+    // 心跳本身零成本(本地一发一收,不走模型)。
+    const interval = this.opts.syncIntervalMs ?? 60_000
+    const timer = setInterval(() => this.bootSync(), interval)
+    if (typeof timer.unref === 'function') timer.unref()
+    setTimeout(() => this.bootSync(), 5_000) // 启动 5s 后先挂一次
+  }
+
+  /** 把注册表里全部 (agent, group) 重新挂上广播扇出;顺带刷新 presence。fire-and-forget。 */
+  bootSync(): void {
+    for (const rec of Object.values(this.state.agents)) {
+      for (const [gid, g] of Object.entries(rec.groups)) {
+        try {
+          this.rpc('group-sync', gid, {
+            groupId: gid,
+            memberId: g.memberId,
+            afterSeq: g.lastReadSeq,
+            markRead: false,
+          }).catch(() => undefined)
+        } catch {
+          /* 单群失败不影响其他 */
+        }
+      }
+    }
   }
 
   // ─── 状态(0600;含群钥,等同凭据对待)──────────────────────────────────────────

@@ -447,3 +447,65 @@ test('L2 twin 续接:第二跑 --resume 同一 session;交班本变更 → 重�
   expect(second[resumeIdx + 1]).toBe(uuid)
   expect(second[second.length - 1]).not.toContain('我们群里只聊技术') // 嘱咐已在上下文,不重注
 })
+
+test('L2 挂载自愈心跳:周期 sync 保持 fanout(重启后群广播不漏的根修)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-chat-hb-'))
+  const hub = new Hub(join(dir, 'state.json'), 100, null, join(dir, 'groups-state.json'))
+  const ceKp = generateKeyPair()
+  const cliWs = new TestWS('cli', (data) => {
+    // 记录 daemon 发出的群帧(sync 也在其中)
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) hubFrames.push(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch { /* hub 通知 */ }
+  })
+  const hubFrames: GroupEnvelope[] = []
+  const { sid, token } = hub.register('machineA', cliWs)
+  const phoneWs = new TestWS('phone', () => {})
+  hub.joinPhone(sid, token, phoneWs, 'ph_1')
+  const phone = new PhoneSim(hub, phoneWs)
+  phoneWs.onWire = (data) => {
+    const f = decodeFrame(enc.encode(data))
+    if (f.type === FrameType.GroupFrame) phone.receive(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+  }
+  const sentFrames: GroupEnvelope[] = []
+  const chat = new ChatHub({
+    cid: 'machineA',
+    privKey: ceKp.privateKey,
+    pubKey: ceKp.publicKey,
+    statePath: join(dir, 'chat-state.json'),
+    sendEnvelope: (env) => {
+      sentFrames.push(env)
+      hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) }))
+    },
+    syncIntervalMs: 200,
+  })
+  cliWs.onWire = (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) {
+        const env = JSON.parse(dec.decode(f.payload)) as GroupEnvelope
+        hubFrames.push(env)
+        chat.onEnvelope(env)
+      }
+    } catch { /* hub 通知 */ }
+  }
+
+  // 建群(join 由手机发起的时代模拟略 —— 直接造状态:注册 agent 进群要用邀请,这里走全流程)
+  phone.send({ op: 'group-create', reqId: 'create', payload: { meta: { name: '心跳群' }, ownerName: '主人' } })
+  await tick()
+  const gid = ((phone.results.find((r) => r.reqId === 'create')!.data) as { groupId: string }).groupId
+  phone.send({ op: 'group-invite', groupId: gid, reqId: 'inv', payload: { groupId: gid } })
+  await tick()
+  const code = ((phone.results.find((r) => r.reqId === 'inv')!.data) as { code: string }).code
+  const joined = await chat.localOp({ op: 'join', code, name: '心跳CC', cwd: process.cwd() })
+  expect(joined.ok).toBe(true)
+
+  // 心跳周期(200ms)内应发出 group-sync(markRead:false)
+  await tick(500)
+  const syncs = sentFrames.filter((e) => e.op === 'group-sync' && e.groupId === gid)
+  expect(syncs.length).toBeGreaterThan(0)
+  const payload = syncs[0].payload as { markRead?: boolean; memberId?: string }
+  expect(payload.markRead).toBe(false) // 偷看式挂载:不动已读游标
+  expect(payload.memberId).toBeTruthy() // 带成员身份(relay 据此挂 fanout)
+}, 15000)
