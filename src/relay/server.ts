@@ -253,6 +253,8 @@ export function createRelayServer(
         const tpl = readFileSync(opts.hirePagePath, 'utf8')
         const body = tpl.replaceAll('__NACL_JS__', () => hireNaclJs(opts.hireNaclPath!)) // 函数替换:防 $ 序列被解释
         res.setHeader('Content-Type', 'text/html; charset=utf-8')
+        // no-store:页面迭代期访客浏览器缓存旧版 = 「发了不显示」类玄学(2026-11-20 实测教训)
+        res.setHeader('Cache-Control', 'no-store')
         res.setHeader('Content-Length', Buffer.byteLength(body))
         res.end(body)
       } catch {
