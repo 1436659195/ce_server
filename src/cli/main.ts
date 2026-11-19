@@ -534,24 +534,6 @@ async function main(): Promise<void> {
   // 群聊枢纽(agent-group S1 底座):本机 agent 注册表 + 群钥 + GroupFrame 收发。
   // sendEnvelope 直出明文信封(正文群钥密文,relay 只见信封);ws 未连时 sendFrame 静默丢弃,
   // 群操作靠 10s 超时报错(见 chat.ts)。信任边缘在 daemon:`ce chat` CLI 只走本地 HTTP。
-  const chatHub = new ChatHub({
-    cid,
-    privKey: identity.privateKey,
-    pubKey: identity.publicKey,
-    statePath: join(homedir(), '.ce', 'chat-state.json'),
-    sendEnvelope: (env) => sendFrame({ type: FrameType.GroupFrame, payload: enc.encode(JSON.stringify(env)) }),
-    // roster 数据源:本机会话表(jupyter 终端 + ce 管辖的 agent 会话;识别判定链在 ChatHub)
-    rosterSessions: async () => {
-      let terminals: Array<{ name: string; cwd?: string }> = []
-      try {
-        // jupyter 终端无 cwd(bridge 注释:jupyter 终端无此字段)→ 无 cwd 证据,归类走「待确认」
-        terminals = (await listTerminalsRetry(jupyter)).map((t) => ({ name: t.name }))
-      } catch {
-        /* jupyter 不在:终端候选空 */
-      }
-      return { terminals, agentSessions: agentRunner.sessions().map((s) => ({ sid: s.sid, cwd: s.cwd })) }
-    },
-  })
 
   const jupyter = makeJupyterClient(baseUrl, token, root)
   // 大文件分段上传会话(root 内直接 node:fs 落盘;见 uploads.ts 头注)
@@ -620,6 +602,24 @@ async function main(): Promise<void> {
     cwd: root, // jupyter root_dir(OS 路径):CC 对话 cwd 的 base,手机传的相对路径相对它拼
   })
   let qrPrinted = false
+  const chatHub = new ChatHub({
+    cid,
+    privKey: identity.privateKey,
+    pubKey: identity.publicKey,
+    statePath: join(homedir(), '.ce', 'chat-state.json'),
+    sendEnvelope: (env) => sendFrame({ type: FrameType.GroupFrame, payload: enc.encode(JSON.stringify(env)) }),
+    // roster 数据源:本机会话表(jupyter 终端 + ce 管辖的 agent 会话;识别判定链在 ChatHub)
+    rosterSessions: async () => {
+      let terminals: Array<{ name: string; cwd?: string }> = []
+      try {
+        // jupyter 终端无 cwd(bridge 注释:jupyter 终端无此字段)→ 无 cwd 证据,归类走「待确认」
+        terminals = (await listTerminalsRetry(jupyter)).map((t) => ({ name: t.name }))
+      } catch {
+        /* jupyter 不在:终端候选空 */
+      }
+      return { terminals, agentSessions: agentRunner.sessions().map((s) => ({ sid: s.sid, cwd: s.cwd })) }
+    },
+  })
   let reconnectDelay = 2000
 
   // ── CC 移动审查楔子(M25 通用审批 + M26 CC hooks 本地接收器)───────────────────────
