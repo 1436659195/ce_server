@@ -31,6 +31,13 @@ function serveStatic(res: ServerResponse, req: IncomingMessage, filePath: string
   }
 }
 
+/** tweetnacl 浏览器版(访客页内嵌;读一次缓存)。文件缺失抛错 → /hire 500(部署缺件可见)。 */
+let naclCache: string | null = null
+function hireNaclJs(path: string): string {
+  if (naclCache === null) naclCache = readFileSync(path, 'utf8')
+  return naclCache
+}
+
 /**
  * 把 Hub(纯逻辑)接到真实 WebSocket 上。
  *
@@ -59,6 +66,10 @@ export function createRelayServer(
     workshopScaffoldPath?: string
     workshopScaffoldSha256Path?: string
     workshopIndexPath?: string
+    /** 雇佣网关(2026-11-19):访客聊天页模板(缺则 /hire 404)+ tweetnacl 浏览器版
+     *  (模板 __NACL_JS__ 占位处内嵌;与手机/ce 同一套密文格式)。 */
+    hirePagePath?: string
+    hireNaclPath?: string
     publicUrl?: string // 对外中继 ws 地址(防 Host 头注入 install 脚本);不配则回退请求 Host
     /** 心跳:每 intervalMs ping 一次,连续 maxMissed 次无 pong 判死 terminate。缺省 30s/2。
      *  测试注入小值加速;治 half-open 死连接(断网/热点切换/NAT 超时,双方无数据则永不发现)。 */
@@ -231,6 +242,25 @@ export function createRelayServer(
       serveStatic(res, req, opts.workshopIndexPath, 'application/json; charset=utf-8', 'index.json')
       return
     }
+    if (path === '/hire' || path.startsWith('/hire/')) {
+      // 雇佣网关访客页(单文件;code 从 path、房钥从 URL fragment —— fragment 不随请求上行,relay 不见钥)
+      if (!opts?.hirePagePath || !opts?.hireNaclPath) {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      try {
+        const tpl = readFileSync(opts.hirePagePath, 'utf8')
+        const body = tpl.replaceAll('__NACL_JS__', () => hireNaclJs(opts.hireNaclPath!)) // 函数替换:防 $ 序列被解释
+        res.setHeader('Content-Type', 'text/html; charset=utf-8')
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
+      } catch {
+        res.writeHead(500)
+        res.end('hire page 不可读')
+      }
+      return
+    }
     res.writeHead(404)
     res.end('not found')
   }
@@ -265,6 +295,18 @@ export function createRelayServer(
     return e.n <= REGISTER_MAX
   }
 
+  // 雇佣码防爆破(Pachat 入口同款):错码 3 次/IP → 锁 24h。内存态(v1 取舍:relay 重启清零,
+  // 码空间 32^8 足够大,24h 窗口内重启窗口可忽略;持久化是 v2)。
+  const GUEST_FAIL_MAX = 3
+  const GUEST_LOCK_MS = 24 * 60 * 60 * 1000
+  const guestFails = new Map<string, { n: number; lockedUntil: number }>()
+  const noteGuestFail = (ip: string): void => {
+    const e = guestFails.get(ip) ?? { n: 0, lockedUntil: 0 }
+    e.n++
+    if (e.n >= GUEST_FAIL_MAX) e.lockedUntil = Date.now() + GUEST_LOCK_MS
+    guestFails.set(ip, e)
+  }
+
   // 心跳默认值(生产 30s/2;测试经 opts.heartbeat 注入小值)
   const hb = opts?.heartbeat ?? { intervalMs: 30_000, maxMissed: 2 }
 
@@ -295,6 +337,34 @@ export function createRelayServer(
       const { sid, token: tok } = hub.register(cid, ws as RelayWS)
       ws.send(JSON.stringify({ type: 'registered', sid, token: tok }))
       wire(ws)
+    } else if (path === '/guest') {
+      // 雇佣网关访客通路(2026-11-19):code 走首帧 guest-hello(不进 URL/日志);防爆破错 3 次/IP 锁 24h。
+      const ip = req.socket.remoteAddress ?? '?'
+      const lock = guestFails.get(ip)
+      if (lock && lock.lockedUntil > Date.now()) {
+        ws.send(JSON.stringify({ type: 'error', reason: '尝试次数过多,已锁定 24 小时' }), () => ws.close())
+        return
+      }
+      let helloed = false
+      ws.on('message', (data) => {
+        if (helloed) return // 已入房:交给 wire 的正式处理器
+        helloed = true
+        let code = ''
+        try {
+          code = String((JSON.parse(data.toString()) as { type?: string; code?: string }).code ?? '')
+        } catch {
+          /* 非 JSON:code 保持空,走同一条错码路径 */
+        }
+        const r = hub.guestJoin(ws as RelayWS, code)
+        if (!r.ok) {
+          noteGuestFail(ip)
+          ws.send(JSON.stringify({ type: 'error', reason: r.error }), () => ws.close())
+          return
+        }
+        guestFails.delete(ip) // 成功即清计数
+        ws.send(JSON.stringify({ type: 'guest-joined', groupId: r.groupId, memberId: r.memberId, groupName: r.groupName }))
+        wire(ws)
+      })
     } else {
       // phone 加入:path = '/{sid}?token=xxx&phoneId=yyy'
       // phoneId 为手机持久身份(多 phone 共连路由用);老 phone 无 phoneId → 匿名(退化可用)

@@ -20,6 +20,7 @@ import {
   GROUP_LIMITS,
   type GroupAckReq,
   type GroupEnvelope,
+  type GroupHireInfo,
   type GroupInvite,
   type GroupJoinReq,
   type GroupLeaveReq,
@@ -27,6 +28,7 @@ import {
   type GroupMeta,
   type GroupMetaEvent,
   type GroupPostReq,
+  type GroupRevokeReq,
   type GroupResult,
   type GroupSnapshot,
   type GroupStoredMsg,
@@ -41,7 +43,7 @@ interface GroupWS {
 /** Hub 提供的上下文(连接身份 + 发送 + 持久化回调)。 */
 export interface GroupRegistryCtx {
   /** 连接身份(未注册 ws → undefined)。cid 即被控机标识(register(cid) 的同一标识)。 */
-  meta(src: GroupWS): { role: 'cli' | 'phone'; phoneId?: string; cid?: string } | undefined
+  meta(src: GroupWS): { role: 'cli' | 'phone' | 'guest'; phoneId?: string; cid?: string } | undefined
   /** 发原始 wire 字符串(实现内自 try/catch)。 */
   send(ws: GroupWS, data: string): void
   /** 读持久化全文(无 → null);写全文(明文,由 Hub 负责加密)。 */
@@ -62,6 +64,8 @@ interface GroupStore {
   invites: GroupInvite[]
   /** 群钥密文槽(memberId → slot;成员机离线时暂存,连上即转,转达即焚)。relay 不解槽。 */
   slots: Map<string, string>
+  /** 雇佣码(网页访客凭据;随房间存续,group-hire-set 轮换即换)。缺省 = 未开门。 */
+  hire?: { code: string; createdAt: number }
 }
 
 /** 单群存量上限(防无限增长;裁剪只掉最旧,seq 连续性由 baseSeq 记录)。 */
@@ -95,7 +99,7 @@ type ClientOp = Exclude<
 >
 
 /** 连接身份(hub wsMeta 的形状;本地重声明避免循环依赖)。 */
-type Ctx = { role: 'cli' | 'phone'; phoneId?: string; cid?: string }
+type Ctx = { role: 'cli' | 'phone' | 'guest'; phoneId?: string; cid?: string }
 
 export class GroupRegistry {
   private groups = new Map<string, GroupStore>()
@@ -120,6 +124,7 @@ export class GroupRegistry {
       if (o.v !== 1 || !Array.isArray(o.groups)) return
       for (const s of o.groups) {
         if (!s?.id) continue
+        const hire = s.hire as { code: string; createdAt: number } | undefined
         this.groups.set(s.id, {
           meta: s.meta as GroupMeta,
           ownerPhoneId: s.ownerPhoneId as string,
@@ -130,6 +135,7 @@ export class GroupRegistry {
           opKeys: new Map((s.opKeys as [string, number][]) ?? []),
           invites: (s.invites as GroupInvite[]) ?? [],
           slots: new Map((s.slots as [string, string][]) ?? []),
+          hire,
         })
       }
     } catch {
@@ -150,6 +156,7 @@ export class GroupRegistry {
         opKeys: Array.from(g.opKeys.entries()),
         invites: g.invites,
         slots: Array.from(g.slots.entries()),
+        hire: g.hire,
       }))
       this.ctx.saveState(JSON.stringify({ v: 1, groups }))
     } catch {
@@ -240,12 +247,17 @@ export class GroupRegistry {
 
   // ─── 成员解析(hub 钳定 from)────────────────────────────────────────────────
 
-  /** phone → 其 human 成员;cli → 断言 memberId 校验 machineId,或按 cid 唯一成员。 */
-  private member(id: { role: 'cli' | 'phone'; phoneId?: string; cid?: string }, g: GroupStore, asserted?: string): GroupMember | undefined {
+  /** phone → 其 human 成员;guest → 断言 memberId(须 guest 成员);cli → 断言 memberId 校验
+   *  machineId,或按 cid 唯一成员。 */
+  private member(id: Ctx, g: GroupStore, asserted?: string): GroupMember | undefined {
     if (id.role === 'phone') {
       if (!id.phoneId) return undefined
       for (const m of g.members.values()) if (m.phoneId === id.phoneId) return m
       return undefined
+    }
+    if (id.role === 'guest') {
+      const m = asserted ? g.members.get(asserted) : undefined
+      return m && m.guest ? m : undefined
     }
     if (asserted) {
       const m = g.members.get(asserted)
@@ -491,6 +503,78 @@ export class GroupRegistry {
       this.save()
       this.reply(src, { reqId: env.reqId ?? '', ok: true })
     },
+
+    'group-hire-set': (src, id, env) => {
+      // 雇佣码签发/轮换:群主限定;再调一次 = 轮换(旧码即死)。relay 不看 meta.kind ——
+      // kind 是手机/ce 的语义标签,relay 只管凭据(哑管道)。
+      const g = env.groupId ? this.groups.get(env.groupId) : undefined
+      if (!g) {
+        this.reply(src, err('no_group', '群不存在'), env.reqId)
+        return
+      }
+      if (id.role !== 'phone' || id.phoneId !== g.ownerPhoneId) {
+        this.reply(src, err('not_member', '只有群主能签发雇佣码'), env.reqId)
+        return
+      }
+      g.hire = { code: inviteCode(), createdAt: now() }
+      this.save()
+      const info: GroupHireInfo = { code: g.hire.code, groupId: env.groupId!, createdAt: g.hire.createdAt }
+      this.reply(src, { reqId: env.reqId ?? '', ok: true, data: info })
+    },
+
+    'group-revoke': (src, id, env) => {
+      // 撤回(宪法 #3):作者本人或群主。relay 置 revokedAt 清 ct,重播 group-msg —— 正文不可恢复。
+      const g = env.groupId ? this.groups.get(env.groupId) : undefined
+      if (!g) {
+        this.reply(src, err('no_group', '群不存在'), env.reqId)
+        return
+      }
+      const p = env.payload as GroupRevokeReq | undefined
+      if (!p || typeof p.seq !== 'number') {
+        this.reply(src, err('no_group', '缺 seq'), env.reqId)
+        return
+      }
+      const msg = g.msgs.find((m) => m.seq === p.seq)
+      if (!msg || msg.revokedAt) {
+        this.reply(src, err('no_group', '消息不存在或已撤回'), env.reqId)
+        return
+      }
+      const sender = this.member(id, g, p.memberId)
+      const isOwner = id.role === 'phone' && id.phoneId === g.ownerPhoneId
+      const isAuthor = sender ? sender.memberId === msg.from.memberId : false
+      if (!isOwner && !isAuthor) {
+        this.reply(src, err('not_member', '只有作者本人或群主能撤回'), env.reqId)
+        return
+      }
+      msg.revokedAt = now()
+      msg.ct = ''
+      delete msg.opKey
+      this.save()
+      this.broadcast(env.groupId!, { op: 'group-msg', groupId: env.groupId, payload: msg })
+      this.reply(src, { reqId: env.reqId ?? '', ok: true })
+    },
+  }
+
+  /** /guest 通路的雇佣码验证 + guest 成员绑定(server.ts 的 guest 升级路径调;hub 不经手)。 */
+  guestHello(code: string, ws: GroupWS): { ok: true; groupId: string; memberId: string; groupName: string } | { ok: false; error: string } {
+    const hit = Array.from(this.groups.entries()).find(([, g]) => g.hire?.code === code)
+    if (!hit) return { ok: false, error: '雇佣码不存在(确认链接完整;错 3 次将锁定 24 小时)' }
+    const groupId = hit[0]
+    const g = hit[1]
+    let m = Array.from(g.members.values()).find((x) => x.guest)
+    if (!m) {
+      if (g.members.size >= GROUP_LIMITS.membersPerGroup) return { ok: false, error: '房间已满' }
+      const t = now()
+      m = { memberId: 'm_' + randId(4), name: '雇主', human: true, guest: true, joinedAt: t, lastSeenAt: t, readUpTo: g.seq }
+      g.members.set(m.memberId, m)
+      // 先广播再挂扇出:guest 不收自己的加入事件(与 join 的顺序约定一致)
+      this.broadcast(groupId, { op: 'group-meta', groupId, payload: { event: 'member-joined', groupId, member: m } satisfies GroupMetaEvent })
+    }
+    m.lastSeenAt = now()
+    this.fanoutAdd(groupId, ws)
+    this.bindMember(groupId, m.memberId, ws)
+    this.save()
+    return { ok: true, groupId, memberId: m.memberId, groupName: g.meta.name }
   }
 
   private doJoin(src: GroupWS, p: GroupJoinReq, cid: string, env: GroupEnvelope): void {
@@ -578,6 +662,14 @@ export class GroupRegistry {
       }
     }
     // 未读不发纪律:他人最新 seq > 己方 readUpTo → 拒发并附带那些消息(替其标读)
+    // guest 先过发言限速(雇佣房间防刷;按近 1h 该成员条数计)
+    if (m.guest) {
+      const hourAgo = now() - 3_600_000
+      if (g.msgs.filter((x) => x.from.memberId === m.memberId && x.ts > hourAgo).length >= GROUP_LIMITS.guestMsgsPerHour) {
+        this.reply(src, err('rate_limited', '发言太频繁,稍后再试'))
+        return
+      }
+    }
     const othersLatest = [...g.msgs].reverse().find((msg) => msg.from.memberId !== m.memberId)?.seq ?? 0
     if (othersLatest > (p.readUpTo ?? 0)) {
       const unread = g.msgs.filter((msg) => msg.seq > (p.readUpTo ?? 0) && msg.from.memberId !== m.memberId)

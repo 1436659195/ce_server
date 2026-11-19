@@ -28,7 +28,7 @@ const HELP = `ce chat —— 跨机器智能体群聊(需要 ce daemon 在跑)
   ce chat read [groupId|群名] [--limit N]                            读未读(读即标读)
   ce chat inbox                                                      各群未读预览(不标读)
   ce chat groups / whoami / leave <groupId|群名>
-  ce chat notes ["追加的嘱咐"]                        # 查看/追加交班本(长期嘱咐,twin 新会话时注入)
+  ce chat revoke <groupId|群名> <seq>                # 撤回自己的一条消息(读即标读不可逆,撤回要趁早)
   ce chat skill                                  # (重)安装群聊成员手册到本项目 .claude/skills/
   全局: --agent <名字> 指定身份(单 agent 机器免填); --json 机器可读输出
 `
@@ -119,6 +119,10 @@ export async function runChatCli(argv: string[]): Promise<void> {
     case 'leave':
       body.groupId = pos[1]
       break
+    case 'revoke':
+      body.groupId = pos[1]
+      body.seq = Number(pos[2])
+      break
     case 'skill':
       body.cwd = process.cwd()
       break
@@ -159,7 +163,7 @@ export async function runChatCli(argv: string[]): Promise<void> {
   switch (cmd) {
     case 'read':
     case 'inbox': {
-      type Item = { groupId?: string; groupName?: string; unread?: number; msgs?: Array<{ seq: number; fromName: string; fromHuman?: boolean; text: string }>; previews?: Array<{ seq: number; fromName: string; text: string }>; mentionsMe?: boolean }
+      type Item = { groupId?: string; groupName?: string; unread?: number; msgs?: Array<{ seq: number; fromName: string; fromHuman?: boolean; text: string; revoked?: boolean }>; previews?: Array<{ seq: number; fromName: string; text: string; revoked?: boolean }>; mentionsMe?: boolean }
       const items: Item[] =
         cmd === 'read'
           ? [data as unknown as Item]
@@ -168,7 +172,7 @@ export async function runChatCli(argv: string[]): Promise<void> {
         const list = it.msgs ?? it.previews ?? []
         const head = cmd === 'read' ? `── ${it.groupName ?? ''} ──` : `${it.groupName}(未读 ${it.unread}${it.mentionsMe ? ' · 有人@你' : ''})`
         console.log(head)
-        for (const m of list) console.log(`  #${m.seq} ${m.fromName}${'fromHuman' in m && (m as { fromHuman?: boolean }).fromHuman ? '[人]' : ''}: ${m.text}`)
+        for (const m of list) console.log(`  #${m.seq} ${m.fromName}${'fromHuman' in m && (m as { fromHuman?: boolean }).fromHuman ? '[人]' : ''}: ${m.revoked ? '(已撤回)' : m.text}`)
       }
       if (cmd === 'inbox' && items.every((it) => (it.unread ?? 0) === 0)) console.log('(所有群都无未读)')
       break

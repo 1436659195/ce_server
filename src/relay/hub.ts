@@ -96,7 +96,7 @@ function cliLeftNotice(): string {
  */
 export class Hub {
   private sessions = new Map<string, Session>()
-  private wsMeta = new Map<RelayWS, { sid: string; role: 'cli' | 'phone'; phoneId?: string; cid?: string }>()
+  private wsMeta = new Map<RelayWS, { sid: string; role: 'cli' | 'phone' | 'guest'; phoneId?: string; cid?: string; groupId?: string }>()
   private cidToEntry = new Map<string, PersistEntry>()
   private statePath: string | null
   private readonly maxEntries: number
@@ -116,6 +116,7 @@ export class Hub {
               const m = this.wsMeta.get(ws)
               return m ? { role: m.role, phoneId: m.phoneId, cid: m.cid } : undefined
             },
+            // (guest 的 meta 走同一回调:wsMeta.role='guest',registry 按 guest 分支解析成员)
             send: (ws, data) => {
               try {
                 ws.send(data)
@@ -327,6 +328,10 @@ export class Hub {
         /* 非法/非 JSON 帧:落回下方 role 路由兜底(向后兼容历史裸字符串) */
       }
     }
+    if (meta.role === 'guest') {
+      // guest(网页访客)只许 GroupFrame:其他帧一律丢弃 —— 公网大堂绝不进 session 隧道
+      return
+    }
     const s = this.sessions.get(meta.sid)
     if (!s) return
     if (meta.role === 'cli') {
@@ -397,33 +402,46 @@ export class Hub {
   onClose(src: RelayWS): void {
     const meta = this.wsMeta.get(src)
     if (!meta) return
-    const s = this.sessions.get(meta.sid)
-    if (s) {
-      if (meta.role === 'cli') {
-        s.cli = null
-        // ce 掉线:给该 session 所有在线 phone 发明文通知(手机立即进「重连等待」而非无感卡死)。
-        //   零信任边界不变:hub 只生成控制通知,不解密任何负载(与 phoneLeft 同款)。
-        for (const ws of s.phones.keys()) {
-          try {
-            ws.send(cliLeftNotice())
-          } catch {
-            /* phone ws 已关 */
+    if (meta.role !== 'guest') {
+      const s = this.sessions.get(meta.sid)
+      if (s) {
+        if (meta.role === 'cli') {
+          s.cli = null
+          // ce 掉线:给该 session 所有在线 phone 发明文通知(手机立即进「重连等待」而非无感卡死)。
+          //   零信任边界不变:hub 只生成控制通知,不解密任何负载(与 phoneLeft 同款)。
+          for (const ws of s.phones.keys()) {
+            try {
+              ws.send(cliLeftNotice())
+            } catch {
+              /* phone ws 已关 */
+            }
           }
-        }
-      } else {
-        s.phones.delete(src)
-        // phone 断:给 cli 发明文控制通知(hub 生成,非加密帧),cli 据此清该 phone 的 E2E 通道与 owner
-        if (meta.phoneId !== undefined && s.cli) {
-          try {
-            s.cli.send(phoneLeftNotice(meta.phoneId))
-          } catch {
-            /* cli ws 已关 */
+        } else {
+          s.phones.delete(src)
+          // phone 断:给 cli 发明文控制通知(hub 生成,非加密帧),cli 据此清该 phone 的 E2E 通道与 owner
+          if (meta.phoneId !== undefined && s.cli) {
+            try {
+              s.cli.send(phoneLeftNotice(meta.phoneId))
+            } catch {
+              /* cli ws 已关 */
+            }
           }
         }
       }
     }
-    // 群扇出集摘除断开的连接(成员资格/消息保留在 groups state)
+    // 群扇出集摘除断开的连接(成员资格/消息保留在 groups state;guest 的 ws 同在此摘除)
     this.groups?.onClose(src)
     this.wsMeta.delete(src)
+  }
+
+  /**
+   * guest(网页访客)连入:雇佣码验证交给 GroupRegistry.guestHello,通过则挂 wsMeta(role 'guest')。
+   * 错码锁定(3 次/IP 24h)属连接层防爆破,在 server.ts 升级路径做。
+   */
+  guestJoin(ws: RelayWS, code: string): { ok: true; groupId: string; memberId: string; groupName: string } | { ok: false; error: string } {
+    if (!this.groups) return { ok: false, error: '群注册表未启用' }
+    const r = this.groups.guestHello(code, ws)
+    if (r.ok) this.wsMeta.set(ws, { sid: 'guest', role: 'guest', groupId: r.groupId })
+    return r
   }
 }

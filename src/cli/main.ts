@@ -46,7 +46,7 @@ import { ensureJupyter, promptUnanswerable, type JupyterInstallDeps } from './ju
 import { resolvePythonBin } from './python'
 import { runConsole } from './console'
 import { installWorkshop, defaultWorkshopRoot, resolveWorkshopDir } from './workshop'
-import { ChatHub } from './chat'
+import { ChatHub, type HireQuota } from './chat'
 import { runChatCli } from './chat-cli'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
@@ -1476,6 +1476,17 @@ async function main(): Promise<void> {
           } else if (req.op === 'chat.roster') {
             // 群聊 roster(S2):手机挑成员用 —— 注册/疑似/终端候选,识别判定链在 ChatHub.roster
             resp = { ok: true, data: await chatHub.roster() }
+          } else if (req.op === 'chat.hireSetup') {
+            // 雇佣开门(2026-11-19 雇佣网关):用邀请码本地 join 入雇佣房间 + 记配额账本
+            const q = req as { code?: string; name?: string; quota?: HireQuota }
+            resp = await chatHub.hireSetup({ code: q.code ?? '', name: q.name ?? '', quota: q.quota })
+          } else if (req.op === 'chat.hireStatus') {
+            // 雇佣账本一览(手机雇佣页展示额度/用量)
+            resp = chatHub.hireStatus()
+          } else if (req.op === 'chat.hireClose') {
+            // 关灯:删 ce 侧账本(房间解散走手机 group-dissolve 既有通道)
+            const q = req as { groupId?: string }
+            resp = chatHub.hireClose({ groupId: q.groupId ?? '' })
           } else if (req.op === 'httpProxy') {
             // 本地 API 转发(套壳 APP 场景:手机经隧道调被控机本地 HTTP 服务,与 Jupyter 无关)。
             // 上游白名单用启动时 cfg.apiUpstreams(~/.ce/config.json;改配置须重启 ce 生效)。

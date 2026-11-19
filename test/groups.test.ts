@@ -265,3 +265,110 @@ test('持久化回放:重启(load)后群还在,消息seq连续', () => {
   expect(r2.reg.groupIds().length).toBe(1)
   expect(r2.reg.groupIds()).toEqual(r1.reg.groupIds())
 })
+
+// ─── 雇佣网关(2026-11-19):雇佣码 / guest / 撤回 ─────────────────────────────
+
+test('雇佣码:群主签发,他人拒,轮换即废旧码', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const other = new FakeWS('other-phone')
+  const { groupId } = createAndInvite(reg, phone)
+  bind(reg, other, { role: 'phone', phoneId: 'ph_2' })
+
+  reg.handle(other, JSON.stringify({ op: 'group-hire-set', groupId, reqId: 'h0', payload: { groupId } }))
+  expect((other.last().payload as GroupResult).ok).toBe(false)
+
+  reg.handle(phone, JSON.stringify({ op: 'group-hire-set', groupId, reqId: 'h1', payload: { groupId } }))
+  const h1 = (phone.last().payload as GroupResult).data as { code: string }
+  reg.handle(phone, JSON.stringify({ op: 'group-hire-set', groupId, reqId: 'h2', payload: { groupId } }))
+  const h2 = (phone.last().payload as GroupResult).data as { code: string }
+  expect(h2.code).not.toBe(h1.code)
+
+  // 旧码已死,新码可进
+  expect(reg.guestHello(h1.code, new FakeWS('g0')).ok).toBe(false)
+  const hello = reg.guestHello(h2.code, new FakeWS('g1'))
+  expect(hello.ok).toBe(true)
+})
+
+test('guestHello:首次建「雇主」成员,重连复用同一成员', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const { groupId } = createAndInvite(reg, phone)
+  reg.handle(phone, JSON.stringify({ op: 'group-hire-set', groupId, reqId: 'h1', payload: { groupId } }))
+  const hire = (phone.last().payload as GroupResult).data as { code: string }
+
+  expect(reg.guestHello('WRONG-CODE1', new FakeWS('g0')).ok).toBe(false)
+  const g1 = new FakeWS('g1')
+  const r1 = reg.guestHello(hire.code, g1)
+  const g2 = new FakeWS('g2')
+  const r2 = reg.guestHello(hire.code, g2)
+  expect(r1.ok && r2.ok).toBe(true)
+  if (r1.ok && r2.ok) expect(r2.memberId).toBe(r1.memberId)
+  // 手机收到了雇主加入广播(human 成员)
+  const meta = phone.last()
+  expect(meta.op).toBe('group-meta')
+  expect(((meta.payload as { member?: { human?: boolean; guest?: true } }).member)?.guest).toBe(true)
+})
+
+test('guest 发言:扇出全房间 + 每小时限速', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const cli = new FakeWS('cli')
+  const { groupId, code } = createAndInvite(reg, phone)
+  bind(reg, cli, { role: 'cli', cid: 'machineA' })
+  reg.handle(cli, JSON.stringify({ op: 'group-join', reqId: 'j1', payload: { inviteCode: code, member: { name: 'A的CC', machineId: 'machineA' } } }))
+  reg.handle(phone, JSON.stringify({ op: 'group-hire-set', groupId, reqId: 'h1', payload: { groupId } }))
+  const hire = (phone.last().payload as GroupResult).data as { code: string }
+  const guest = new FakeWS('guest')
+  bind(reg, guest, { role: 'guest' })
+  const hr = reg.guestHello(hire.code, guest)
+  if (!hr.ok) throw new Error('guest hello 应成功')
+  guest.sent.length = 0 // 清 hello 阶段帧
+
+  for (let i = 1; i <= 30; i++) {
+    reg.handle(guest, JSON.stringify({ op: 'group-post', groupId, reqId: 'p' + i, payload: { ct: 'CIPHERTEXT', memberId: hr.memberId, readUpTo: i - 1 } }))
+    expect((guest.last().payload as GroupResult).ok).toBe(true)
+  }
+  reg.handle(guest, JSON.stringify({ op: 'group-post', groupId, reqId: 'p31', payload: { ct: 'CIPHERTEXT', memberId: hr.memberId, readUpTo: 30 } }))
+  expect((guest.last().payload as GroupResult).error?.code).toBe('rate_limited')
+  // 房间成员收到了 guest 广播(from.human)
+  expect(phone.last().op).toBe('group-msg')
+  expect((phone.last().payload as GroupStoredMsg).from.human).toBe(true)
+})
+
+test('撤回:作者/群主可撤,他人不可;撤后密文清空重播墓碑', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const cliA = new FakeWS('cliA')
+  const cliB = new FakeWS('cliB')
+  const { groupId, code } = createAndInvite(reg, phone)
+  bind(reg, cliA, { role: 'cli', cid: 'machineA' })
+  reg.handle(cliA, JSON.stringify({ op: 'group-join', reqId: 'j1', payload: { inviteCode: code, member: { name: 'A的CC', machineId: 'machineA' } } }))
+  const snapA = (cliA.last().payload as GroupResult).data as { snapshot: { members: Array<{ memberId: string; name: string }> } }
+  const midA = snapA.snapshot.members.find((m) => m.name === 'A的CC')!.memberId
+  bind(reg, cliB, { role: 'cli', cid: 'machineB' })
+  reg.handle(cliB, JSON.stringify({ op: 'group-join', reqId: 'j2', payload: { inviteCode: code, member: { name: 'B的CC', machineId: 'machineB' } } }))
+  const snapB = (cliB.last().payload as GroupResult).data as { snapshot: { members: Array<{ memberId: string; name: string }> } }
+  const midB = snapB.snapshot.members.find((m) => m.name === 'B的CC')!.memberId
+
+  // A 发一条(opKey 幂等键保留在索引里,撤后重放不复活消息)
+  reg.handle(cliA, JSON.stringify({ op: 'group-post', groupId, reqId: 'p1', payload: { ct: 'SECRET_CT', opKey: 'k1', memberId: midA, readUpTo: 0 } }))
+  // B 想撤 A 的 → 拒
+  reg.handle(cliB, JSON.stringify({ op: 'group-revoke', groupId, reqId: 'r0', payload: { seq: 1, memberId: midB } }))
+  expect((cliB.last().payload as GroupResult).ok).toBe(false)
+  // 作者撤自己的 → ok;广播墓碑(ct 清空 + revokedAt)
+  reg.handle(cliA, JSON.stringify({ op: 'group-revoke', groupId, reqId: 'r1', payload: { seq: 1, memberId: midA } }))
+  expect((cliA.last().payload as GroupResult).ok).toBe(true)
+  const tomb = cliA.env(cliA.sent.length - 2)
+  expect(tomb.op).toBe('group-msg')
+  const tm = tomb.payload as GroupStoredMsg
+  expect(tm.revokedAt).toBeTruthy()
+  expect(tm.ct).toBe('')
+  // 同 opKey 重放 → 幂等返回旧 seq,不复活
+  reg.handle(cliA, JSON.stringify({ op: 'group-post', groupId, reqId: 'p2', payload: { ct: 'SECRET_CT2', opKey: 'k1', memberId: midA, readUpTo: 1 } }))
+  expect(((cliA.last().payload as GroupResult).data as { dedup?: boolean }).dedup).toBe(true)
+  // B 再发一条,群主(手机)可撤任何人的
+  reg.handle(cliB, JSON.stringify({ op: 'group-post', groupId, reqId: 'p3', payload: { ct: 'CT_B', opKey: 'k2', memberId: midB, readUpTo: 1 } }))
+  reg.handle(phone, JSON.stringify({ op: 'group-revoke', groupId, reqId: 'r2', payload: { seq: 2 } }))
+  expect((phone.last().payload as GroupResult).ok).toBe(true)
+})

@@ -509,3 +509,125 @@ test('L2 挂载自愈心跳:周期 sync 保持 fanout(重启后群广播不漏�
   expect(payload.markRead).toBe(false) // 偷看式挂载:不动已读游标
   expect(payload.memberId).toBeTruthy() // 带成员身份(relay 据此挂 fanout)
 }, 15000)
+
+// ─── 雇佣网关(2026-11-19):开门 → 进门 → 对话 → 配额闸 → 撤回 ─────────────────────
+
+test('L2 雇佣全链:hireSetup 入房 → guest 发言 → twin 唤醒(第四档+json 计量)→ 配额闸拒+system 提示 → agent 回话达 guest → 撤回墓碑', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-chat-hire-'))
+  const hub = new Hub(join(dir, 'state.json'), 100, null, join(dir, 'groups-state.json'))
+  const ceKp = generateKeyPair()
+  const cliWs = new TestWS('cli', () => {})
+  const { sid, token } = hub.register('machineA', cliWs)
+  const phoneWs = new TestWS('phone', () => {})
+  expect(hub.joinPhone(sid, token, phoneWs, 'ph_1')).toBe(true)
+
+  const phone = new PhoneSim(hub, phoneWs)
+  phoneWs.onWire = (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) phone.receive(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch {
+      /* 控制帧忽略 */
+    }
+  }
+
+  const twins: Array<{ cwd: string; args: string[] }> = []
+  const chat = new ChatHub({
+    cid: 'machineA',
+    privKey: ceKp.privateKey,
+    pubKey: ceKp.publicKey,
+    statePath: join(dir, 'chat-state.json'),
+    sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
+    spawnTwin: (cwd, args) => twins.push({ cwd, args }),
+    agentRunner: { sessions: () => [], writeStdin: () => {} }, // 被雇 agent 是终端型(不在 runner)→ 走 twin
+  })
+  cliWs.onWire = (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) chat.onEnvelope(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch {
+      /* 控制帧忽略 */
+    }
+  }
+
+  // 1. 手机建雇佣房 + 邀请
+  phone.send({ op: 'group-create', reqId: 'create', payload: { meta: { name: '雇佣·项目A', kind: 'hire' }, ownerName: '主人' } })
+  await tick()
+  const created = phone.results.find((r) => r.reqId === 'create')
+  expect(created?.ok).toBe(true)
+  const groupId = (created!.data as { groupId: string }).groupId
+  phone.send({ op: 'group-invite', groupId, reqId: 'inv', payload: { groupId } })
+  await tick()
+  const code = ((phone.results.find((r) => r.reqId === 'inv')!.data) as { code: string }).code
+
+  // 2. hireSetup:ce 本地 join(槽照走)+ 账本
+  const setup = await chat.hireSetup({ code, name: '项目A的CC', quota: { maxRuns: 2 } })
+  expect(setup.ok).toBe(true)
+  await tick(30) // 等密文槽在途
+
+  // 3. 雇佣码 + guest 进门
+  phone.send({ op: 'group-hire-set', groupId, reqId: 'hire', payload: { groupId } })
+  await tick()
+  const hireCode = ((phone.results.find((r) => r.reqId === 'hire')!.data) as { code: string }).code
+  const guestWire: GroupEnvelope[] = []
+  const guestWs = new TestWS('guest', (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) guestWire.push(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch {
+      /* 控制帧忽略 */
+    }
+  })
+  const gj = hub.guestJoin(guestWs, hireCode)
+  expect(gj.ok).toBe(true)
+  if (!gj.ok) throw new Error('unreachable')
+  const guestSend = (env: GroupEnvelope): void =>
+    hub.onMessage(guestWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) }))
+  const roomKey = phone.groupKey!
+  const sealRoom = (text: string): string => b64(seal(roomKey, enc.encode(JSON.stringify({ kind: 'text', text }))))
+
+  // 4. guest 发言 → twin 唤醒(第四档文案 + json 输出计量)
+  guestSend({ op: 'group-post', groupId, reqId: 'gp1', payload: { ct: sealRoom('帮我把日志分析一下'), memberId: gj.memberId, readUpTo: 0 } })
+  await tick()
+  expect(twins.length).toBe(1)
+  expect(twins[0].args).toContain('--output-format')
+  const prompt = twins[0].args[twins[0].args.length - 1]
+  expect(prompt).toContain('帮我把日志分析一下')
+  expect(prompt).toContain('雇佣条款')
+
+  // 5. 记账 + 配额闸:第 1/2 次放行,第 3 次拒(maxRuns=2)+ system 提示
+  // 45s 冷却真实等待太慢:拨回冷却表(白盒,同 twin 续接测试)
+  const chatAny = chat as unknown as { twinLastAt: Map<string, number> }
+  for (const [k, v] of chatAny.twinLastAt) chatAny.twinLastAt.set(k, v - 46_000)
+  const logPath = join(dir, 'twin-项目A的CC.log')
+  const { appendFileSync } = await import('node:fs')
+  appendFileSync(logPath, '\n===== 唤醒 t1 =====\n{"usage":{"input_tokens":100,"output_tokens":50}}\n')
+  guestSend({ op: 'group-post', groupId, reqId: 'gp2', payload: { ct: sealRoom('再看看错误率'), memberId: gj.memberId, readUpTo: 1 } })
+  await tick()
+  expect(twins.length).toBe(2)
+  appendFileSync(logPath, '\n===== 唤醒 t2 =====\n{"usage":{"input_tokens":200,"output_tokens":100}}\n')
+  guestSend({ op: 'group-post', groupId, reqId: 'gp3', payload: { ct: sealRoom('还有吗'), memberId: gj.memberId, readUpTo: 2 } })
+  await tick()
+  expect(twins.length).toBe(2) // 第三条被配额闸拒
+  const rec = ((chat.hireStatus().data) as Array<{ used: { tokens: number; runs: number } }>)[0]
+  expect(rec.used.runs).toBe(2)
+  expect(rec.used.tokens).toBe(450)
+  const sysEnv = phone.sent.filter((e) => e.op === 'group-msg').at(-1) as GroupEnvelope
+  const sysPt = JSON.parse(dec.decode(open(roomKey, unb64((sysEnv.payload as { ct: string }).ct)))) as { kind: string }
+  expect(sysPt.kind).toBe('system')
+
+  // 6. agent 回话 → guest 实时收到
+  const reply = await chat.localOp({ agent: '项目A的CC', op: 'send', groupId, text: '好的,这就分析' })
+  expect(reply.ok).toBe(true)
+  await tick()
+  const guestMsg = guestWire.filter((e) => e.op === 'group-msg').at(-1) as GroupEnvelope
+  expect((JSON.parse(dec.decode(open(roomKey, unb64((guestMsg.payload as { ct: string }).ct)))) as { text: string }).text).toBe('好的,这就分析')
+
+  // 7. agent 撤回自己那条 → guest 收墓碑(密文清空)
+  const rev = await chat.localOp({ agent: '项目A的CC', op: 'revoke', groupId, seq: (reply.data as { seq: number }).seq })
+  expect(rev.ok).toBe(true)
+  await tick()
+  const tomb = guestWire.filter((e) => e.op === 'group-msg').at(-1) as GroupEnvelope
+  expect((tomb.payload as { revokedAt?: number }).revokedAt).toBeTruthy()
+  expect((tomb.payload as { ct: string }).ct).toBe('')
+})

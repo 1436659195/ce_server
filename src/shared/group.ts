@@ -38,6 +38,12 @@ export type GroupOp =
   // b64(临时公钥(32B) || seal(临时私钥×成员公钥 派生键, 群钥))。relay 存槽并转发给成员机,
   // 永不解槽(E2E 群钥定案:relay 全程只见密文)。
   | 'group-keyslot-set'
+  // 手机→relay:签发/轮换雇佣码(meta.kind='hire' 的房间;2026-11-19 雇佣网关)。
+  // payload: {groupId}。返回 {code, createdAt}。再调一次 = 轮换(旧码即死)。
+  | 'group-hire-set'
+  // 成员→relay:撤回自己的一条消息;群主可撤任何人的。payload: GroupRevokeReq。
+  // relay 置 revokedAt 并清 ct,重播 group-msg(三端渲染「已撤回」墓碑;正文不可恢复)。
+  | 'group-revoke'
   // relay→成员机:转发群钥密文槽。payload: {groupId, slot}。ce 用身份私钥开槽。
   | 'group-keyslot'
   // relay→全体成员:广播新消息(payload: GroupStoredMsg)。
@@ -67,6 +73,9 @@ export interface GroupMeta {
   topic?: string;
   /** 给 agent 的行为规则文本(agent 首跑拉取,注入其行为)。 */
   rules?: string;
+  /** 房间形态标(明文路由元数据,与群名同级取舍;relay 不解释)。'hire' = 雇佣房间
+   *  (2026-11-19 雇佣网关:手机按此渲染徽标,ce 按此挂配额闸,手册按此切第四档纪律)。 */
+  kind?: 'hire';
   createdAt: number;
   createdBy: string; // 建群者 phoneId
 }
@@ -85,6 +94,9 @@ export interface GroupMember {
   /** 成员机身份公钥(b64 X25519):群钥密文槽的封装目标(手机封槽用)。 */
   pubKey?: string;
   human?: boolean; // 手机主人 true;agent 缺省
+  /** 网页访客成员(雇佣房间;2026-11-19)。鉴权走 /guest 通路的雇佣码,无 machineId/phoneId;
+   *  发言限速 guestMsgsPerHour,op 白名单外(建群/邀请/join/下槽/解散)。 */
+  guest?: true;
   cwd?: string; // agent 工作目录(识别/展示用)
   joinedAt: number;
   lastSeenAt: number; // 活动(post/read/ack/join)即刷新;reclaim 15 分钟活跃卫兵依据
@@ -102,6 +114,8 @@ export interface GroupStoredMsg {
   opKey?: string; // 幂等键(原样透传;relay 拒重放:同 opKey 返回已存 seq)
   replyTo?: number; // 回复的 seq(仅成员消息;系统通知不可回复)
   mentions?: string[]; // 精确成员名(通知/唤醒依据;未命中由发送端 mentionHint 提示)
+  /** 撤回时间(group-revoke 置;正文 ct 同步清空 → 老端解密失败自然跳过,新端渲染墓碑)。 */
+  revokedAt?: number;
 }
 
 /** 正文明文(群钥解密后)。kind 只加不破,未知 kind 老端显示为不支持。 */
@@ -169,6 +183,19 @@ export interface GroupInvite {
   usesLeft: number;
 }
 
+/** group-hire-set 的应答:雇佣码(网页访客凭据;随房间存续,轮换即换)。 */
+export interface GroupHireInfo {
+  code: string; // 'XXXX-XXXX'(与邀请码同字母表;_lookup 走 rooms 的 hire.code,互不串)
+  groupId: string;
+  createdAt: number;
+}
+
+/** group-revoke 的 payload。memberId 语义同 GroupPostReq(作者本人撤;群主可撤任何人的)。 */
+export interface GroupRevokeReq {
+  seq: number;
+  memberId?: string;
+}
+
 /** group-meta 广播的事件(成员增减/解散);手机据此触发群钥经隧道下发等后续。 */
 export interface GroupMetaEvent {
   event: 'member-joined' | 'member-left' | 'dissolved';
@@ -220,6 +247,7 @@ export type GroupErrorCode =
   | 'no_group'
   | 'too_large'
   | 'too_many_members'
+  | 'rate_limited'
   | 'owner_leave';
 
 // ─── 群内纪律与限额(发送端 + relay 共同遵守;首版强制子集,余者 v2)────────────────
@@ -239,4 +267,6 @@ export const GROUP_LIMITS = {
   syncDefaultLimit: 50,
   /** reclaim 活跃卫兵窗口 ms:目标成员该窗口内活跃过 → 拒 member_active。 */
   reclaimActiveGuardMs: 15 * 60 * 1000,
+  /** guest(网页访客)每小时发言上限(雇佣房间防刷;超限拒 rate_limited)。 */
+  guestMsgsPerHour: 30,
 } as const;
