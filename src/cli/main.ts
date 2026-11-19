@@ -1568,6 +1568,9 @@ async function main(): Promise<void> {
     // 先按序补处理 'registered' 前到达的帧,再挂正式处理器(此后走实时路径)。
     for (const r of pending) void onMessage(r)
     curWs.on('message', onMessage)
+    // 连上即重挂群广播(agent-group):relay 群扇出是连接级状态,注册完成立刻补挂,
+    // 不等 60s 心跳——否则重启后第一分钟内的群消息会漏(实机踩过)。
+    chatHub.bootSync()
   }
 
   // 连中继(带 cid)→ 注册 → 打 qr(首次)→ 接桥接;断开则指数退避重连。
