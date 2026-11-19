@@ -106,7 +106,7 @@ function render() {
   const stick = nearBottom(), log = $('log'), me = S.memberId
   const seqs = [...S.msgs.keys()].sort((a, b) => a - b)
   log.innerHTML = seqs.map((q) => {
-    const m = S.msgs[q]
+    const m = S.msgs.get(q) // Map 必须 .get(下标取值恒 undefined → render 炸被 onmessage 吞,页面全空白)
     if (m.sys) return `<div class="sys">${esc(m.text)}</div>`
     if (m.revoked) return `<div class="row${m.fromId === me ? ' me' : ''}"><div class="bubble tomb">消息已撤回</div></div>`
     const who = m.fromId === me ? '' : `<div class="who">${esc(m.fromName)}</div>`
@@ -228,7 +228,8 @@ $('go').addEventListener('click', () => {
     $('setup').style.display = 'none'
     start()
   } catch (e2) { err.textContent = '链接不完整:请原样粘贴主人发的完整链接(' + e2.message + ')' }
-})
+});
+// ↑ 分号必须:无分号 + 下一行 ( 开头 = ASI 把 init 解析成对上一条返回值的调用(首载即炸)
 
 // ─── 入口:URL 自带 code+key 则直接进,否则出setup ────────────────────────────────
 (function init() {
