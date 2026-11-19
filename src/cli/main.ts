@@ -619,6 +619,7 @@ async function main(): Promise<void> {
       }
       return { terminals, agentSessions: agentRunner.sessions().map((s) => ({ sid: s.sid, cwd: s.cwd })) }
     },
+    agentRunner,
   })
   let reconnectDelay = 2000
 
