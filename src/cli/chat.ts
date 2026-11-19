@@ -297,7 +297,8 @@ export class ChatHub {
     if (!key) return { ok: false, error: '群钥未下发:等手机端分发(成员刚加入会有一次延迟)' }
     const mentions = Array.isArray(body.mentions) ? (body.mentions as string[]).map(String) : undefined
     const r = await this.rpc('group-post', gid, {
-      ct: seal(key, new TextEncoder().encode(JSON.stringify({ kind: 'text', text } satisfies GroupPlaintext))),
+      // ct 走 base64(协议:字符串;裸 Uint8Array 经 JSON.stringify 会变对象 —— L2 管道测试抓的断层)
+      ct: Buffer.from(seal(key, new TextEncoder().encode(JSON.stringify({ kind: 'text', text } satisfies GroupPlaintext)))).toString('base64'),
       opKey: 'ok_' + randomBytes(6).toString('hex'),
       replyTo: typeof body.replyTo === 'number' ? body.replyTo : undefined,
       mentions,
