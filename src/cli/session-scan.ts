@@ -23,14 +23,22 @@ export interface AgentSignature {
   pattern: RegExp
 }
 
-/** 内置默认特征表(常见 coding agent 的进程名;工坊/配置可追加,不可覆盖语义)。 */
+/**
+ * 内置默认特征表(常见 coding agent 的进程名;工坊/配置可追加,不可覆盖语义)。
+ *
+ * 形状教训(2026-11-19 实机):CC 在本机的真实 argv 是
+ *   `.../@anthropic-ai/claude-code/bin/claude.exe`(comm=claude.exe)——
+ * `claude` 后面跟的是 `-code`/`.exe` 这类后缀,老的「后边界只许空白/结尾」正则一条都匹配不上
+ * (roster 全漏)。现统一:`名` 前界 = 行首|斜杠|空白|@,后展望 = 结尾|空白|点|斜杠|连字符|@
+ * (覆盖 claude / claude.exe / claude-code/cli.js / codex exec / gemini-cli;claudette 类不误伤)。
+ */
 export const DEFAULT_AGENT_SIGNATURES: readonly AgentSignature[] = [
-  { platform: 'claude', label: 'CC', pattern: /(?:^|\/)claude(?:$|[\s])/ },
-  { platform: 'codex', label: 'Codex', pattern: /(?:^|\/)codex(?:$|[\s])/ },
-  { platform: 'gemini', label: 'Gemini', pattern: /(?:^|\/)gemini(?:$|[\s])/ },
-  { platform: 'cursor', label: 'Cursor', pattern: /(?:^|\/)cursor-agent(?:$|[\s])/ },
-  { platform: 'opencode', label: 'OpenCode', pattern: /(?:^|\/)opencode(?:$|[\s])/ },
-  { platform: 'aider', label: 'Aider', pattern: /(?:^|\/)aider(?:$|[\s])/ },
+  { platform: 'claude', label: 'CC', pattern: /(?:^|\/|[\s@])claude(?=$|[\s/.@-])/ },
+  { platform: 'codex', label: 'Codex', pattern: /(?:^|\/|[\s@])codex(?=$|[\s/.@-])/ },
+  { platform: 'gemini', label: 'Gemini', pattern: /(?:^|\/|[\s@])gemini(?=$|[\s/.@-])/ },
+  { platform: 'cursor', label: 'Cursor', pattern: /(?:^|\/|[\s@])cursor-agent(?=$|[\s/.@-])/ },
+  { platform: 'opencode', label: 'OpenCode', pattern: /(?:^|\/|[\s@])opencode(?=$|[\s/.@-])/ },
+  { platform: 'aider', label: 'Aider', pattern: /(?:^|\/|[\s@])aider(?=$|[\s/.@-])/ },
 ]
 
 // ─── 进程证据(可注入)────────────────────────────────────────────────────────

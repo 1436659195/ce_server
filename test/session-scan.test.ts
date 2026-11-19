@@ -15,15 +15,23 @@ import {
 
 // ─── 特征表 ────────────────────────────────────────────────────────────────
 
-test('特征表:claude argv 命中;非 agent 进程不误报', () => {
+test('特征表:claude argv 各真实形状命中;非 agent 进程不误报', () => {
+  // 经典形态
   expect(matchSignature('node /usr/local/bin/claude --help')?.platform).toBe('claude')
   expect(matchSignature('claude')?.platform).toBe('claude')
   expect(matchSignature('codex exec --json')?.platform).toBe('codex')
+  // 2026-11-19 实机形态:native 启动器命名带后缀(comm=claude.exe;包路径 claude-code)
+  expect(matchSignature('/root/.nvm/versions/node/v24.13.0/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe')?.platform).toBe('claude')
+  expect(matchSignature('claude.exe')?.platform).toBe('claude')
+  expect(matchSignature('node .../@anthropic-ai/claude-code/cli.js')?.platform).toBe('claude')
+  expect(matchSignature('claude-code --version')?.platform).toBe('claude')
+  // 非 agent 进程不误报
   expect(matchSignature('python train.py')).toBeNull()
   expect(matchSignature('bash')).toBeNull()
   expect(matchSignature('vim main.py')).toBeNull()
-  // 前缀不误伤:claudette/claude-sdk-docs 这类非进程名不命中
+  // 前缀不误伤:claudette/claudeius 这类「claude 后跟字母」不命中
   expect(matchSignature('claudette')).toBeNull()
+  expect(matchSignature('claudeius app')).toBeNull()
 })
 
 // ─── 进程树扫描 ────────────────────────────────────────────────────────────
