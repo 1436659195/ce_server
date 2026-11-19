@@ -42,10 +42,12 @@ import { promisify } from 'node:util'
 import { createInterface } from 'node:readline'
 import { loadConfig, saveWorkdir } from './config'
 import { sameDir, resolveWorkdir } from './paths'
-import { ensureJupyter, type JupyterInstallDeps } from './jupyter-install'
+import { ensureJupyter, promptUnanswerable, type JupyterInstallDeps } from './jupyter-install'
 import { resolvePythonBin } from './python'
 import { runConsole } from './console'
 import { installWorkshop, defaultWorkshopRoot, resolveWorkshopDir } from './workshop'
+import { ChatHub } from './chat'
+import { runChatCli } from './chat-cli'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
 import { ManagedTerms } from './managed-terms'
@@ -478,6 +480,17 @@ async function main(): Promise<void> {
   const cliPubB64 = b64(identity.publicKey)
   const cid = identity.cid
 
+  // 群聊枢纽(agent-group S1 底座):本机 agent 注册表 + 群钥 + GroupFrame 收发。
+  // sendEnvelope 直出明文信封(正文群钥密文,relay 只见信封);ws 未连时 sendFrame 静默丢弃,
+  // 群操作靠 10s 超时报错(见 chat.ts)。信任边缘在 daemon:`ce chat` CLI 只走本地 HTTP。
+  const chatHub = new ChatHub({
+    cid,
+    privKey: identity.privateKey,
+    pubKey: identity.publicKey,
+    statePath: join(homedir(), '.ce', 'chat-state.json'),
+    sendEnvelope: (env) => sendFrame({ type: FrameType.GroupFrame, payload: enc.encode(JSON.stringify(env)) }),
+  })
+
   const jupyter = makeJupyterClient(baseUrl, token, root)
   // 大文件分段上传会话(root 内直接 node:fs 落盘;见 uploads.ts 头注)
   const uploads = new UploadSessions(root)
@@ -708,6 +721,16 @@ async function main(): Promise<void> {
       async fetch(req) {
         const url = new URL(req.url)
         if (url.pathname.startsWith('/control/')) return controlRoute(req, url)
+        if (url.pathname === '/chat/op' && req.method === 'POST') {
+          // ce chat 薄 CLI 入口(仅 127.0.0.1 可达,与 /hook 同一收口):参数形状见 chat.ts localOp
+          try {
+            const body = (await req.json()) as { agent?: string; op: string } & Record<string, unknown>
+            const r = await chatHub.localOp(body)
+            return new Response(JSON.stringify(r), { headers: { 'content-type': 'application/json' } })
+          } catch (e) {
+            return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), { status: 400, headers: { 'content-type': 'application/json' } })
+          }
+        }
         if (req.method !== 'POST') return new Response('method not allowed', { status: 405 })
         const raw = await req.text()
         // PreToolUse → approvals.request 阻塞 55s 等手机 → 回 permissionDecision;
@@ -977,6 +1000,17 @@ async function main(): Promise<void> {
       // 多 phone:按 frame.sourcePhoneId(hub 注入)查该 phone 的 E2E 通道。
       const srcPhone = frame.sourcePhoneId
       const knownKey = srcPhone ? phoneKeys.get(srcPhone)?.sharedKey : undefined
+
+      // 群聊帧(GroupFrame=9):信封明文(relay 解析路由),不经 phone E2E 通道 ——
+      // 必须在 srcPhone 守卫前分流(pending 补发帧也走这里,顺序天然正确)。
+      if (frame.type === FrameType.GroupFrame) {
+        try {
+          chatHub.onEnvelope(JSON.parse(dec.decode(frame.payload)) as Parameters<ChatHub['onEnvelope']>[0])
+        } catch {
+          /* 非法信封 → 忽略(不拖垮连接) */
+        }
+        return
+      }
 
       // Control 帧:可能是握手 phonePub(明文,手机每次连入/重连都发)或 resize(密文)。
       // 多 phone 下:已配对的 phone 发的 resize 用其 key 解密;未配对/解密失败 → 当握手。
@@ -1518,11 +1552,17 @@ async function main(): Promise<void> {
   connect()
 }
 
-// 入口分叉:--workshop[=目录] 装/更新插件工坊(装完即退,不进 daemon/控制台;relay 取
-// config.json/--relay);--daemon 跑守护进程(main);否则跑控制台 TUI(console.ts)。
+// 入口分叉:ce chat … 群聊薄 CLI(需本地 daemon 在跑;装完即退);--workshop[=目录] 装/更新
+// 插件工坊(装完即退,不进 daemon/控制台;relay 取 config.json/--relay);--daemon 跑守护进程
+// (main);否则跑控制台 TUI(console.ts)。
 // daemon 加全局错误兜底:小意外记日志不退,严重错误退出(由控制台/系统拉起)+清 stale daemon.json。
 const wsFlag = process.argv.find((a) => a === '--workshop' || a.startsWith('--workshop='))
-if (wsFlag) {
+if (process.argv[2] === 'chat') {
+  runChatCli(process.argv.slice(3)).catch((e) => {
+    console.error('[ce chat]', (e as Error).message)
+    process.exit(1)
+  })
+} else if (wsFlag) {
   const relayUrl = arg('relay') ?? loadConfig().relay
   if (!relayUrl) {
     console.error('[ce] --workshop 需要中继地址:补 --relay=ws://...(或先跑一次 ce,让 ~/.ce/config.json 记住中继)')

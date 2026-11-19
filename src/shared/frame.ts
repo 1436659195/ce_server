@@ -21,6 +21,7 @@ export enum FrameType {
   ButlerOutput, // ce→手机:管家 cc 的 stdout/stderr 字节
   AgentEvent, // 7 ce→手机:agent 结构化事件(CC hooks 等,通用);hub 零信任透传、不解析;编号与手机端 ce-platform 同步
   PairReject, // 8 ce→手机:配对被拒(明文 {reason:not_paired|pin_mismatch};握手未成无密钥,故明文;旧手机端不识此号→安全降级为超时)
+  GroupFrame, // 9 双向(手机↔relay↔ce):群聊帧,载荷是 GroupEnvelope JSON(明文信封+群钥密文正文;relay 只解析信封路由)。2026-11-19 末尾新增,手机端 frame.ts 同号(权威契约:src/shared/group.ts)
 }
 
 export interface Frame {

@@ -1,4 +1,4 @@
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRelayServer } from './server'
 import { Hub, deriveStateKey } from './hub'
@@ -45,7 +45,7 @@ const stateKey = process.env.RELAY_STATE_KEY ? deriveStateKey(process.env.RELAY_
 if (!stateKey) {
   console.warn('[relay] ⚠ 未设 RELAY_STATE_KEY,relay-state.json 明文存 token(生产建议设)')
 }
-const hub = new Hub(statePath, 1000, stateKey)
+const hub = new Hub(statePath, 1000, stateKey, join(dirname(statePath), 'groups-state.json'))
 // --rotate:一次性维护,重置所有 token 后退出(手机需重新扫码)。
 if (process.argv.includes('--rotate')) {
   hub.rotateTokens()

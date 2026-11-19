@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { decodeFrame, encodeFrame } from '../shared/frame'
+import { decodeFrame, encodeFrame, FrameType } from '../shared/frame'
+import { GroupRegistry } from './groups'
 
 /** state 加密格式版本(AES-256-GCM)。 */
 const STATE_CRYPTO_VERSION = 1
@@ -95,17 +96,56 @@ function cliLeftNotice(): string {
  */
 export class Hub {
   private sessions = new Map<string, Session>()
-  private wsMeta = new Map<RelayWS, { sid: string; role: 'cli' | 'phone'; phoneId?: string }>()
+  private wsMeta = new Map<RelayWS, { sid: string; role: 'cli' | 'phone'; phoneId?: string; cid?: string }>()
   private cidToEntry = new Map<string, PersistEntry>()
   private statePath: string | null
   private readonly maxEntries: number
   private readonly stateKey: Buffer | null
+  /** 群聊注册表(statePath 为空则不启用;groupsPath 缺省 = statePath 同目录 groups-state.json)。 */
+  readonly groups: GroupRegistry | null
 
-  constructor(statePath?: string, maxEntries = 1000, stateKey?: Buffer | null) {
+  constructor(statePath?: string, maxEntries = 1000, stateKey?: Buffer | null, groupsPath?: string) {
     this.statePath = statePath ?? null
     this.maxEntries = maxEntries
     this.stateKey = stateKey ?? null
     this.loadState()
+    this.groups =
+      statePath && groupsPath !== null
+        ? new GroupRegistry({
+            meta: (ws) => {
+              const m = this.wsMeta.get(ws)
+              return m ? { role: m.role, phoneId: m.phoneId, cid: m.cid } : undefined
+            },
+            send: (ws, data) => {
+              try {
+                ws.send(data)
+              } catch {
+                /* ws 已关 */
+              }
+            },
+            loadState: () => {
+              try {
+                if (!existsSync(groupsPath!)) return null
+                const raw = readFileSync(groupsPath!, 'utf8')
+                try {
+                  return decryptState(raw, this.stateKey)
+                } catch {
+                  return raw // 老明文兜底
+                }
+              } catch {
+                return null
+              }
+            },
+            saveState: (plain) => {
+              try {
+                writeFileSync(groupsPath!, encryptState(plain, this.stateKey))
+                chmodSync(groupsPath!, 0o600)
+              } catch {
+                /* 写失败 → 忽略(内存有效) */
+              }
+            },
+          })
+        : null
   }
 
   /** state 文件权限 0600(防其他用户读 token)。 */
@@ -208,7 +248,7 @@ export class Hub {
         }
       }, 0)
     }
-    this.wsMeta.set(cli, { sid, role: 'cli' })
+    this.wsMeta.set(cli, { sid, role: 'cli', cid })
     return { sid, token }
   }
 
@@ -273,6 +313,20 @@ export class Hub {
   onMessage(src: RelayWS, data: string): void {
     const meta = this.wsMeta.get(src)
     if (!meta) return
+    // 群聊帧(GroupFrame=9):信封明文,委托 GroupRegistry(正文密文,本层不解析)。
+    // 置于 session 路由之前:群跨 session,不走 phone↔ce 隧道。
+    if (this.groups) {
+      try {
+        const frame = decodeFrame(new TextEncoder().encode(data))
+        if (frame.type === FrameType.GroupFrame) {
+          const envelopeJson = new TextDecoder().decode(frame.payload)
+          this.groups.handle(src, envelopeJson)
+          return
+        }
+      } catch {
+        /* 非法/非 JSON 帧:落回下方 role 路由兜底(向后兼容历史裸字符串) */
+      }
+    }
     const s = this.sessions.get(meta.sid)
     if (!s) return
     if (meta.role === 'cli') {
@@ -368,6 +422,8 @@ export class Hub {
         }
       }
     }
+    // 群扇出集摘除断开的连接(成员资格/消息保留在 groups state)
+    this.groups?.onClose(src)
     this.wsMeta.delete(src)
   }
 }
