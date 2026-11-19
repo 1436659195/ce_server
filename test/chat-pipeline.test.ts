@@ -185,7 +185,7 @@ test('L2 roster:注册/进程扫描/会话候选 三段聚合,判定链按 cwd �
   // 注:注册 agent 路径(join)需要活中继,由上面的全链测试覆盖;本测只验聚合形态
   const r = (await chat.localOp({ op: 'roster' })).data as {
     agents: unknown[]
-    suspects: Array<{ platform: string; cwd?: string }>
+    suspects: Array<{ platform: string; cwd?: string; argv: string }>
     terminals: Array<{ id: string; status: string }>
   }
   // 进程段:claude(registered)与 codex(loose)命中;python 不在特征表
