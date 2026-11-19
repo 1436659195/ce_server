@@ -6,17 +6,17 @@
  * 配套:daemon 侧路由见 main.ts 的 controlRoute。
  */
 import { createInterface } from 'node:readline'
-import { readFileSync, openSync } from 'node:fs'
+import { openSync, unlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
 import { installWorkshop, defaultWorkshopRoot, resolveWorkshopDir } from './workshop'
+import { readDaemonInfo, staleStarting, STALE_STARTING_MS, type DaemonInfo } from './daemon-state'
+import { resolveWorkdir } from './paths'
+import { saveWorkdir } from './config'
 
-const DAEMON_JSON = join(homedir(), '.ce', 'daemon.json')
-
-interface DaemonInfo { port?: number; pid: number; version?: string; starting?: boolean }
 interface PairedPhone { id: string; name: string; pairedAt: number }
 interface State {
   running: boolean; pid: number; version: string; relay: string; jupyter: string
@@ -40,13 +40,10 @@ function box(lines: string[]): string {
   return '┌' + '─'.repeat(w) + '┐\n' + lines.map(line).join('\n') + '\n└' + '─'.repeat(w) + '┘'
 }
 
-/** daemon 进程在不在:读 daemon.json + pid 存活探测(kill -0)。starting(还没就绪/port 未定)也算"在"。 */
+/** daemon 进程在不在:读 daemon.json + pid 存活探测(kill -0)。starting(还没就绪/port 未定)也算"在"。
+ *  实现在 daemon-state.ts(含 startAt 缺失回退 mtime、卡死启动态判定),console 只消费。 */
 function procInfo(): DaemonInfo | null {
-  try {
-    const d = JSON.parse(readFileSync(DAEMON_JSON, 'utf8')) as DaemonInfo
-    if (!d.pid) return null
-    try { process.kill(d.pid, 0); return d } catch { return null }
-  } catch { return null }
+  return readDaemonInfo()
 }
 /** daemon 就绪(进程在 + 控制端点 port 已定)。控制台进 menu 前要就绪。 */
 function readyInfo(): DaemonInfo | null {
@@ -59,12 +56,23 @@ async function api<T>(d: DaemonInfo, path: string, init?: RequestInit): Promise<
   return (await r.json()) as T
 }
 
-/** 启动 daemon(spawn detached ce --daemon);relay 由 daemon 自读 config.json。 */
+/** 把控制台收到的 CLI 参数透传给 daemon(--relay/--workdir/--jupyter/--jupyter-token/--python/...):
+ *  真正消费这些参数的是 daemon(main()),不透传 = 控制台敲的参数被静默吞掉 —— 真实事故:
+ *  `ce --workdir=/aiprojrct` 起的 daemon 按默认根解析,jupyter.json root 记成 /,与用户自跑的
+ *  Jupyter(root_dir=/aiprojrct)对不上 → 不复用、又自启第二个 Jupyter。
+ *  daemon 收到 --workdir 还会 saveWorkdir 落盘(config.json),与「开机自启不带参」通道合流。
+ *  滤掉 --daemon(spawn 时自己补)与 --workshop(旁路模式:装工坊即退,不该由 daemon 执行)。 */
+function forwardArgs(): string[] {
+  return process.argv.slice(2).filter((a) => a !== '--daemon' && !(a === '--workshop' || a.startsWith('--workshop=')))
+}
+
+/** 启动 daemon(spawn detached ce --daemon);relay 由 daemon 自读 config.json / 透传的 --relay。 */
 function startDaemon(): void {
-  // dev(bun main.ts):spawn bun + 脚本路径;编译版(ce):spawn ce。两者都带 --daemon。
+  // dev(bun main.ts):spawn bun + 脚本路径;编译版(ce):spawn ce。两者都带 --daemon + 透传参数。
   const isDev = process.argv[1]?.endsWith('.ts') ?? false
   const cmd = isDev ? process.argv[0]! : process.execPath
-  const args = isDev ? [process.argv[1]!, '--daemon'] : ['--daemon']
+  const extra = forwardArgs()
+  const args = isDev ? [process.argv[1]!, '--daemon', ...extra] : ['--daemon', ...extra]
   // daemon stdout/stderr → ~/.ce/ce.log(append):否则 stdio:'ignore' 吞掉 [ce] 日志 + uncaughtException,
   // daemon 崩溃/重连时无据可查(控制台 [l] 只看得到 Jupyter 日志)。
   let stdio: Array<'ignore' | number> = ['ignore', 'ignore', 'ignore']
@@ -101,11 +109,47 @@ async function prompt(msg: string): Promise<string> {
   try { return await new Promise<string>((r) => rl.question('', (a) => r(a.trim()))) } finally { rl.close() }
 }
 
+/** 杀掉卡死在启动态的 daemon 并重新 spawn。SIGTERM 即默认终止(daemon 无 SIGTERM 处理器);
+ *  此态下 port 未定 = daemon 尚未走完 resolveJupyter 之后的就绪写入,通常无自启 Jupyter 可成孤儿;
+ *  即便有(卡在更后面的阶段),daemon 重启后会经 jupyter.json 验活复用,不受影响。 */
+async function restartStuckDaemon(): Promise<void> {
+  const d = procInfo()
+  if (!d) return
+  const waited = d.startAt ? Math.round((Date.now() - d.startAt) / 60000) : Math.round(STALE_STARTING_MS / 60000)
+  console.log(C.yellow + `\ndaemon 卡在启动态约 ${waited} 分钟(疑似卡死,如卡在没人能答的安装询问),杀旧进程重启...` + C.reset)
+  try { process.kill(d.pid) } catch { /* 已死 */ }
+  try { unlinkSync(join(homedir(), '.ce', 'daemon.json')) } catch { /* 已不在 */ }
+  // 给旧进程一点退场时间:防新 daemon 撞单例锁(48731 未释放)误走「放弃端口锁」降级甚至双跑
+  await sleep(1500)
+  startDaemon()
+}
+
+/** 控制台路径也处理 --workdir(校验 + 落盘 config.json):daemon 收到透传参数后本会自己落,
+ *  但 daemon 已在跑时 spawn 会被单例挡掉、参数根本传不到 —— 这里补一份,保证「至少重启后生效」,
+ *  不再静默吞参数。目录无效:用户就在控制台前,与 daemon CLI 路径同语义直接报错退出。 */
+function applyWorkdirArg(): void {
+  const wdArg = process.argv.find((a) => a.startsWith('--workdir='))
+  if (!wdArg) return
+  const wd = resolveWorkdir(wdArg.slice('--workdir='.length), undefined)
+  if ('invalid' in wd) {
+    console.error(`[ce] --workdir 指向的目录无效:"${wd.invalid}"(不存在或不是文件夹),请检查路径后重试。`)
+    process.exit(1)
+  }
+  if (procInfo()?.port) {
+    if (!saveWorkdir(wd.dir)) console.error('[ce] 警告:工作目录写入 ~/.ce/config.json 失败,重启后将回退默认根目录')
+    else console.log(`[ce] 已记住工作目录:${wd.dir}。当前 daemon 已在跑,重启 daemon 后生效(控制台 [x] 停再 [s] 启)`)
+  }
+}
+
 export async function runConsole(): Promise<void> {
   process.stdout.write(clr)
   console.log(`${C.bold}ce 控制台${C.reset}`)
+  applyWorkdirArg()
   let d = procInfo()
-  if (!d) {
+  if (staleStarting(d)) {
+    await restartStuckDaemon()
+    d = procInfo()
+  } else if (!d) {
     console.log('daemon 未运行,启动中...')
     startDaemon()
   } else if (!d.port) {
@@ -113,13 +157,27 @@ export async function runConsole(): Promise<void> {
   }
   // 等就绪(port 出现),最长 ~3 分钟(首次 pip install jupyterlab)。daemon 进程消失 = 真失败。
   // 老逻辑只等 12s 就报失败 → 首次装 Jupyter 时必然误报 + 重复 spawn 多个 daemon。
+  // 等待中发现 daemon 卡死在启动态(starting 超 STALE_STARTING_MS,如卡在没人能答的安装询问上)
+  // → 杀掉重启并重给等待预算,不再无限打点(Kylin 真机:卡 22 天,每次 ce 干等后仍不恢复)。
+  // daemon.json 要等 spawn 的进程真正 boot 后才写上,连续 3s 读不到才算「进程已退出」防误判。
+  let missing = 0
   for (let i = 0; i < 180; i++) {
     if (d?.port) break
     await sleep(1000)
     d = procInfo()
     if (!d) {
-      console.error(C.red + '\ndaemon 启动失败(进程已退出)。手动排查:ce --daemon' + C.reset)
-      process.exit(1)
+      if (++missing >= 3) {
+        console.error(C.red + '\ndaemon 启动失败(进程已退出)。排查:终端跑 ce --daemon 看报错,或看 ~/.ce/ce.log' + C.reset)
+        process.exit(1)
+      }
+      continue
+    }
+    missing = 0
+    if (staleStarting(d)) {
+      await restartStuckDaemon()
+      d = procInfo()
+      i = 0 // 新 daemon 重新给满等待预算;它若因同一环境问题再退出,由上方「进程已退出」分支接住
+      continue
     }
     process.stdout.write('.')
   }

@@ -110,6 +110,7 @@ export async function runChatCli(argv: string[]): Promise<void> {
       body.limit = typeof flags.limit === 'string' ? Number(flags.limit) : undefined
       break
     case 'inbox':
+      body.agent = body.agent ?? pos[1] // `chat inbox <agent 名>` 与 --agent 等效(位置参数此前被丢弃,多 agent 时静默查错)
       break
     case 'groups':
     case 'whoami':

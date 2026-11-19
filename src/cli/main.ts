@@ -1467,6 +1467,11 @@ async function main(): Promise<void> {
             } else {
               resp = { ok: true, data: { results: await runPreflight(items) } }
             }
+          } else if (req.op === 'chat.invite') {
+            // 邀请直投(用户定案:免复制粘贴):把 join 指令塞进本机 cc-* 会话 stdin 队列
+            const q = req as { sid?: string; code?: string; name?: string; groupName?: string }
+            const ok = chatHub.deliverInvite(q.sid ?? '', q.code ?? '', q.name ?? '', q.groupName ?? '')
+            resp = ok ? { ok: true } : { ok: false, error: '会话不在 ce 管辖(纯终端请手动粘贴命令)' }
           } else if (req.op === 'chat.roster') {
             // 群聊 roster(S2):手机挑成员用 —— 注册/疑似/终端候选,识别判定链在 ChatHub.roster
             resp = { ok: true, data: await chatHub.roster() }
