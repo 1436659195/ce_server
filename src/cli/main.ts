@@ -95,10 +95,38 @@ const pExecFile = promisify(execFile)
 async function askYesNo(msg: string): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout })
   try {
-    const a = await new Promise<string>((r) => rl.question(`${msg} [y/N] `, r))
+    const a = await new Promise<string>((resolve) => {
+      // EOF/流关闭必须能退场:readline 的 question 回调在 EOF 的 stdin 上永不来,await 会挂死
+      // (Kylin 真机事故:daemon 卡在无人能答的安装询问上 22 天)。EOF 按「否」处理。
+      // 主防线是 promptUnanswerable(非 TTY 根本不进这里),此处是 TTY 中途消失的次级防线。
+      const cleanup = () => { process.stdin.off('end', onEnd); process.stdin.off('close', onEnd); rl.close() }
+      const done = (v: string) => { cleanup(); resolve(v) }
+      const onEnd = () => done('')
+      process.stdin.once('end', onEnd)
+      process.stdin.once('close', onEnd)
+      rl.question(`${msg} [y/N] `, done)
+    })
     return /^[yY]/.test(a.trim())
   } finally {
     rl.close()
+  }
+}
+
+/** 限时 y/n:超时按「否」。daemon 的任何等待必须有界 —— 装询问曾挂死 daemon 22 天
+ *  (Kylin 真机,nohup/继承终端 stdin 的 daemon 没人作答 → 永久卡 starting)。
+ *  限时窗口只给「真人在场敲一个 y」的裕量(终端前台 ce --daemon 调试),超时即确定性退出。 */
+async function askYesNoBounded(msg: string, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => {
+      console.error(`[ce] ${Math.round(ms / 1000)} 秒未作答,按「否」处理(daemon 的等待必须有界,防挂死)`)
+      resolve(false)
+    }, ms)
+  })
+  try {
+    return await Promise.race([askYesNo(msg), timeout])
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -117,7 +145,21 @@ function realJupyterDeps(pythonBin: string): JupyterInstallDeps {
         return false
       }
     },
-    prompt: (msg) => askYesNo(msg),
+    prompt: (msg) => {
+      // 无人能答就不问:stdin 非 TTY(控制台 spawn 的 daemon、`< /dev/null`、systemd)→ 按「否」
+      // + 可行动指引,让 resolveJupyter 走 cancelled → 明确报错退出(进程死 → 控制台能看到失败并指路),
+      // 绝不阻塞等待(readline 在 EOF 流上回调永不来 → 挂死,Kylin 真机卡 22 天的根因)。
+      if (promptUnanswerable(process.stdin.isTTY)) {
+        console.error(`[ce] ${msg} —— 当前无终端可作答(stdin 非 TTY),按「否」跳过。`)
+        console.error('[ce] 请在被控机终端前台跑 ce --daemon 完成交互安装(会询问是否装,限时作答),')
+        console.error('[ce] 或直接手动安装:pip install jupyterlab -i https://pypi.tuna.tsinghua.edu.cn/simple')
+        return Promise.resolve(false)
+      }
+      // 有 TTY 但 --daemon(nohup 继承终端 stdin / 手动前台调试):限时作答 —— daemon 的等待必须有界。
+      // 60s 超时按「否」→ cancelled → 报错退出,不再有「活着但永远 starting」的僵尸。
+      if (process.argv.includes('--daemon')) return askYesNoBounded(msg, 60000)
+      return askYesNo(msg)
+    },
     install: async () => {
       console.log('[ce] pip install jupyterlab(清华源,约 1-2 分钟,请等待)...')
       await new Promise<void>((resolve, reject) => {
@@ -453,6 +495,15 @@ async function main(): Promise<void> {
     const ceDir0 = join(homedir(), '.ce')
     mkdirSync(ceDir0, { recursive: true })
     writeFileSync(join(ceDir0, 'daemon.json'), JSON.stringify({ pid: process.pid, port: null, starting: true, version: VERSION, startAt: Date.now() }))
+    // starting 态的 daemon.json 随本进程退出清掉:此后任何退出路径(前置检查失败/装 Jupyter 被拒/
+    // pip 失败/正常退出)都不留 stale starting 文件 —— 控制台读到只会误等「启动中」。就绪后
+    // daemon.json 被重写为 starting:false,此 handler 读不到 starting → 不误删就绪态。
+    process.on('exit', () => {
+      try {
+        const cur = JSON.parse(readFileSync(join(ceDir0, 'daemon.json'), 'utf8')) as { starting?: boolean }
+        if (cur.starting) unlinkSync(join(ceDir0, 'daemon.json'))
+      } catch { /* 无文件/读不了 → 没什么可清 */ }
+    })
   } catch {
     /* 写失败不阻塞启动 */
   }
@@ -489,6 +540,17 @@ async function main(): Promise<void> {
     pubKey: identity.publicKey,
     statePath: join(homedir(), '.ce', 'chat-state.json'),
     sendEnvelope: (env) => sendFrame({ type: FrameType.GroupFrame, payload: enc.encode(JSON.stringify(env)) }),
+    // roster 数据源:本机会话表(jupyter 终端 + ce 管辖的 agent 会话;识别判定链在 ChatHub)
+    rosterSessions: async () => {
+      let terminals: Array<{ name: string; cwd?: string }> = []
+      try {
+        // jupyter 终端无 cwd(bridge 注释:jupyter 终端无此字段)→ 无 cwd 证据,归类走「待确认」
+        terminals = (await listTerminalsRetry(jupyter)).map((t) => ({ name: t.name }))
+      } catch {
+        /* jupyter 不在:终端候选空 */
+      }
+      return { terminals, agentSessions: agentRunner.sessions().map((s) => ({ sid: s.sid, cwd: s.cwd })) }
+    },
   })
 
   const jupyter = makeJupyterClient(baseUrl, token, root)
@@ -1405,6 +1467,9 @@ async function main(): Promise<void> {
             } else {
               resp = { ok: true, data: { results: await runPreflight(items) } }
             }
+          } else if (req.op === 'chat.roster') {
+            // 群聊 roster(S2):手机挑成员用 —— 注册/疑似/终端候选,识别判定链在 ChatHub.roster
+            resp = { ok: true, data: await chatHub.roster() }
           } else if (req.op === 'httpProxy') {
             // 本地 API 转发(套壳 APP 场景:手机经隧道调被控机本地 HTTP 服务,与 Jupyter 无关)。
             // 上游白名单用启动时 cfg.apiUpstreams(~/.ce/config.json;改配置须重启 ce 生效)。

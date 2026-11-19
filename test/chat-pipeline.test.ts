@@ -161,3 +161,38 @@ test('L2 全链:join → 密文槽 → ce 收钥 → send → 手机解密 → �
   const sentB2 = await chat.localOp({ agent: '项目B的CC', op: 'send', groupId, text: 'B 读完了,继续' })
   expect(sentB2.ok).toBe(true)
 })
+
+test('L2 roster:注册/进程扫描/会话候选 三段聚合,判定链按 cwd 对齐', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-chat-roster-'))
+  const procs: Array<{ pid: number; ppid: number; comm: string; argv: string; cwd?: string }> = [
+    { pid: 1, ppid: 0, comm: 'bash', argv: 'bash', cwd: '/' },
+    { pid: 500, ppid: 1, comm: 'node', argv: 'node /usr/local/bin/claude', cwd: '/proj/registered' },
+    { pid: 600, ppid: 1, comm: 'node', argv: 'node /usr/local/bin/codex', cwd: '/proj/loose' },
+    { pid: 700, ppid: 1, comm: 'python', argv: 'python train.py', cwd: '/proj/script' },
+  ]
+  const chat = new ChatHub({
+    cid: 'machineA',
+    privKey: new Uint8Array(32),
+    pubKey: new Uint8Array(32),
+    statePath: join(dir, 'chat-state.json'),
+    sendEnvelope: () => {},
+    rosterSessions: async () => ({
+      terminals: [{ name: 'term-reg' }, { name: 'term-loose' }, { name: 'term-plain' }],
+      agentSessions: [{ sid: 'cc-abcd', cwd: '/proj/app' }],
+    }),
+    procLister: () => procs,
+  })
+  // 注:注册 agent 路径(join)需要活中继,由上面的全链测试覆盖;本测只验聚合形态
+  const r = (await chat.localOp({ op: 'roster' })).data as {
+    agents: unknown[]
+    suspects: Array<{ platform: string; cwd?: string }>
+    terminals: Array<{ id: string; status: string }>
+  }
+  // 进程段:claude(registered)与 codex(loose)命中;python 不在特征表
+  expect(r.suspects.some((s) => s.platform === 'claude' && s.cwd === '/proj/registered')).toBe(true)
+  expect(r.suspects.some((s) => s.platform === 'codex' && s.cwd === '/proj/loose')).toBe(true)
+  expect(r.suspects.some((s) => s.argv.includes('train.py'))).toBe(false)
+  // 终端段:jupyter 无 cwd → 待确认;ce 管辖 agent 会话 → 已接入
+  expect(r.terminals.find((t) => t.id === 'term-reg')?.status).toBe('unconfirmed')
+  expect(r.terminals.find((t) => t.id === 'cc-abcd')?.status).toBe('connected')
+})

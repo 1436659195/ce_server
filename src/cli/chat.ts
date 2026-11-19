@@ -27,6 +27,7 @@ import {
   type GroupResult,
   type GroupStoredMsg,
 } from '../shared/group'
+import { classifySession, osProcLister, scanAgentProcsAll, type ProcEntry } from './session-scan'
 
 /** 单 agent 的群成员身份(一 agent 可入多群)。 */
 interface AgentGroupRec {
@@ -72,6 +73,10 @@ export interface ChatHubOpts {
   statePath: string
   /** 把一条群信封发上 relay(main.ts 注入:GroupFrame 直出,正文已密文)。 */
   sendEnvelope(env: GroupEnvelope): void
+  /** 本机会话数据(roster 聚合用;main.ts 注入,测试喂假数据)。 */
+  rosterSessions?: () => Promise<{ terminals: Array<{ name: string; cwd?: string }>; agentSessions: Array<{ sid: string; cwd?: string }> }>
+  /** 进程表读取器(默认真实 /proc;测试注入假表)。 */
+  procLister?: () => ProcEntry[]
 }
 
 export class ChatHub {
@@ -196,6 +201,8 @@ export class ChatHub {
             ok: true,
             data: Object.entries(rec.groups).map(([groupId, g]) => ({ groupId, groupName: g.groupName, memberId: g.memberId })),
           }))
+        case 'roster':
+          return { ok: true, data: await this.roster() }
         case 'whoami':
           return {
             ok: true,
@@ -391,7 +398,48 @@ export class ChatHub {
     return { ok: true }
   }
 
-  // ─── 工具 ──────────────────────────────────────────────────────────────────
+  // ─── roster(识别判定链聚合;S2)──────────────────────────────────────────────
+
+  async roster(): Promise<{
+    agents: Array<{ name: string; platform?: string; cwd?: string; groups: string[] }>
+    suspects: Array<{ platform: string; label: string; pid: number; cwd?: string; argv: string }>
+    terminals: Array<{ id: string; source: 'jupyter' | 'agent'; status: 'connected' | 'suspect' | 'unconfirmed' | 'plain'; reason: string; cwd?: string }>
+  }> {
+    const agents = Object.entries(this.state.agents).map(([name, rec]) => ({
+      name,
+      platform: rec.platform,
+      cwd: rec.cwd,
+      groups: Object.values(rec.groups).map((g) => g.groupName),
+    }))
+    // 全机进程扫描 → 按 platform+cwd 去重(同 agent 多进程只报一行)
+    const lister = this.opts.procLister ?? osProcLister()
+    const seen = new Set<string>()
+    const suspects: Array<{ platform: string; label: string; pid: number; cwd?: string; argv: string }> = []
+    for (const hit of scanAgentProcsAll(lister())) {
+      const key = `${hit.sig.platform}|${hit.cwd ?? ''}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      suspects.push({ platform: hit.sig.platform, label: hit.sig.label, pid: hit.pid, cwd: hit.cwd, argv: hit.argv })
+    }
+    // 会话候选(注入的本机会话表):按 cwd 与注册/疑似证据对齐 → classifySession 四档
+    const terminals: Array<{ id: string; source: 'jupyter' | 'agent'; status: 'connected' | 'suspect' | 'unconfirmed' | 'plain'; reason: string; cwd?: string }> = []
+    const data = this.opts.rosterSessions ? await this.opts.rosterSessions() : { terminals: [], agentSessions: [] }
+    const agentCwds = new Map(agents.filter((a) => a.cwd).map((a) => [a.cwd!, a]))
+    const suspectCwds = new Map(suspects.filter((s) => s.cwd).map((s) => [s.cwd!, s]))
+    for (const t of data.terminals) {
+      const cwd = t.cwd
+      const r = classifySession({
+        registry: cwd && agentCwds.has(cwd) ? { name: agentCwds.get(cwd)!.name, platform: agentCwds.get(cwd)!.platform ?? '?' } : undefined,
+        matchedProc: cwd && suspectCwds.has(cwd) ? { platform: suspectCwds.get(cwd)!.platform, label: suspectCwds.get(cwd)!.label, cwd } : undefined,
+      })
+      terminals.push({ id: t.name, source: 'jupyter', status: r.status, reason: r.reason, cwd })
+    }
+    for (const s of data.agentSessions) {
+      // ce 管辖的 agent 会话(cc-*):平台已知(claude),天然是「已接入候选」
+      terminals.push({ id: s.sid, source: 'agent', status: 'connected', reason: 'ce 管辖的 agent 会话(已接入候选)', cwd: s.cwd })
+    }
+    return { agents, suspects, terminals }
+  }
 
   private keyOf(gid: string): Uint8Array | null {
     const b64 = this.state.keys[gid]

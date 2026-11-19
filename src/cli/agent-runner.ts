@@ -525,6 +525,10 @@ export class AgentRunner {
   stopAllForPhone(phoneId: string): void {
     for (const p of [...this.procs.values()]) if (p.owner === phoneId) this.stop(p.sid)
   }
+  /** 全部会话一览(roster 聚合用;ce 管辖的 CC 会话 = 天然的「已接入」候选)。 */
+  sessions(): Array<{ sid: string; cwd: string; started: boolean }> {
+    return [...this.procs.values()].map((p) => ({ sid: p.sid, cwd: p.cwd, started: p.started }))
+  }
   sidForPhone(phoneId: string): string | null {
     for (const p of this.procs.values()) if (p.owner === phoneId) return p.sid
     return null

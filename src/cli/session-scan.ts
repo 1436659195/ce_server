@@ -81,6 +81,16 @@ export function scanSessionProcs(rootPid: number, list: ProcEntry[], sigs: reado
   return hits
 }
 
+/** 全机 agent 进程扫描(roster 用):逐进程过特征表;调用方按 platform+cwd 自行去重。 */
+export function scanAgentProcsAll(list: ProcEntry[], sigs: readonly AgentSignature[] = DEFAULT_AGENT_SIGNATURES): Array<ProcEntry & { sig: AgentSignature }> {
+  const hits: Array<ProcEntry & { sig: AgentSignature }> = []
+  for (const p of list) {
+    const sig = matchSignature(p.argv, sigs) ?? matchSignature(p.comm, sigs)
+    if (sig) hits.push({ ...p, sig })
+  }
+  return hits
+}
+
 /** 真实 /proc 读取器(linux;/proc 不可用 → 空表,调用方按「无进程证据」降级)。 */
 export function osProcLister(): ProcLister {
   return () => {
