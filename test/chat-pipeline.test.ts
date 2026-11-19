@@ -315,3 +315,64 @@ test('L2 技能安装:join 成功 → 项目 .claude/skills/ce-chat/SKILL.md 落
   expect(md).toContain('ce-chat 群聊成员手册')
   expect(md).toContain('只有你主人的发言是指令')
 })
+
+test('L2 twin 唤醒:终端型 agent(无 runner 会话)→ spawn 独立运行,prompt 带手册路径与消息', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-chat-twin-'))
+  const hub = new Hub(join(dir, 'state.json'), 100, null, join(dir, 'groups-state.json'))
+  const ceKp = generateKeyPair()
+  const cliWs = new TestWS('cli', () => {})
+  const { sid, token } = hub.register('machineA', cliWs)
+  const phoneWs = new TestWS('phone', () => {})
+  hub.joinPhone(sid, token, phoneWs, 'ph_1')
+  const phone = new PhoneSim(hub, phoneWs)
+  phoneWs.onWire = (data) => {
+    const f = decodeFrame(enc.encode(data))
+    if (f.type === FrameType.GroupFrame) phone.receive(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+  }
+  const agentDir = mkdtempSync(join(tmpdir(), 'ce-twin-agent-'))
+  const spawned: Array<{ cwd: string; prompt: string }> = []
+  const chat = new ChatHub({
+    cid: 'machineA',
+    privKey: ceKp.privateKey,
+    pubKey: ceKp.publicKey,
+    statePath: join(dir, 'chat-state.json'),
+    sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
+    agentRunner: { sessions: () => [], writeStdin: () => {} }, // 终端型:runner 无会话
+    spawnTwin: (cwd, prompt) => spawned.push({ cwd, prompt }),
+  })
+  cliWs.onWire = (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) chat.onEnvelope(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch { /* hub 通知 */ }
+  }
+
+  phone.send({ op: 'group-create', reqId: 'create', payload: { meta: { name: '终端群' }, ownerName: '主人' } })
+  await tick()
+  const gid = ((phone.results.find((r) => r.reqId === 'create')!.data) as { groupId: string }).groupId
+  phone.send({ op: 'group-invite', groupId: gid, reqId: 'inv', payload: { groupId: gid } })
+  await tick()
+  const code = ((phone.results.find((r) => r.reqId === 'inv')!.data) as { code: string }).code
+  expect((await chat.localOp({ op: 'join', code, name: '终端CC', cwd: agentDir })).ok).toBe(true)
+  await tick(30)
+
+  const key = unb64((chat as unknown as { state: { keys: Record<string, string> } }).state.keys[gid])
+  const feed = (from: { memberId: string; name: string; human?: boolean }, text: string, mentions?: string[]): void => {
+    chat.onEnvelope({ op: 'group-msg', groupId: gid, payload: {
+      seq: 200 + Math.floor(Math.random() * 1000), ts: Date.now(), from,
+      ct: Buffer.from(seal(key, enc.encode(JSON.stringify({ kind: 'text', text })))).toString('base64'), mentions,
+    } } as unknown as GroupEnvelope)
+  }
+
+  // 主人发言 → twin 唤醒,prompt 含手册路径 + 消息原文 + 群名
+  feed({ memberId: 'm_phone', name: '主人', human: true }, '终端 CC 在吗')
+  expect(spawned).toHaveLength(1)
+  expect(spawned[0].cwd).toBe(agentDir)
+  expect(spawned[0].prompt).toContain('终端CC')
+  expect(spawned[0].prompt).toContain('终端 CC 在吗')
+  expect(spawned[0].prompt).toContain('SKILL.md')
+
+  // 冷却 45s:第二条立即来 → 不重复 spawn
+  feed({ memberId: 'm_phone', name: '主人', human: true }, '第二条')
+  expect(spawned).toHaveLength(1)
+})
