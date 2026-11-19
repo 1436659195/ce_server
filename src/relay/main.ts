@@ -69,6 +69,9 @@ const { server, close } = createRelayServer(hub, {
   workshopScaffoldPath: join(here, '..', '..', 'workshop-release', 'scaffold.tgz'),
   workshopScaffoldSha256Path: join(here, '..', '..', 'workshop-release', 'scaffold.tgz.sha256'),
   workshopIndexPath: join(here, '..', '..', 'workshop-release', 'index.json'),
+  // 雇佣网关访客页(2026-11-20):模板 + 内嵌 tweetnacl 浏览器版(缺一则 /hire 404)
+  hirePagePath: join(here, '..', '..', 'scripts', 'hire-page.html'),
+  hireNaclPath: join(here, '..', '..', 'node_modules', 'tweetnacl', 'nacl-fast.min.js'),
   publicUrl,
 })
 if (bindHost) {

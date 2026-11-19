@@ -27,7 +27,7 @@ class FakeWS {
   }
 }
 
-type MetaMap = Map<FakeWS, { role: 'cli' | 'phone'; phoneId?: string; cid?: string }>
+type MetaMap = Map<FakeWS, { role: 'cli' | 'phone' | 'guest'; phoneId?: string; cid?: string }>
 
 function makeRegistry(load?: () => string | null): { reg: GroupRegistry; saved: string[] } {
   const saved: string[] = []
@@ -41,7 +41,7 @@ function makeRegistry(load?: () => string | null): { reg: GroupRegistry; saved: 
   return { reg, saved }
 }
 
-function bind(reg: GroupRegistry, ws: FakeWS, id: { role: 'cli' | 'phone'; phoneId?: string; cid?: string }): void {
+function bind(reg: GroupRegistry, ws: FakeWS, id: { role: 'cli' | 'phone' | 'guest'; phoneId?: string; cid?: string }): void {
   const holder = reg as unknown as { __meta?: MetaMap }
   if (!holder.__meta) holder.__meta = new Map()
   holder.__meta.set(ws, id)
