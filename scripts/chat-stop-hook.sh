@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-OUT=$(./dist/ce-linux-x64 chat inbox --json 2>/dev/null | tail -1) || exit 0
+OUT=$(./dist/ce-linux-x64 chat inbox "Ai群聊开发" --json 2>/dev/null | tail -1) || exit 0
 [ -n "$OUT" ] || exit 0
 
 python3 - "$OUT" <<'PY'
