@@ -16,7 +16,7 @@
  */
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
 import { open, seal, sharedSecret } from '../shared/crypto'
 import {
@@ -125,6 +125,10 @@ export class ChatHub {
 
   /** 把注册表里全部 (agent, group) 重新挂上广播扇出;顺带刷新 presence。fire-and-forget。 */
   bootSync(): void {
+    if (process.env.CE_CHAT_DEBUG) {
+      const n = Object.values(this.state.agents).reduce((acc, r) => acc + Object.keys(r.groups).length, 0)
+      console.log(`[ce:chat-debug] bootSync:挂载 ${n} 个 (agent,群)`)
+    }
     for (const rec of Object.values(this.state.agents)) {
       for (const [gid, g] of Object.entries(rec.groups)) {
         try {
@@ -167,6 +171,7 @@ export class ChatHub {
 
   /** relay 广播/应答帧(main.ts 帧分发委托)。 */
   onEnvelope(env: GroupEnvelope): void {
+    if (process.env.CE_CHAT_DEBUG) console.log(`[ce:chat-debug] 收到群帧 op=${env.op} group=${env.groupId ?? '-'}`)
     if (env.op === 'group-result') {
       const r = env.payload as GroupResult | undefined
       const reqId = r?.reqId ?? env.reqId
@@ -194,7 +199,10 @@ export class ChatHub {
     const msg = env.payload as GroupStoredMsg | undefined
     if (!gid || !msg) return
     const key = this.keyOf(gid)
-    if (!key) return
+    if (!key) {
+      if (process.env.CE_CHAT_DEBUG) console.log('[ce:chat-debug] 投递跳过:群钥未下发', gid)
+      return
+    }
     let text = ''
     try {
       const pt = JSON.parse(new TextDecoder().decode(open(key, new Uint8Array(Buffer.from(msg.ct, 'base64'))))) as GroupPlaintext
@@ -310,9 +318,13 @@ export class ChatHub {
     }
     console.log(`[ce] 群消息唤醒终端 agent「${name}」(claude -p @ ${cwd}, prompt ${prompt.length} 字, ${grec.twinSessionId ? 'resume' : 'new'} 会话)`)
     try {
-      // 独立轻量运行:仅放行 ce chat 命令(最小权限;交互会话不受影响,detached 不随 daemon 退出)
-      const child = spawn('claude', args, { cwd, detached: true, stdio: 'ignore' })
+      // 独立轻量运行:仅放行 ce chat 命令(最小权限;交互会话不受影响,detached 不随 daemon 退出)。
+      // stdout/stderr 落 ~/.ce/twin-<名>.log(headless 运行唯一可观测点,排障依据)
+      const logFd = openSync(join(this.opts.statePath, '..', `twin-${name}.log`), 'a')
+      writeSync(logFd, `\n===== 唤醒 ${new Date().toISOString()} 群[${groupName}] 来自[${fromName}] =====\n`)
+      const child = spawn('claude', args, { cwd, detached: true, stdio: ['ignore', logFd, logFd] })
       child.unref?.()
+      closeSync(logFd) // 父进程 spawn 后即可关;子进程持有自己的副本
     } catch (e) {
       console.warn('[ce] 群消息唤醒失败:', (e as Error).message)
     }
