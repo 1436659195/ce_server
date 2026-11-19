@@ -30,3 +30,4 @@ Thumbs.db
 .codegraph/
 .ipynb_checkpoints/
 .claude/
+groups-state.json
