@@ -408,7 +408,11 @@ export class GroupRegistry {
         this.reply(src, err('not_member', '不在群内'), env.reqId)
         return
       }
-      m.lastSeenAt = now()
+      // markRead=false(心跳/偷看)不刷 lastSeenAt(2026-11-20 真机抓出的卫兵污染):
+      // daemon bootSync 对所有注册群周期发 markRead:false 的 sync,若无条件刷新,
+      // CC 死后身份也永远「活跃」→ reclaim 15 分钟卫兵永久失效(agent 搬不了家)。
+      // presence 语义同步修正:没真读就不算在场。
+      if (p?.markRead !== false) m.lastSeenAt = now()
       this.fanoutAdd(env.groupId!, src)
       const after = Math.max(p?.afterSeq ?? 0, g.baseSeq - 1)
       const limit = p?.limit ?? GROUP_LIMITS.syncDefaultLimit

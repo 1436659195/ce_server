@@ -7,7 +7,7 @@
 import { test, expect } from 'bun:test'
 import { generateKeyPair, seal, open, sharedSecret } from '../src/shared/crypto'
 import { GroupRegistry, type GroupRegistryCtx } from '../src/relay/groups'
-import type { GroupEnvelope, GroupResult, GroupStoredMsg } from '../src/shared/group'
+import type { GroupEnvelope, GroupMember, GroupResult, GroupStoredMsg } from '../src/shared/group'
 
 // ─── 假件 ──────────────────────────────────────────────────────────────────
 
@@ -462,3 +462,42 @@ test('sync 应答随行成员名单(2026-11-20:掉线错过 member-joined 的自
   expect(members.some((m) => m.name === '客座CC')).toBe(true)
   expect(members.some((m) => m.name === '主人')).toBe(true)
 })
+
+test('心跳(markRead:false)不刷 lastSeenAt —— reclaim 卫兵不被 daemon 心跳污染', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const { groupId } = createAndInvite(reg, phone)
+  const t0 = 1795000000000
+  const spy = Date.now
+  ;(globalThis as { Date: unknown }).Date = class extends Date {
+    constructor(...a: unknown[]) {
+      super(a.length ? (a[0] as string | number) : t0)
+    }
+    static now() {
+      return t0
+    }
+  }
+  try {
+    // 新成员入群(lastSeenAt = t0)
+    const kp = generateKeyPair()
+    const cli = new FakeWS('cli')
+    bind(reg, cli, { role: 'cli', cid: 'machineA' })
+    reg.handle(cli, JSON.stringify({ op: 'group-join', reqId: 'j', payload: { inviteCode: createAndInviteCode(reg, phone, groupId), member: { name: 'A', machineId: 'machineA', pubKey: Buffer.from(kp.publicKey).toString('base64') } } }))
+    // 心跳 ×3(markRead:false)→ lastSeenAt 不动
+    for (let i = 0; i < 3; i++) reg.handle(cli, JSON.stringify({ op: 'group-sync', groupId, reqId: 'h' + i, payload: { groupId, afterSeq: 0, markRead: false } }))
+    const members = () => (reg as unknown as { groups: Map<string, { members: Map<string, GroupMember> }> }).groups.get(groupId)!.members
+    const seen1 = [...members().values()].find((m) => m.name === 'A')!.lastSeenAt
+    expect(seen1).toBe(t0)
+    // 真读(markRead 缺省)→ 刷
+    reg.handle(cli, JSON.stringify({ op: 'group-sync', groupId, reqId: 'r', payload: { groupId, afterSeq: 0 } }))
+    expect([...members().values()].find((m) => m.name === 'A')!.lastSeenAt).toBeGreaterThanOrEqual(t0)
+  } finally {
+    ;(globalThis as { Date: unknown }).Date = spy
+  }
+})
+
+/** 拿一个新邀请码(测试辅助)。 */
+function createAndInviteCode(reg: GroupRegistry, phone: FakeWS, groupId: string): string {
+  reg.handle(phone, JSON.stringify({ op: 'group-invite', groupId, reqId: 'inv_' + Math.random(), payload: { groupId } }))
+  return ((phone.last().payload as GroupResult).data as { code: string }).code
+}
