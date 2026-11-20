@@ -128,7 +128,7 @@ test('L2 全链:join → 密文槽 → ce 收钥 → send → 手机解密 → �
   const code = ((phone.results.find((r) => r.reqId === 'inv')!.data) as { code: string }).code
 
   // 3. agent join(带成员机公钥)→ 手机收到 member-joined → 自动封槽 → 槽转达 → ce 开钥落盘
-  const joined = await chat.localOp({ op: 'join', code, name: '项目A的CC', platform: 'claude' })
+  const joined = await chat.localOp({ op: 'join', code, name: '项目A的CC', platform: 'claude', cwd: mkdtempSync(join(tmpdir(), 'cc-a-')) })
   expect(joined.ok).toBe(true)
   await tick(30) // 等槽在途
 
@@ -539,6 +539,7 @@ test('L2 雇佣全链:hireSetup 入房 → guest 发言 → twin 唤醒(第四�
     statePath: join(dir, 'chat-state.json'),
     sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
     spawnTwin: (cwd, args) => twins.push({ cwd, args }),
+    procLister: () => [], // 并行测试隔离:真机 /proc 扫描/直写会与兄弟测试互踩
     agentRunner: { sessions: () => [], writeStdin: () => {} }, // 被雇 agent 是终端型(不在 runner)→ 走 twin
   })
   cliWs.onWire = (data) => {
@@ -664,10 +665,9 @@ async function liveDeliverTopo(
     sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
     spawnTwin: (cwd, args) => twins.push({ cwd, args }),
     agentRunner: { sessions: () => [], writeStdin: () => {} }, // 终端型:runner 没有它的会话
-    procLister: () => procs,
-    listTerminalProcs: () => [{ name: '终端A', shellPid: 400 }],
-    writeTerminal: (name, text) => {
-      writes.push({ name, text })
+    procLister: () => procs, // 本尊投递测试:显式喂进程表
+    writeAgentInput: (pid, text) => {
+      writes.push({ name: `pid${pid}`, text })
       return true
     },
   })
@@ -709,7 +709,7 @@ test('L2 本尊投递:终端里 CC 活着 → 注入该终端(不 spawn twin)', 
   ]
   await liveDeliverTopo(procs, writes, twins)
   expect(writes.length).toBe(1)
-  expect(writes[0].name).toBe('终端A')
+  expect(writes[0].name).toBe('pid401')
   expect(writes[0].text).toContain('本尊请查收')
   expect(writes[0].text).toContain('主人')
   expect(twins.length).toBe(0) // 本尊接了,替身不出动

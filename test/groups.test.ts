@@ -467,33 +467,19 @@ test('心跳(markRead:false)不刷 lastSeenAt —— reclaim 卫兵不被 daemon
   const { reg } = makeRegistry()
   const phone = new FakeWS('phone')
   const { groupId } = createAndInvite(reg, phone)
-  const t0 = 1795000000000
-  const spy = Date.now
-  ;(globalThis as { Date: unknown }).Date = class extends Date {
-    constructor(...a: unknown[]) {
-      super(a.length ? (a[0] as string | number) : t0)
-    }
-    static now() {
-      return t0
-    }
-  }
-  try {
-    // 新成员入群(lastSeenAt = t0)
-    const kp = generateKeyPair()
-    const cli = new FakeWS('cli')
-    bind(reg, cli, { role: 'cli', cid: 'machineA' })
-    reg.handle(cli, JSON.stringify({ op: 'group-join', reqId: 'j', payload: { inviteCode: createAndInviteCode(reg, phone, groupId), member: { name: 'A', machineId: 'machineA', pubKey: Buffer.from(kp.publicKey).toString('base64') } } }))
-    // 心跳 ×3(markRead:false)→ lastSeenAt 不动
-    for (let i = 0; i < 3; i++) reg.handle(cli, JSON.stringify({ op: 'group-sync', groupId, reqId: 'h' + i, payload: { groupId, afterSeq: 0, markRead: false } }))
-    const members = () => (reg as unknown as { groups: Map<string, { members: Map<string, GroupMember> }> }).groups.get(groupId)!.members
-    const seen1 = [...members().values()].find((m) => m.name === 'A')!.lastSeenAt
-    expect(seen1).toBe(t0)
-    // 真读(markRead 缺省)→ 刷
-    reg.handle(cli, JSON.stringify({ op: 'group-sync', groupId, reqId: 'r', payload: { groupId, afterSeq: 0 } }))
-    expect([...members().values()].find((m) => m.name === 'A')!.lastSeenAt).toBeGreaterThanOrEqual(t0)
-  } finally {
-    ;(globalThis as { Date: unknown }).Date = spy
-  }
+  // 新成员入群
+  const kp = generateKeyPair()
+  const cli = new FakeWS('cli')
+  bind(reg, cli, { role: 'cli', cid: 'machineA' })
+  reg.handle(cli, JSON.stringify({ op: 'group-join', reqId: 'j', payload: { inviteCode: createAndInviteCode(reg, phone, groupId), member: { name: 'A', machineId: 'machineA', pubKey: Buffer.from(kp.publicKey).toString('base64') } } }))
+  const members = () => (reg as unknown as { groups: Map<string, { members: Map<string, GroupMember> }> }).groups.get(groupId)!.members
+  const seen0 = [...members().values()].find((m) => m.name === 'A')!.lastSeenAt
+  // 心跳 ×3(markRead:false)→ lastSeenAt 一动不动(等值;旧代码会每拍刷新)
+  for (let i = 0; i < 3; i++) reg.handle(cli, JSON.stringify({ op: 'group-sync', groupId, reqId: 'h' + i, payload: { groupId, afterSeq: 0, markRead: false } }))
+  expect([...members().values()].find((m) => m.name === 'A')!.lastSeenAt).toBe(seen0)
+  // 真读(markRead 缺省)→ 刷(≥ 旧值;同 ms 内可能相等,断言不小于)
+  reg.handle(cli, JSON.stringify({ op: 'group-sync', groupId, reqId: 'r', payload: { groupId, afterSeq: 0 } }))
+  expect([...members().values()].find((m) => m.name === 'A')!.lastSeenAt).toBeGreaterThanOrEqual(seen0)
 })
 
 /** 拿一个新邀请码(测试辅助)。 */

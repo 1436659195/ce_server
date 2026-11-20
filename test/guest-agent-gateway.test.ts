@@ -96,6 +96,7 @@ test('L2 外部 agent 全链:真 ce-guest.mjs pair → send → ce 投递(访客
     sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
     spawnTwin: (cwd, args) => twins.push({ cwd, args }),
     agentRunner: { sessions: () => [], writeStdin: () => {} },
+    procLister: () => [], // 测试隔离:防真机 /proc 命中活 claude 抢走投递
   })
   cliWs.onWire = (data) => {
     try {
