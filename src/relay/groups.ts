@@ -416,7 +416,9 @@ export class GroupRegistry {
       // markRead=false 是「偷看」(inbox 预览):不推进已读游标(缺省 true,读即标读)
       if (p?.markRead !== false) m.readUpTo = Math.max(m.readUpTo, msgs.length ? msgs[msgs.length - 1].seq : 0)
       this.save()
-      this.reply(src, { reqId: env.reqId ?? '', ok: true, data: { msgs, seq: g.seq } })
+      // members 随行(2026-11-20):手机/客户端成员名单不能只靠实时广播 —— 掉线错过
+      // member-joined 就永久陈旧;sync 是重连自愈路,顺手对齐名单(只加不破)。
+      this.reply(src, { reqId: env.reqId ?? '', ok: true, data: { msgs, seq: g.seq, members: Array.from(g.members.values()) } })
     },
 
     'group-ack': (src, id, env) => {

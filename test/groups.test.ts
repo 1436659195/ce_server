@@ -447,3 +447,18 @@ test('resolveAgentSeat:未 pair/绑定校验/跨成员拒', () => {
   expect(reg.resolveAgentSeat(code, bound).ok).toBe(true)
   expect(reg.resolveAgentSeat(code, 'm_别的成员').ok).toBe(false)
 })
+
+test('sync 应答随行成员名单(2026-11-20:掉线错过 member-joined 的自愈路)', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const { groupId } = createAndInvite(reg, phone)
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'a1', payload: { groupId } }))
+  const code = ((phone.last().payload as GroupResult).data as { code: string }).code
+  reg.guestHelloAgent(code, '客座CC', 'claude', new FakeWS('g1'))
+  reg.handle(phone, JSON.stringify({ op: 'group-sync', groupId, reqId: 's1', payload: { groupId, afterSeq: 0 } }))
+  const r = phone.last().payload as GroupResult
+  expect(r.ok).toBe(true)
+  const members = (r.data as { members?: Array<{ name: string }> }).members ?? []
+  expect(members.some((m) => m.name === '客座CC')).toBe(true)
+  expect(members.some((m) => m.name === '主人')).toBe(true)
+})
