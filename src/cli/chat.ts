@@ -692,6 +692,11 @@ export class ChatHub {
     if (!rec) {
       rec = { platform, cwd, joinedAt: Date.now(), groups: {} }
       this.state.agents[name] = rec
+    } else {
+      // reclaim 搬家:cwd/platform 跟着新终端走(2026-11-20 真机抓出 —— 本尊投递按 rec.cwd 找
+      // 活着的 CC,注册目录停在老地方 = agent 搬家后永远只能被 twin 替身接)。
+      rec.cwd = cwd
+      if (platform) rec.platform = platform
     }
     rec.groups[gid] = { memberId: me.memberId, groupName: data.snapshot.meta.name, lastReadSeq: data.snapshot.seq }
     this.save()
