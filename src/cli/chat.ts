@@ -14,9 +14,9 @@
  *
  * 投递(S2 范围:hook 边界捎带/安全闸)不在本模块;S1 由 agent 主动轮询 inbox/read。
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from 'node:fs'
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, readlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
 import { open, seal, sharedSecret } from '../shared/crypto'
 import {
@@ -131,6 +131,30 @@ export interface ChatHubOpts {
    * 现查现投。测试注入假实现。
    */
   writeAgentInput?: (pid: number, text: string) => boolean
+}
+
+/**
+ * TIOCSTI 注入 helper(2026-11-20 v3):open CC 的 pts 再写字节是「输出方向」(屏幕侧,v2 真机
+ * 实锤无效);键盘输入必须走内核 TIOCSTI(simulate terminal input)。root 下跨 session 合法,
+ * 注入的字节直接进该终端输入队列(CC TUI 读到 = 真人打字)。python3 逐字节 ioctl(daemon 自带
+ * python3 依赖 — jupyter 都在跑)。失败(内核禁用/非 pts)→ false 落 twin 兜底。
+ */
+const TIOCSTI_HELPER = [
+  'import fcntl, termios, os, sys',
+  'fd = os.open(sys.argv[1], os.O_WRONLY)',
+  'for b in sys.stdin.buffer.read():',
+  '    fcntl.ioctl(fd, termios.TIOCSTI, bytes([b]))',
+].join('\n')
+
+function writeViaTiocsti(pid: number, text: string): boolean {
+  try {
+    const pts = readlinkSync(`/proc/${pid}/fd/0`)
+    if (!pts.startsWith('/dev/pts/')) return false
+    const r = spawnSync('python3', ['-c', TIOCSTI_HELPER, pts], { input: text, timeout: 5000 })
+    return r.status === 0
+  } catch {
+    return false
+  }
 }
 
 /** 会话运行器的最小接口(与 cli/agent-runner.ts AgentRunner 结构兼容)。 */
@@ -338,16 +362,7 @@ export class ChatHub {
     msg: GroupStoredMsg,
     text: string,
   ): boolean {
-    const write = this.opts.writeAgentInput ?? ((pid: number, t: string) => {
-      try {
-        const fd = openSync(`/proc/${pid}/fd/0`, 'a')
-        writeSync(fd, t)
-        closeSync(fd)
-        return true
-      } catch {
-        return false
-      }
-    })
+    const write = this.opts.writeAgentInput ?? ((pid: number, t: string) => writeViaTiocsti(pid, t))
     if (!rec.cwd) return false
     const procs = (this.opts.procLister ?? osProcLister())()
     const hit = scanAgentProcsAll(procs).find((x) => x.cwd === rec.cwd)
