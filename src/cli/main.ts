@@ -556,6 +556,36 @@ async function main(): Promise<void> {
   // 终端占用:terminalName → owner phoneId。Task 4 的 tryAcquire 接入填充;此处先声明供输出寻路 + phoneLeft 清理。
   const terminalOwner = new Map<string, string>()
   const terms = new Map<string, WebSocket>() // terminalName → 本地 terminado WS(跨重连复用)
+  // 终端 shell pid(2026-11-20 本尊投递):createTerminal 时 /proc 差集捕获「这个终端的 shell」,
+  // 群消息投递靠它反查「成员的 CC 本尊在哪个终端」。jupyter 重启后 pid 全变 → 记录失效,
+  // 投递自动落 twin 兜底(终端重建时重新捕获,自愈)。
+  const termShellPids = new Map<string, number>()
+  const SHELL_COMMS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'pwsh', 'powershell'])
+  const readProcPids = (): number[] => {
+    try {
+      return readdirSync('/proc')
+        .filter((n) => /^\d+$/.test(n))
+        .map(Number)
+    } catch {
+      return []
+    }
+  }
+  const readComm = (pid: number): string => {
+    try {
+      return readFileSync(`/proc/${pid}/comm`, 'utf8').trim()
+    } catch {
+      return ''
+    }
+  }
+  /** createTerminal 后调:差集找「新建出来的那个 shell」→ 记 {name → pid}。找不到静默(兜底 twin)。 */
+  const captureShellPid = (name: string, before: number[]): void => {
+    const prev = new Set(before)
+    const pid = readProcPids().find((p) => !prev.has(p) && SHELL_COMMS.has(readComm(p)))
+    if (pid) {
+      termShellPids.set(name, pid)
+      console.log(`[ce] 终端 ${name} shell pid=${pid} 已记(本尊投递用)`)
+    }
+  }
   // managed 终端集落盘(~/.ce/managed-terminals.json):terms 是内存态,daemon 重启即空 →
   // listTerminals 全员 managed=false → 手机杀 app 重开不自动恢复(会话管理「清空」观感)。
   // 重启后由它合并标注;终端真没了(Jupyter 列表不含)由 listTerminals 顺手 prune。
@@ -609,6 +639,14 @@ async function main(): Promise<void> {
     statePath: join(homedir(), '.ce', 'chat-state.json'),
     sendEnvelope: (env) => sendFrame({ type: FrameType.GroupFrame, payload: enc.encode(JSON.stringify(env)) }),
     // roster 数据源:本机会话表(jupyter 终端 + ce 管辖的 agent 会话;识别判定链在 ChatHub)
+    // 本尊投递(2026-11-20):终端清单(shell pid)与写入通路(与手机键盘同:terminado ['stdin',text])
+    listTerminalProcs: () => [...terms.keys()].map((name) => ({ name, shellPid: termShellPids.get(name) })),
+    writeTerminal: (name, text) => {
+      const ws = terms.get(name)
+      if (!ws) return false
+      ws.send(JSON.stringify(['stdin', text]))
+      return true
+    },
     rosterSessions: async () => {
       let terminals: Array<{ name: string; cwd?: string }> = []
       try {
@@ -1316,6 +1354,7 @@ async function main(): Promise<void> {
               // 普通终端:Jupyter 分配的新 name 必空闲 → 创建者即 owner(先到先得天然满足)。
               // 成功后【不】在此 eager 开 terminado WS(懒开:等手机首条 resize/stdin 才开,对齐直连,
               // 治「晚到 resize 致 Windows 第一个命令错位」——详见 git 历史)。
+              const shellPidsBefore = readProcPids() // shell 诞生差集的「前」照(jupyter 创建终端时拉起 shell)
               resp = await handleRpc(jupyter, req)
               if (
                 resp.ok &&
@@ -1323,6 +1362,7 @@ async function main(): Promise<void> {
                 typeof (resp.data as { name?: string }).name === 'string'
               ) {
                 const newName = (resp.data as { name: string }).name
+                setTimeout(() => captureShellPid(newName, shellPidsBefore), 1500) // 等 shell 拉起来再差集
                 terminalOwner.set(newName, srcPhone)
                 const finger = termRegistry.assign(newName) // 新实例入册(分配指纹)
                 termRegistry.setOwner(newName, { id: srcPhone, name: phoneKeys.get(srcPhone)?.name ?? '' }) // 创建者即属主

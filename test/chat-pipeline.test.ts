@@ -631,3 +631,97 @@ test('L2 雇佣全链:hireSetup 入房 → guest 发言 → twin 唤醒(第四�
   expect((tomb.payload as { revokedAt?: number }).revokedAt).toBeTruthy()
   expect((tomb.payload as { ct: string }).ct).toBe('')
 })
+
+// ─── 本尊投递(2026-11-20 用户定案:群消息给终端里那个 CC 本尊,替身只兜底)──────────────
+
+/** 本尊投递测试底盘:建群 → ce agent join(cwd='/w')→ 手机(群主)发一条。 */
+async function liveDeliverTopo(
+  procs: import('../src/cli/session-scan').ProcEntry[],
+  writes: Array<{ name: string; text: string }>,
+  twins: Array<{ cwd: string; args: string[] }>,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-chat-live-'))
+  const hub = new Hub(join(dir, 'state.json'), 100, null, join(dir, 'groups-state.json'))
+  const ceKp = generateKeyPair()
+  const cliWs = new TestWS('cli', () => {})
+  const { sid, token } = hub.register('machineA', cliWs)
+  const phoneWs = new TestWS('phone', () => {})
+  expect(hub.joinPhone(sid, token, phoneWs, 'ph_1')).toBe(true)
+  const phone = new PhoneSim(hub, phoneWs)
+  phoneWs.onWire = (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) phone.receive(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch {
+      /* 控制帧忽略 */
+    }
+  }
+  const chat = new ChatHub({
+    cid: 'machineA',
+    privKey: ceKp.privateKey,
+    pubKey: ceKp.publicKey,
+    statePath: join(dir, 'chat-state.json'),
+    sendEnvelope: (env) => hub.onMessage(cliWs, JSON.stringify({ type: FrameType.GroupFrame, payload: b64(enc.encode(JSON.stringify(env))) })),
+    spawnTwin: (cwd, args) => twins.push({ cwd, args }),
+    agentRunner: { sessions: () => [], writeStdin: () => {} }, // 终端型:runner 没有它的会话
+    procLister: () => procs,
+    listTerminalProcs: () => [{ name: '终端A', shellPid: 400 }],
+    writeTerminal: (name, text) => {
+      writes.push({ name, text })
+      return true
+    },
+  })
+  cliWs.onWire = (data) => {
+    try {
+      const f = decodeFrame(enc.encode(data))
+      if (f.type === FrameType.GroupFrame) chat.onEnvelope(JSON.parse(dec.decode(f.payload)) as GroupEnvelope)
+    } catch {
+      /* 控制帧忽略 */
+    }
+  }
+  phone.send({ op: 'group-create', reqId: 'create', payload: { meta: { name: '本尊房' }, ownerName: '主人' } })
+  await tick()
+  const groupId = (phone.results.find((r) => r.reqId === 'create')!.data as { groupId: string }).groupId
+  phone.send({ op: 'group-invite', groupId, reqId: 'inv', payload: { groupId } })
+  await tick()
+  const code = ((phone.results.find((r) => r.reqId === 'inv')!.data) as { code: string }).code
+  const joined = await chat.localOp({ op: 'join', code, name: '终端CC', cwd: '/w' })
+  expect(joined.ok).toBe(true)
+  await tick(30) // 密文槽
+  // 群主(手机)发一条 → 投递
+  const key = phone.groupKey!
+  phone.send({
+    op: 'group-post',
+    groupId,
+    reqId: 'p1',
+    payload: { ct: b64(seal(key, enc.encode(JSON.stringify({ kind: 'text', text: '本尊请查收' })))), opKey: 'k1', readUpTo: 0 },
+  })
+  await tick(30)
+}
+
+test('L2 本尊投递:终端里 CC 活着 → 注入该终端(不 spawn twin)', async () => {
+  const writes: Array<{ name: string; text: string }> = []
+  const twins: Array<{ cwd: string; args: string[] }> = []
+  // 终端A shell(400) + 它进程树里活着的 CC(401,cwd=/w 与登记一致)
+  const procs = [
+    { pid: 400, ppid: 1, comm: 'bash', argv: 'bash', cwd: '/w' },
+    { pid: 401, ppid: 400, comm: 'claude', argv: '/usr/lib/claude-code/bin/claude.exe', cwd: '/w' },
+  ]
+  await liveDeliverTopo(procs, writes, twins)
+  expect(writes.length).toBe(1)
+  expect(writes[0].name).toBe('终端A')
+  expect(writes[0].text).toContain('本尊请查收')
+  expect(writes[0].text).toContain('主人')
+  expect(twins.length).toBe(0) // 本尊接了,替身不出动
+})
+
+test('L2 本尊兜底:终端里 CC 已死(进程树没它)→ twin 接管', async () => {
+  const writes: Array<{ name: string; text: string }> = []
+  const twins: Array<{ cwd: string; args: string[] }> = []
+  // 终端A shell 还在,但 CC 已退出(进程树里没有)
+  const procs = [{ pid: 400, ppid: 1, comm: 'bash', argv: 'bash', cwd: '/w' }]
+  await liveDeliverTopo(procs, writes, twins)
+  expect(writes.length).toBe(0) // 死进程不注入(裸 shell 会把文本当命令执行)
+  expect(twins.length).toBe(1)
+  expect(twins[0].args[twins[0].args.length - 1]).toContain('本尊请查收')
+})
