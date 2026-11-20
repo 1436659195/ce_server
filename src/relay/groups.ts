@@ -20,6 +20,7 @@ import {
   GROUP_LIMITS,
   type GroupAckReq,
   type GroupEnvelope,
+  type GroupAgentCodeInfo,
   type GroupHireInfo,
   type GroupInvite,
   type GroupJoinReq,
@@ -66,6 +67,8 @@ interface GroupStore {
   slots: Map<string, string>
   /** 雇佣码(网页访客凭据;随房间存续,group-hire-set 轮换即换)。缺省 = 未开门。 */
   hire?: { code: string; createdAt: number }
+  /** 外部 agent 接入码(2026-11-20 2-2):一码一座 —— 首个 pair 绑定 memberId,同码重连即重绑。 */
+  agentCodes: Array<{ code: string; memberId?: string; createdAt: number }>
 }
 
 /** 单群存量上限(防无限增长;裁剪只掉最旧,seq 连续性由 baseSeq 记录)。 */
@@ -136,6 +139,7 @@ export class GroupRegistry {
           invites: (s.invites as GroupInvite[]) ?? [],
           slots: new Map((s.slots as [string, string][]) ?? []),
           hire,
+          agentCodes: (s.agentCodes as Array<{ code: string; memberId?: string; createdAt: number }>) ?? [],
         })
       }
     } catch {
@@ -157,6 +161,7 @@ export class GroupRegistry {
         invites: g.invites,
         slots: Array.from(g.slots.entries()),
         hire: g.hire,
+        agentCodes: g.agentCodes,
       }))
       this.ctx.saveState(JSON.stringify({ v: 1, groups }))
     } catch {
@@ -200,7 +205,7 @@ export class GroupRegistry {
       this.reply(src, err('no_group', `${env.op} 是 relay 单向下发 op`))
       return true
     }
-    const id = this.ctx.meta(src)
+    const id = this.metaOverride ? this.metaOverride(src) : this.ctx.meta(src)
     if (!id) {
       this.reply(src, err('not_member', '连接未注册'), env.reqId)
       return true
@@ -323,6 +328,7 @@ export class GroupRegistry {
         opKeys: new Map(),
         invites: [],
         slots: new Map(),
+        agentCodes: [],
       }
       const owner: GroupMember = {
         memberId: 'm_' + randId(4),
@@ -522,6 +528,28 @@ export class GroupRegistry {
       this.reply(src, { reqId: env.reqId ?? '', ok: true, data: info })
     },
 
+    'group-agent-code-set': (src, id, env) => {
+      // 外部 agent 接入码(2-2):群主限定;追加制(一码一座),存活上限 20,满了拒 too_large。
+      const g = env.groupId ? this.groups.get(env.groupId) : undefined
+      if (!g) {
+        this.reply(src, err('no_group', '群不存在'), env.reqId)
+        return
+      }
+      if (id.role !== 'phone' || id.phoneId !== g.ownerPhoneId) {
+        this.reply(src, err('not_member', '只有群主能签发外部 agent 接入码'), env.reqId)
+        return
+      }
+      if (g.agentCodes.length >= 20) {
+        this.reply(src, err('too_large', '接入码已达上限(20),请先关闭不用的'), env.reqId)
+        return
+      }
+      const entry = { code: inviteCode(), createdAt: now() }
+      g.agentCodes.push(entry)
+      this.save()
+      const info: GroupAgentCodeInfo = { code: entry.code, groupId: env.groupId!, createdAt: entry.createdAt }
+      this.reply(src, { reqId: env.reqId ?? '', ok: true, data: info })
+    },
+
     'group-revoke': (src, id, env) => {
       // 撤回(宪法 #3):作者本人或群主。relay 置 revokedAt 清 ct,重播 group-msg —— 正文不可恢复。
       const g = env.groupId ? this.groups.get(env.groupId) : undefined
@@ -575,6 +603,114 @@ export class GroupRegistry {
     this.bindMember(groupId, m.memberId, ws)
     this.save()
     return { ok: true, groupId, memberId: m.memberId, groupName: g.meta.name }
+  }
+
+  // ─── 外部 agent 网关(2026-11-20 2-2;goals.md 定案三第 3 步)────────────────────
+
+  /**
+   * 外部 agent pair(HTTP /guest/api/pair 适配):接入码 → 一码一座成员身份。
+   * 同码重连 = 重绑同一成员(与雇佣访客的「复用雇主成员」同语义);成员已退群则重新建座。
+   * 名字与 Pachat 对齐:必填,群内唯一(member_exists 时 agent 自己换名或 --reclaim 语义 = 换码)。
+   */
+  guestHelloAgent(
+    code: string,
+    name: string,
+    platform: string | undefined,
+    ws: GroupWS,
+  ): { ok: true; groupId: string; memberId: string; groupName: string } | { ok: false; error: string } {
+    const hit = Array.from(this.groups.entries()).find(([, g]) => g.agentCodes.some((c) => c.code === code))
+    if (!hit) return { ok: false, error: '接入码不存在(检查接入文本块是否完整)' }
+    const groupId = hit[0]
+    const g = hit[1]
+    if (!name?.trim()) return { ok: false, error: '缺名字(--name,群里怎么称呼你)' }
+    const clean = name.trim().slice(0, 40)
+    const entry = g.agentCodes.find((c) => c.code === code)!
+    const t = now()
+    let m = entry.memberId ? g.members.get(entry.memberId) : undefined
+    if (m && (m.guest === true && !m.human)) {
+      // 同码重连:刷新在场,身份不变
+      m.lastSeenAt = t
+      if (platform) m.platform = platform
+    } else {
+      // 新座(或旧座已退群):名字占用检查 → member_exists
+      if (Array.from(g.members.values()).some((x) => x.name === clean)) {
+        return { ok: false, error: `名字「${clean}」已被占用,换一个(--name)` }
+      }
+      if (g.members.size >= GROUP_LIMITS.membersPerGroup) return { ok: false, error: '房间已满' }
+      m = {
+        memberId: 'm_' + randId(4),
+        name: clean,
+        platform,
+        human: false,
+        guest: true,
+        joinedAt: t,
+        lastSeenAt: t,
+        readUpTo: g.seq,
+      }
+      g.members.set(m.memberId, m)
+      entry.memberId = m.memberId
+      this.broadcast(groupId, { op: 'group-meta', groupId, payload: { event: 'member-joined', groupId, member: m } satisfies GroupMetaEvent })
+    }
+    this.fanoutAdd(groupId, ws)
+    this.bindMember(groupId, m.memberId, ws)
+    this.save()
+    return { ok: true, groupId, memberId: m.memberId, groupName: g.meta.name }
+  }
+
+  /**
+   * HTTP guest API 的适配入口(2026-11-20):以 guest 身份执行一条信封,同步拿回应答。
+   * WS 访客页与 HTTP 外部 agent 走同一套 op/纪律/限速/持久化 —— 零协议分叉。
+   * 不落任何连接状态(shim 即弃);op 白名单/未读纪律全由 handle 原路径执行。
+   */
+  callAsGuest(env: GroupEnvelope): GroupResult {
+    const sent: string[] = []
+    const shim: GroupWS = { send: (d) => sent.push(d) }
+    this.metaOverride = () => ({ role: 'guest' })
+    try {
+      this.handle(shim, JSON.stringify(env))
+    } finally {
+      this.metaOverride = undefined
+    }
+    for (const w of sent) {
+      try {
+        const f = JSON.parse(w) as { type: number; payload: string }
+        if (f.type !== 9) continue
+        const inner = JSON.parse(Buffer.from(f.payload, 'base64').toString('utf8')) as GroupEnvelope
+        const r = inner.payload as GroupResult | undefined
+        if (inner.op === 'group-result' && r && r.reqId === env.reqId) return r
+      } catch {
+        /* 忽略非应答帧 */
+      }
+    }
+    return { reqId: env.reqId ?? '', ok: false, error: { code: 'no_group', message: '无应答' } }
+  }
+
+  private metaOverride?: (src: GroupWS) => Ctx | undefined
+
+  /** 外部 agent HTTP API 的凭据解析:接入码 → 房间 + 绑定成员(校验调用方断言的 memberId)。 */
+  resolveAgentSeat(
+    code: string,
+    memberId?: string,
+  ): { ok: true; groupId: string; memberId: string; groupName: string } | { ok: false; error: string } {
+    const hit = Array.from(this.groups.entries()).find(([, g]) => g.agentCodes.some((c) => c.code === code))
+    if (!hit) return { ok: false, error: '接入码不存在(检查接入文本块是否完整)' }
+    const g = hit[1]
+    const entry = g.agentCodes.find((c) => c.code === code)!
+    if (!entry.memberId) return { ok: false, error: '该码还没有 pair 过(先走 pair)' }
+    if (memberId && memberId !== entry.memberId) return { ok: false, error: 'memberId 与该码绑定的身份不符(凭据拿错了?)' }
+    const m = g.members.get(entry.memberId!)
+    if (!m) return { ok: false, error: '绑定成员已不在房间' }
+    return { ok: true, groupId: hit[0], memberId: m.memberId, groupName: g.meta.name }
+  }
+
+  // ─── post 钩子(HTTP 长轮询用;server.ts 注册)──────────────────────────────────
+
+  private postListeners = new Set<(groupId: string, msg: GroupStoredMsg) => void>()
+
+  /** 注册「有新消息」回调(返回注销函数)。HTTP guest 长轮询靠它在有新货时立刻返回。 */
+  onPosted(cb: (groupId: string, msg: GroupStoredMsg) => void): () => void {
+    this.postListeners.add(cb)
+    return () => this.postListeners.delete(cb)
   }
 
   private doJoin(src: GroupWS, p: GroupJoinReq, cid: string, env: GroupEnvelope): void {
@@ -691,7 +827,7 @@ export class GroupRegistry {
     const msg: GroupStoredMsg = {
       seq: ++g.seq,
       ts: now(),
-      from: { memberId: m.memberId, name: m.name, human: m.human },
+      from: { memberId: m.memberId, name: m.name, human: m.human, guest: m.guest || undefined },
       ct: p.ct,
       opKey: p.opKey,
       replyTo: p.replyTo,
@@ -707,6 +843,13 @@ export class GroupRegistry {
     m.lastSeenAt = now()
     this.save()
     this.broadcast(env.groupId!, { op: 'group-msg', groupId: env.groupId, payload: msg })
+    for (const cb of this.postListeners) {
+      try {
+        cb(env.groupId!, msg)
+      } catch {
+        /* 单个监听者异常不拖累 */
+      }
+    }
     const hint = p.mentions?.filter((n) => !Array.from(g.members.values()).some((mm) => mm.name === n))
     this.reply(src, { reqId: env.reqId ?? '', ok: true, data: { seq: msg.seq, ...(hint?.length ? { mentionHint: hint } : {}) } })
   }

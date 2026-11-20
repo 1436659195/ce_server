@@ -38,6 +38,39 @@ function hireNaclJs(path: string): string {
   return naclCache
 }
 
+/** 外部 agent 客户端拼装(2026-11-20 2-2):ESM shim + tweetnacl 源 + 客户端源码 → 单文件零依赖。
+ *  导出供测试使用(L2 直跑拼装产物)。
+ *  nacl 的 UMD 尾 `typeof module…:self.nacl` 在 ESM 下走 self 分支,故 shim 先补 `const self = globalThis`。 */
+let guestClientCache: string | null = null
+export function guestClientJs(clientPath: string, naclPath: string): string {
+  if (guestClientCache === null) {
+    const shim = `const self = globalThis;\n`
+    const client = readFileSync(clientPath, 'utf8').replace(/^#![^\n]*\n/, '') // shebang 挪到首行(夹中间=语法错)
+    // nacl 的 UMD 尾引用 `module` 标识符 → Bun 把整文件判成 CommonJS(与 import 冲突);换成纯 self 形式
+    const nacl = readFileSync(naclPath, 'utf8').replace('"undefined"!=typeof module&&module.exports?module.exports:self.nacl=self.nacl||{}', 'self.nacl=self.nacl||{}')
+    guestClientCache = `#!/usr/bin/env node\n` + shim + nacl + '\n' + client
+  }
+  return guestClientCache
+}
+
+/** 静态文本(手册类):同 serveStatic 但强制 no-store —— 手册迭代期老缓存会误导外部 agent。 */
+function serveStaticNoStore(res: ServerResponse, req: IncomingMessage, filePath: string, contentType: string, label: string): void {
+  try {
+    const body = readFileSync(filePath)
+    res.setHeader('Content-Type', contentType)
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('Content-Length', body.length)
+    if (req.method === 'HEAD') {
+      res.end()
+      return
+    }
+    res.end(body)
+  } catch {
+    res.writeHead(404)
+    res.end(`${label} 不可读`)
+  }
+}
+
 /**
  * 把 Hub(纯逻辑)接到真实 WebSocket 上。
  *
@@ -70,6 +103,10 @@ export function createRelayServer(
      *  (模板 __NACL_JS__ 占位处内嵌;与手机/ce 同一套密文格式)。 */
     hirePagePath?: string
     hireNaclPath?: string
+    /** 外部 agent 网关(2026-11-20 2-2):客户端脚本源码(拼装内嵌 nacl)+ 两份手册(缺则路由 404)。 */
+    guestClientPath?: string
+    guestSkillPath?: string
+    guestInstallPath?: string
     publicUrl?: string // 对外中继 ws 地址(防 Host 头注入 install 脚本);不配则回退请求 Host
     /** 心跳:每 intervalMs ping 一次,连续 maxMissed 次无 pong 判死 terminate。缺省 30s/2。
      *  测试注入小值加速;治 half-open 死连接(断网/热点切换/NAT 超时,双方无数据则永不发现)。 */
@@ -263,6 +300,32 @@ export function createRelayServer(
       }
       return
     }
+    // ── 外部 agent 网关(2026-11-20 2-2;Pachat 三件套同形态)──────────────────────────
+    if (path === '/guest/ce-guest.mjs' && opts?.guestClientPath && opts?.hireNaclPath) {
+      try {
+        const body = guestClientJs(opts.guestClientPath, opts.hireNaclPath)
+        res.setHeader('Content-Type', 'text/javascript; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('Content-Length', Buffer.byteLength(body))
+        res.end(body)
+      } catch {
+        res.writeHead(500)
+        res.end('ce-guest.mjs 不可读')
+      }
+      return
+    }
+    if (path === '/guest/skill.md' && opts?.guestSkillPath) {
+      serveStaticNoStore(res, req, opts.guestSkillPath, 'text/markdown; charset=utf-8', 'skill.md')
+      return
+    }
+    if (path === '/guest/install.md' && opts?.guestInstallPath) {
+      serveStaticNoStore(res, req, opts.guestInstallPath, 'text/markdown; charset=utf-8', 'install.md')
+      return
+    }
+    if (path.startsWith('/guest/api/') && req.method === 'POST') {
+      handleGuestApi(req, res, path.slice('/guest/api/'.length))
+      return
+    }
     res.writeHead(404)
     res.end('not found')
   }
@@ -432,6 +495,159 @@ export function createRelayServer(
       }
     }, hb.intervalMs)
     ws.on('close', () => clearInterval(t))
+  }
+
+  // ── 外部 agent HTTP API(2026-11-20 2-2)──────────────────────────────────────
+  // 每分钟每 IP 上限(正常外部 agent 的轮询远低于此;防匿名刷)。
+  const GUEST_API_MAX = 120
+  const guestApiHits = new Map<string, { t: number; n: number }>()
+  const allowGuestApi = (ip: string): boolean => {
+    const now = Date.now()
+    const e = guestApiHits.get(ip)
+    if (!e || now - e.t > 60_000) {
+      guestApiHits.set(ip, { t: now, n: 1 })
+      return true
+    }
+    e.n++
+    return e.n <= GUEST_API_MAX
+  }
+  const readBody = (req: IncomingMessage): Promise<string> =>
+    new Promise((resolve, reject) => {
+      let out = ''
+      req.on('data', (c) => {
+        out += c
+        if (out.length > 1_000_000) {
+          reject(new Error('body 过大'))
+          req.destroy()
+        }
+      })
+      req.on('end', () => resolve(out))
+      req.on('error', reject)
+    })
+
+  // 长轮询 waiter(按群挂;onPosted 唤醒)
+  const waiters = new Map<string, Set<{ afterSeq: number; memberId: string; wake: () => void }>>()
+  hub.groups?.onPosted((groupId, msg) => {
+    for (const w of waiters.get(groupId) ?? []) {
+      if (msg.seq > w.afterSeq && msg.from.memberId !== w.memberId) w.wake()
+    }
+  })
+
+  const handleGuestApi = (req: IncomingMessage, res: ServerResponse, kind: string): void => {
+    const ip = req.socket.remoteAddress ?? '?'
+    const json = (r: unknown): void => {
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      res.end(JSON.stringify(r))
+    }
+    void (async () => {
+      if (!allowGuestApi(ip)) {
+        json({ ok: false, error: { code: 'rate_limited', message: '请求太频繁,稍后再试' } })
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = JSON.parse(await readBody(req)) as Record<string, unknown>
+      } catch {
+        json({ ok: false, error: { code: 'no_group', message: 'body 不是合法 JSON' } })
+        return
+      }
+      const registry = hub.groups
+      if (!registry) {
+        json({ ok: false, error: { code: 'no_group', message: '群注册表未启用' } })
+        return
+      }
+      const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+      const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+      const reqId = 'h_' + Math.random().toString(36).slice(2, 10)
+      if (kind === 'pair') {
+        const lock = guestFails.get(ip)
+        if (lock && lock.lockedUntil > Date.now()) {
+          json({ ok: false, error: { code: 'locked', message: '尝试次数过多,已锁定 24 小时' } })
+          return
+        }
+        const shim = { send: () => {} }
+        const r = registry.guestHelloAgent(str(body.code), str(body.name), body.platform ? str(body.platform) : undefined, shim)
+        if (!r.ok) {
+          noteGuestFail(ip)
+          json({ ok: false, error: { code: 'code_invalid', message: r.error } })
+          return
+        }
+        guestFails.delete(ip)
+        const sync = registry.callAsGuest({ op: 'group-sync', groupId: r.groupId, reqId, payload: { groupId: r.groupId, memberId: r.memberId, afterSeq: 0, markRead: false, limit: 1 } })
+        const seq = (sync.data as { seq?: number } | undefined)?.seq ?? 0
+        json({ ok: true, groupId: r.groupId, memberId: r.memberId, groupName: r.groupName, seq })
+        return
+      }
+      const seat = registry.resolveAgentSeat(str(body.code), str(body.memberId))
+      if (!seat.ok) {
+        json({ ok: false, error: { code: 'code_invalid', message: seat.error } })
+        return
+      }
+      if (kind === 'sync') {
+        json(registry.callAsGuest({ op: 'group-sync', groupId: seat.groupId, reqId, payload: { groupId: seat.groupId, memberId: seat.memberId, afterSeq: num(body.afterSeq) ?? 0, markRead: body.markRead !== false, limit: num(body.limit) ?? 200 } }))
+        return
+      }
+      if (kind === 'post') {
+        json(registry.callAsGuest({ op: 'group-post', groupId: seat.groupId, reqId, payload: { ct: str(body.ct), opKey: str(body.opKey) || undefined, readUpTo: num(body.readUpTo) ?? 0, replyTo: num(body.replyTo), mentions: Array.isArray(body.mentions) ? (body.mentions as unknown[]).map(String) : undefined, memberId: seat.memberId } }))
+        return
+      }
+      if (kind === 'ack') {
+        json(registry.callAsGuest({ op: 'group-ack', groupId: seat.groupId, reqId, payload: { groupId: seat.groupId, memberId: seat.memberId, upToSeq: num(body.upToSeq) ?? 0 } }))
+        return
+      }
+      if (kind === 'leave') {
+        json(registry.callAsGuest({ op: 'group-leave', groupId: seat.groupId, reqId, payload: { groupId: seat.groupId, memberId: seat.memberId } }))
+        return
+      }
+      if (kind === 'inbox') {
+        const afterSeq = num(body.afterSeq) ?? 0
+        const waitSec = Math.min(Math.max(num(body.waitSec) ?? 0, 0), 25)
+        const check = (): { idle: boolean; msgs?: unknown; seq?: number } => {
+          const r = registry.callAsGuest({ op: 'group-sync', groupId: seat.groupId, reqId: 'h_' + Math.random().toString(36).slice(2, 10), payload: { groupId: seat.groupId, memberId: seat.memberId, afterSeq, markRead: false, limit: 200 } })
+          if (!r.ok) return { idle: true }
+          const all = (r.data as { msgs?: Array<{ from: { memberId: string } }>; seq: number }).msgs ?? []
+          const fresh = all.filter((m) => m.from.memberId !== seat.memberId)
+          return fresh.length ? { idle: false, msgs: all, seq: (r.data as { seq: number }).seq } : { idle: true }
+        }
+        const first = check()
+        if (!first.idle || waitSec <= 0) {
+          json({ ok: true, data: first })
+          return
+        }
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            waiters.get(seat.groupId)?.delete(waiter)
+            json({ ok: true, data: { idle: true } })
+            resolve()
+          }, waitSec * 1000)
+          const waiter = {
+            afterSeq,
+            memberId: seat.memberId,
+            wake: () => {
+              clearTimeout(timer)
+              waiters.get(seat.groupId)?.delete(waiter)
+              json({ ok: true, data: check() })
+              resolve()
+            },
+          }
+          let set = waiters.get(seat.groupId)
+          if (!set) {
+            set = new Set()
+            waiters.set(seat.groupId, set)
+          }
+          set.add(waiter)
+        })
+        return
+      }
+      json({ ok: false, error: { code: 'no_group', message: `未知 api ${kind}` } })
+    })().catch(() => {
+      try {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: { code: 'no_group', message: '内部错误' } }))
+      } catch {
+        /* 已结束 */
+      }
+    })
   }
 
   return {

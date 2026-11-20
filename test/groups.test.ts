@@ -372,3 +372,78 @@ test('撤回:作者/群主可撤,他人不可;撤后密文清空重播墓碑', (
   reg.handle(phone, JSON.stringify({ op: 'group-revoke', groupId, reqId: 'r2', payload: { seq: 2 } }))
   expect((phone.last().payload as GroupResult).ok).toBe(true)
 })
+
+// ─── 外部 agent 网关(2026-11-20 2-2):接入码 / pair / 座位解析 ──────────────────────
+
+test('agent 接入码:群主签发,他人拒,上限 20', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const other = new FakeWS('other')
+  const { groupId } = createAndInvite(reg, phone)
+  bind(reg, other, { role: 'phone', phoneId: 'ph_2' })
+  reg.handle(other, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'a0', payload: { groupId } }))
+  expect((other.last().payload as GroupResult).ok).toBe(false)
+  const codes: string[] = []
+  for (let i = 0; i < 20; i++) {
+    reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'a' + i, payload: { groupId } }))
+    codes.push(((phone.last().payload as GroupResult).data as { code: string }).code)
+  }
+  expect(new Set(codes).size).toBe(20)
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'a21', payload: { groupId } }))
+  expect((phone.last().payload as GroupResult).error?.code).toBe('too_large')
+})
+
+test('guestHelloAgent:新座/重连复用/名字占用', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const { groupId } = createAndInvite(reg, phone)
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'a1', payload: { groupId } }))
+  const code = ((phone.last().payload as GroupResult).data as { code: string }).code
+
+  const g1 = new FakeWS('g1')
+  const r1 = reg.guestHelloAgent(code, '小王 Codex', 'codex', g1)
+  expect(r1.ok).toBe(true)
+  if (r1.ok) expect(r1.groupName).toBeTruthy()
+  // 房里广播了成员加入(agent 成员,guest)
+  const meta = phone.last()
+  expect(meta.op).toBe('group-meta')
+  const mm = (meta.payload as { member?: { guest?: boolean; human?: boolean; name?: string } }).member
+  expect(mm?.guest).toBe(true)
+  expect(mm?.human).toBe(false)
+
+  // 同码重连 → 同一成员
+  const g2 = new FakeWS('g2')
+  const r2 = reg.guestHelloAgent(code, '小王 Codex', 'codex', g2)
+  expect(r2.ok && r1.ok && (r2.ok ? r2.memberId : '') === (r1.ok ? r1.memberId : '')).toBe(true)
+
+  // 同码换名 ≠ 新座(码即身份锚):仍复用同一成员
+  const g3 = new FakeWS('g3')
+  const r3 = reg.guestHelloAgent(code, '小王 Codex', 'codex', g3)
+  expect(r3.ok && (r3.ok ? r3.memberId : '') === (r1.ok ? r1.memberId : '')).toBe(true)
+
+  // 名字与已有 agent 冲突 → 先 pair 的另一个码报 member_exists
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'a2', payload: { groupId } }))
+  const code2 = ((phone.last().payload as GroupResult).data as { code: string }).code
+  const r4 = reg.guestHelloAgent(code2, '小王 Codex', undefined, new FakeWS('g4'))
+  expect(r4.ok).toBe(false)
+  if (!r4.ok) expect(r4.error).toContain('已被占用')
+
+  // 错码
+  expect(reg.guestHelloAgent('WRONG-CODE1', 'x', undefined, new FakeWS('g5')).ok).toBe(false)
+})
+
+test('resolveAgentSeat:未 pair/绑定校验/跨成员拒', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const { groupId } = createAndInvite(reg, phone)
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'a1', payload: { groupId } }))
+  const code = ((phone.last().payload as GroupResult).data as { code: string }).code
+
+  expect(reg.resolveAgentSeat(code).ok).toBe(false) // 未 pair
+  const r = reg.guestHelloAgent(code, '客座CC', 'claude', new FakeWS('g1'))
+  expect(r.ok).toBe(true)
+  const bound = r.ok ? r.memberId : ''
+  expect(reg.resolveAgentSeat(code).ok).toBe(true)
+  expect(reg.resolveAgentSeat(code, bound).ok).toBe(true)
+  expect(reg.resolveAgentSeat(code, 'm_别的成员').ok).toBe(false)
+})

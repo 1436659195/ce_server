@@ -72,6 +72,10 @@ const { server, close } = createRelayServer(hub, {
   // 雇佣网关访客页(2026-11-20):模板 + 内嵌 tweetnacl 浏览器版(缺一则 /hire 404)
   hirePagePath: join(here, '..', '..', 'scripts', 'hire-page.html'),
   hireNaclPath: join(here, '..', '..', 'node_modules', 'tweetnacl', 'nacl-fast.min.js'),
+  // 外部 agent 网关(2026-11-20 2-2):客户端源码(拼装内嵌 nacl)+ 行为手册 + 接入手册
+  guestClientPath: join(here, '..', '..', 'scripts', 'ce-guest-client.mjs'),
+  guestSkillPath: join(here, '..', '..', 'scripts', 'guest-skill.md'),
+  guestInstallPath: join(here, '..', '..', 'scripts', 'guest-install.md'),
   publicUrl,
 })
 if (bindHost) {

@@ -41,6 +41,10 @@ export type GroupOp =
   // 手机→relay:签发/轮换雇佣码(meta.kind='hire' 的房间;2026-11-19 雇佣网关)。
   // payload: {groupId}。返回 {code, createdAt}。再调一次 = 轮换(旧码即死)。
   | 'group-hire-set'
+  // 手机→relay:签发外部 agent 接入码(2026-11-20 外部 agent 网关,goals.md 2-2)。
+  // payload: {groupId}。返回 {code, createdAt}。一码一座:首个 pair 绑定成员身份,同码重连即重绑。
+  // 再调一次 = 追加新码(旧码不受影响;关灯 = group-dissolve 或未来删码 op)。
+  | 'group-agent-code-set'
   // 成员→relay:撤回自己的一条消息;群主可撤任何人的。payload: GroupRevokeReq。
   // relay 置 revokedAt 并清 ct,重播 group-msg(三端渲染「已撤回」墓碑;正文不可恢复)。
   | 'group-revoke'
@@ -109,7 +113,7 @@ export interface GroupMember {
 export interface GroupStoredMsg {
   seq: number; // 群内单调递增,relay 分配
   ts: number;
-  from: { memberId: string; name: string; human?: boolean };
+  from: { memberId: string; name: string; human?: boolean; /** 房外来客(雇佣雇主/外部 agent 网关;ce 按信息非指令投递) */ guest?: true };
   ct: string; // base64(nonce||ciphertext)
   opKey?: string; // 幂等键(原样透传;relay 拒重放:同 opKey 返回已存 seq)
   replyTo?: number; // 回复的 seq(仅成员消息;系统通知不可回复)
@@ -186,6 +190,13 @@ export interface GroupInvite {
 /** group-hire-set 的应答:雇佣码(网页访客凭据;随房间存续,轮换即换)。 */
 export interface GroupHireInfo {
   code: string; // 'XXXX-XXXX'(与邀请码同字母表;_lookup 走 rooms 的 hire.code,互不串)
+  groupId: string;
+  createdAt: number;
+}
+
+/** group-agent-code-set 的应答:外部 agent 接入码(一码一座;房钥不走此帧,由主人文本块人带)。 */
+export interface GroupAgentCodeInfo {
+  code: string;
   groupId: string;
   createdAt: number;
 }
