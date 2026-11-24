@@ -43,8 +43,11 @@ export type GroupOp =
   | 'group-hire-set'
   // 手机→relay:签发外部 agent 接入码(2026-11-20 外部 agent 网关,goals.md 2-2)。
   // payload: {groupId}。返回 {code, createdAt}。一码一座:首个 pair 绑定成员身份,同码重连即重绑。
-  // 再调一次 = 追加新码(旧码不受影响;关灯 = group-dissolve 或未来删码 op)。
+  // 再调一次 = 追加新码(旧码不受影响;撤销用 group-agent-code-revoke)。
   | 'group-agent-code-set'
+  // 手机→relay:群主撤销外部 agent 接入码并移除绑定成员，保留历史。
+  // payload: {groupId, code}。重复撤销幂等返回 {revoked:true}。
+  | 'group-agent-code-revoke'
   // 成员→relay:撤回自己的一条消息;群主可撤任何人的。payload: GroupRevokeReq。
   // relay 置 revokedAt 并清 ct,重播 group-msg(三端渲染「已撤回」墓碑;正文不可恢复)。
   | 'group-revoke'
@@ -123,8 +126,11 @@ export interface GroupStoredMsg {
 }
 
 /** 正文明文(群钥解密后)。kind 只加不破,未知 kind 老端显示为不支持。 */
+export interface GroupAttachment {
+  id: string; kind: 'upload' | 'artifact'; botId: string; name: string; mime: string; size: number; hash: string;
+}
 export type GroupPlaintext =
-  | { kind: 'text'; text: string }
+  | { kind: 'text'; text: string; attachments?: GroupAttachment[] }
   | { kind: 'system'; text: string } // relay 侧通知(如 xx 加入)不需要——走 group-meta;此档留给手机端本地系统提示
   | { kind: string; [k: string]: unknown };
 

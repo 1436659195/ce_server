@@ -526,10 +526,15 @@ export function createRelayServer(
     })
 
   // 长轮询 waiter(按群挂;onPosted 唤醒)
-  const waiters = new Map<string, Set<{ afterSeq: number; memberId: string; wake: () => void }>>()
+  const waiters = new Map<string, Set<{ afterSeq: number; memberId: string; wake: () => void; revoke: () => void }>>()
   hub.groups?.onPosted((groupId, msg) => {
     for (const w of waiters.get(groupId) ?? []) {
       if (msg.seq > w.afterSeq && msg.from.memberId !== w.memberId) w.wake()
+    }
+  })
+  hub.groups?.onMemberRemoved((groupId, memberId) => {
+    for (const waiter of waiters.get(groupId) ?? []) {
+      if (waiter.memberId === memberId) waiter.revoke()
     }
   })
 
@@ -567,6 +572,7 @@ export function createRelayServer(
         }
         const shim = { send: () => {} }
         const r = registry.guestHelloAgent(str(body.code), str(body.name), body.platform ? str(body.platform) : undefined, shim)
+        registry.onClose(shim)
         if (!r.ok) {
           noteGuestFail(ip)
           json({ ok: false, error: { code: 'code_invalid', message: r.error } })
@@ -627,6 +633,12 @@ export function createRelayServer(
               clearTimeout(timer)
               waiters.get(seat.groupId)?.delete(waiter)
               json({ ok: true, data: check() })
+              resolve()
+            },
+            revoke: () => {
+              clearTimeout(timer)
+              waiters.get(seat.groupId)?.delete(waiter)
+              json({ ok: false, error: { code: 'not_member', message: '外部 agent 接入已被撤销' } })
               resolve()
             },
           }

@@ -110,6 +110,8 @@ export class GroupRegistry {
   private fanout = new Map<string, Set<GroupWS>>()
   /** 连接 → 它代表的成员键([groupId, memberId]):断开时反查清理 + 群钥槽定向转发。 */
   private connMembers = new Map<GroupWS, Array<[string, string]>>()
+  /** 内存已退群但尚未确认落盘的成员；只供原身份重试，不参与收发鉴权。 */
+  private pendingLeaves = new Map<string, Map<string, GroupMember>>()
   private readonly ctx: GroupRegistryCtx
 
   constructor(ctx: GroupRegistryCtx) {
@@ -147,7 +149,7 @@ export class GroupRegistry {
     }
   }
 
-  private save(): void {
+  private save(): boolean {
     try {
       const groups = Array.from(this.groups.entries()).map(([id, g]) => ({
         id,
@@ -164,8 +166,10 @@ export class GroupRegistry {
         agentCodes: g.agentCodes,
       }))
       this.ctx.saveState(JSON.stringify({ v: 1, groups }))
+      return true
     } catch {
-      /* 写失败 → 忽略(本次内存有效) */
+      /* 本次内存仍有效；需要持久化确认的操作据 false 返回可重试错误。 */
+      return false
     }
   }
 
@@ -254,21 +258,23 @@ export class GroupRegistry {
 
   /** phone → 其 human 成员;guest → 断言 memberId(须 guest 成员);cli → 断言 memberId 校验
    *  machineId,或按 cid 唯一成员。 */
-  private member(id: Ctx, g: GroupStore, asserted?: string): GroupMember | undefined {
+  private member(id: Ctx, g: GroupStore, asserted?: string, src?: GroupWS, members = g.members): GroupMember | undefined {
     if (id.role === 'phone') {
       if (!id.phoneId) return undefined
-      for (const m of g.members.values()) if (m.phoneId === id.phoneId) return m
+      for (const m of members.values()) if (m.phoneId === id.phoneId) return m
       return undefined
     }
     if (id.role === 'guest') {
-      const m = asserted ? g.members.get(asserted) : undefined
-      return m && m.guest ? m : undefined
+      const m = asserted ? members.get(asserted) : undefined
+      // HTTP shim 的身份已由接入码验证；真实 WS 必须只使用自己已绑定的座位。
+      const bound = this.metaOverride || (src && this.connMembers.get(src)?.some(([gid, mid]) => this.groups.get(gid) === g && mid === asserted))
+      return m && m.guest && bound ? m : undefined
     }
     if (asserted) {
-      const m = g.members.get(asserted)
+      const m = members.get(asserted)
       return m && m.machineId && m.machineId === id.cid ? m : undefined
     }
-    for (const m of g.members.values()) if (!m.human && m.machineId === id.cid) return m
+    for (const m of members.values()) if (!m.human && m.machineId === id.cid) return m
     return undefined
   }
 
@@ -293,6 +299,33 @@ export class GroupRegistry {
       this.send(ws, { op: 'group-keyslot', groupId, payload: { groupId, slot } })
       g.slots.delete(memberId)
       this.save()
+    }
+  }
+
+  /** 只摘除该座位；同连接仍代表的其他房间/身份继续接收。 */
+  private unbindMember(groupId: string, memberId: string): void {
+    for (const [ws, bindings] of this.connMembers) {
+      if (!bindings.some(([gid, mid]) => gid === groupId && mid === memberId)) continue
+      const remaining = bindings.filter(([gid, mid]) => gid !== groupId || mid !== memberId)
+      if (remaining.length) this.connMembers.set(ws, remaining)
+      else this.connMembers.delete(ws)
+      if (!remaining.some(([gid]) => gid === groupId)) this.fanout.get(groupId)?.delete(ws)
+    }
+  }
+
+  /** save 保存全表；确认成功后，补发此前因持久化失败而暂缓的退群通知。 */
+  private finishPendingLeaves(): void {
+    const pending = this.pendingLeaves
+    this.pendingLeaves = new Map()
+    for (const [groupId, members] of pending) {
+      if (!this.groups.has(groupId)) continue
+      for (const member of members.values()) {
+        this.broadcast(groupId, { op: 'group-meta', groupId, payload: { event: 'member-left', groupId, member } satisfies GroupMetaEvent })
+        this.unbindMember(groupId, member.memberId)
+        for (const cb of this.memberRemovedListeners) {
+          try { cb(groupId, member.memberId) } catch { /* 观察者失败不回滚已保存的退群 */ }
+        }
+      }
     }
   }
 
@@ -388,7 +421,7 @@ export class GroupRegistry {
         this.reply(src, err('no_group', '缺正文'), env.reqId)
         return
       }
-      const m = this.member(id, g, p.memberId)
+      const m = this.member(id, g, p.memberId, src)
       if (!m) {
         this.reply(src, err('not_member', '发送方不在群内(或 machineId 不符)'), env.reqId)
         return
@@ -403,7 +436,7 @@ export class GroupRegistry {
         return
       }
       const p = env.payload as GroupSyncReq | undefined
-      const m = this.member(id, g, p?.memberId)
+      const m = this.member(id, g, p?.memberId, src)
       if (!m) {
         this.reply(src, err('not_member', '不在群内'), env.reqId)
         return
@@ -422,7 +455,7 @@ export class GroupRegistry {
       this.save()
       // members 随行(2026-11-20):手机/客户端成员名单不能只靠实时广播 —— 掉线错过
       // member-joined 就永久陈旧;sync 是重连自愈路,顺手对齐名单(只加不破)。
-      this.reply(src, { reqId: env.reqId ?? '', ok: true, data: { msgs, seq: g.seq, members: Array.from(g.members.values()) } })
+      this.reply(src, { reqId: env.reqId ?? '', ok: true, data: { msgs, seq: g.seq, members: Array.from(g.members.values()), meta: g.meta } })
     },
 
     'group-ack': (src, id, env) => {
@@ -432,7 +465,7 @@ export class GroupRegistry {
         return
       }
       const p = env.payload as GroupAckReq | undefined
-      const m = this.member(id, g, p?.memberId)
+      const m = this.member(id, g, p?.memberId, src)
       if (!m) {
         this.reply(src, err('not_member', '不在群内'), env.reqId)
         return
@@ -450,8 +483,15 @@ export class GroupRegistry {
         return
       }
       const p = env.payload as GroupLeaveReq | undefined
-      const m = this.member(id, g, p?.memberId)
+      const pending = this.pendingLeaves.get(env.groupId!)
+      const m = this.member(id, g, p?.memberId, src) ?? (pending && this.member(id, g, p?.memberId, src, pending))
       if (!m) {
+        // 内存缺席不足以证明持久退群；botRetire 将 not_member 视为幂等完成。
+        if (!this.save()) {
+          this.reply(src, err('storage_error', '退群状态保存失败，请保持连接并重试'), env.reqId)
+          return
+        }
+        this.finishPendingLeaves()
         this.reply(src, err('not_member', '不在群内'), env.reqId)
         return
       }
@@ -460,8 +500,15 @@ export class GroupRegistry {
         return
       }
       g.members.delete(m.memberId)
-      this.save()
-      this.broadcast(env.groupId!, { op: 'group-meta', groupId: env.groupId, payload: { event: 'member-left', groupId: env.groupId!, member: m } satisfies GroupMetaEvent })
+      g.slots.delete(m.memberId)
+      const leaving = pending ?? new Map<string, GroupMember>()
+      leaving.set(m.memberId, m)
+      this.pendingLeaves.set(env.groupId!, leaving)
+      if (!this.save()) {
+        this.reply(src, err('storage_error', '退群状态保存失败，请保持连接并重试'), env.reqId)
+        return
+      }
+      this.finishPendingLeaves()
       this.reply(src, { reqId: env.reqId ?? '', ok: true })
     },
 
@@ -556,6 +603,39 @@ export class GroupRegistry {
       this.reply(src, { reqId: env.reqId ?? '', ok: true, data: info })
     },
 
+    'group-agent-code-revoke': (src, id, env) => {
+      const g = env.groupId ? this.groups.get(env.groupId) : undefined
+      if (!g) {
+        this.reply(src, err('no_group', '群不存在'), env.reqId)
+        return
+      }
+      if (id.role !== 'phone' || id.phoneId !== g.ownerPhoneId) {
+        this.reply(src, err('not_member', '只有群主能撤销外部 agent 接入码'), env.reqId)
+        return
+      }
+      const p = env.payload as { code?: unknown } | undefined
+      if (typeof p?.code !== 'string' || !p.code.trim()) {
+        this.reply(src, err('code_invalid', '缺接入码'), env.reqId)
+        return
+      }
+      const entry = g.agentCodes.find(c => c.code === p.code)
+      g.agentCodes = g.agentCodes.filter(c => c.code !== p.code)
+      const member = entry?.memberId ? g.members.get(entry.memberId) : undefined
+      if (entry?.memberId) {
+        g.members.delete(entry.memberId)
+        g.slots.delete(entry.memberId)
+        this.unbindMember(env.groupId!, entry.memberId)
+      }
+      const persisted = this.save()
+      if (member) {
+        for (const cb of this.memberRemovedListeners) {
+          try { cb(env.groupId!, member.memberId) } catch { /* 观察者失败不回滚撤销 */ }
+        }
+        this.broadcast(env.groupId!, { op: 'group-meta', groupId: env.groupId, payload: { event: 'member-left', groupId: env.groupId!, member } satisfies GroupMetaEvent })
+      }
+      this.reply(src, persisted ? { reqId: env.reqId ?? '', ok: true, data: { revoked: true } } : err('storage_error', '接入已暂时停止，但撤销状态保存失败，请保持连接并重试'), env.reqId)
+    },
+
     'group-revoke': (src, id, env) => {
       // 撤回(宪法 #3):作者本人或群主。relay 置 revokedAt 清 ct,重播 group-msg —— 正文不可恢复。
       const g = env.groupId ? this.groups.get(env.groupId) : undefined
@@ -573,7 +653,7 @@ export class GroupRegistry {
         this.reply(src, err('no_group', '消息不存在或已撤回'), env.reqId)
         return
       }
-      const sender = this.member(id, g, p.memberId)
+      const sender = this.member(id, g, p.memberId, src)
       const isOwner = id.role === 'phone' && id.phoneId === g.ownerPhoneId
       const isAuthor = sender ? sender.memberId === msg.from.memberId : false
       if (!isOwner && !isAuthor) {
@@ -676,6 +756,7 @@ export class GroupRegistry {
       this.handle(shim, JSON.stringify(env))
     } finally {
       this.metaOverride = undefined
+      this.onClose(shim)
     }
     for (const w of sent) {
       try {
@@ -712,6 +793,13 @@ export class GroupRegistry {
   // ─── post 钩子(HTTP 长轮询用;server.ts 注册)──────────────────────────────────
 
   private postListeners = new Set<(groupId: string, msg: GroupStoredMsg) => void>()
+  private memberRemovedListeners = new Set<(groupId: string, memberId: string) => void>()
+
+  /** HTTP 长轮询在座位撤销时立即结束，不能等待后续消息或超时。 */
+  onMemberRemoved(cb: (groupId: string, memberId: string) => void): () => void {
+    this.memberRemovedListeners.add(cb)
+    return () => this.memberRemovedListeners.delete(cb)
+  }
 
   /** 注册「有新消息」回调(返回注销函数)。HTTP guest 长轮询靠它在有新货时立刻返回。 */
   onPosted(cb: (groupId: string, msg: GroupStoredMsg) => void): () => void {

@@ -16,8 +16,8 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, readlinkSync, writeFileSync, writeSync } from 'node:fs'
-import { join } from 'node:path'
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs'
+import { join, resolve, relative, isAbsolute, sep } from 'node:path'
 import { open, seal, sharedSecret } from '../shared/crypto'
 import {
   GROUP_LIMITS,
@@ -27,9 +27,18 @@ import {
   type GroupPlaintext,
   type GroupResult,
   type GroupStoredMsg,
+  type GroupMember,
 } from '../shared/group'
 import { classifySession, osProcLister, scanAgentProcsAll, type ProcEntry } from './session-scan'
 import { CE_CHAT_SKILL_MD, CE_CHAT_SKILL_NAME } from './chat-skill'
+import { botCliAvailable, runBot, type BotPlatform, type BotTurn, type BotTurnResult } from './bot-runtime'
+import { botPermissionPreset, operationMode, resolveBotDirectory, validateBotPermissions, type BotApproval, type BotOperation, type BotPermissions, type BotPolicyInfo, type BotToolContext, type StoredBotPolicy } from './bot-permissions'
+import type { BotRuntimeService, RuntimeControl } from './bot-runtime/service'
+import type { RuntimeAttachment, RuntimeBot, RuntimeReply, RuntimeSettings, RuntimeUploadRequest, RuntimeView } from './bot-runtime/types'
+import { digitalPersonDirectory, digitalPersonProfile, validateDigitalPerson, type DigitalPersonState } from './bot-onboarding'
+
+type BotMemberIdentity = Pick<GroupMember, 'memberId' | 'name' | 'phoneId' | 'human' | 'guest'>
+type BotPolicyResult = { ok: boolean; data?: BotPolicyInfo; error?: string }
 
 /** 单 agent 的群成员身份(一 agent 可入多群)。 */
 interface AgentGroupRec {
@@ -40,9 +49,20 @@ interface AgentGroupRec {
   twinSessionId?: string
   /** 上次注入 prompt 的交班本指纹(变了才重注;续接会话上下文里已有旧版)。 */
   twinNotesHash?: string
+  botSessionId?: string
+  botSessions?: Record<string, string>
+  createdBy?: string
+  createdAt?: number
+  botMembers?: BotMemberIdentity[]
+  botHistorySeq?: number
+  /** 已实时入队但尚未被历史扫描游标覆盖的 seq，防重放且不跨过离线缺口。 */
+  botRealtimeSeqs?: number[]
+  botQueue?: Array<{ seq: number; text: string; attachments?: RuntimeAttachment[]; fromName: string; fromHuman: boolean; fromMemberId?: string; reply?: { text: string; system: boolean; offset: number } }>
 }
 
 interface AgentRec {
+  /** 新 BOT 与来源 Agent 的运行上下文分离；legacy join 不设置此标记。 */
+  bot?: { id?: string; sourceSessionId: string; dmGroupId?: string; policy?: StoredBotPolicy; onboarding?: DigitalPersonState; retirement?: { ownerPhoneId: string; requestedAt: number; completedAt?: number } }
   platform?: string
   cwd?: string
   joinedAt: number
@@ -75,10 +95,14 @@ export interface HireRec {
   groupId: string
   groupName: string
   agent: string
+  /** 保存租赁来源品牌，展示不依赖仍打开的来源会话。 */
+  platform?: string
   quota: HireQuota
   used: { tokens: number; runs: number }
   /** twin log 已入账的运行条数(增量解析防重复计)。 */
   accountedRuns: number
+  /** Token 配额无法可靠计量时暂停，避免代理省略 usage 导致无限执行。 */
+  meteringUnavailable?: boolean
   /** 超额/到期提示上次发出的时间(6h 一条,防刷屏)。 */
   noticeAt?: number
 }
@@ -107,6 +131,16 @@ export interface ChatHubOpts {
   pubKey: Uint8Array
   /** 状态文件(~/.ce/chat-state.json;0600,含群钥)。 */
   statePath: string
+  /** Jupyter 的真实根目录。前端 sourceCwd 是此根下的 UI 路径。 */
+  rootDir?: string
+  botCliAvailable?: (platform: BotPlatform) => Promise<boolean>
+  botCliPaths?: Partial<Record<BotPlatform, string>>
+  runBot?: (turn: BotTurn) => Promise<BotTurnResult>
+  people?: () => Array<{ phoneId: string; name: string }>
+  commandSandbox?: () => boolean
+  approvalTimeoutMs?: number
+  onBotPolicyChanged?: (name: string) => void
+  openBotTools?: (context: BotToolContext) => { connection: { endpoint: string; token: string }; close: () => void }
   /** 把一条群信封发上 relay(main.ts 注入:GroupFrame 直出,正文已密文)。 */
   sendEnvelope(env: GroupEnvelope): void
   /** 本机会话数据(roster 聚合用;main.ts 注入,测试喂假数据)。 */
@@ -164,9 +198,82 @@ export interface GroupAgentRunner {
 }
 
 export class ChatHub {
+  private runtime?: BotRuntimeService
   private state: ChatState = { v: 1, keys: {}, agents: {}, hires: {} }
   /** reqId → 等待中的应答(群操作是 relay req/resp,与 RPCReq 同款关联法)。 */
   private pending = new Map<string, { resolve: (r: GroupResult) => void; timer: ReturnType<typeof setTimeout> }>()
+
+  attachBotRuntime(runtime: BotRuntimeService): void { this.runtime = runtime }
+
+  /** 本机权威 Bot 信息；显示名仅用于首次定位，持久 ID 不随名字改变。 */
+  runtimeBot(nameOrId: string): RuntimeBot {
+    const entry = Object.entries(this.state.agents).find(([name, r]) => name === nameOrId || r.bot?.id === nameOrId)
+    if (!entry) throw new Error('找不到本地 Bot')
+    const [name, rec] = entry; const policy = rec.bot?.policy
+    if (!rec.bot || rec.bot.retirement || !policy || !rec.cwd) throw new Error('Bot 未配置 owner 权限或已注销')
+    if (!rec.bot.id) { rec.bot.id = randomUUID(); this.save(true) }
+    return { botId: rec.bot.id, name, groupId: rec.bot.dmGroupId ?? Object.keys(rec.groups)[0], ownerPhoneId: policy.ownerPhoneId, sourceCwd: rec.cwd, directory: resolveBotDirectory(rec.cwd, policy.permissions), permissions: policy.permissions, policyRevision: policy.revision, commandSandbox: this.opts.commandSandbox?.() === true, platform: rec.platform ?? 'claude' }
+  }
+
+  async botRuntime(nameOrId: string, actor: string): Promise<{ ok: boolean; data?: RuntimeView; error?: string }> {
+    try { if (!this.runtime) throw new Error('当前 CE 不支持前后台模式'); return { ok: true, data: this.runtime.view(this.runtimeBot(nameOrId).botId, actor) } }
+    catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  async botRuntimeUpdate(nameOrId: string, actor: string, revision: number, patch: Partial<Pick<RuntimeSettings, 'mode' | 'profile' | 'model'>>): Promise<{ ok: boolean; data?: RuntimeView; error?: string }> {
+    try {
+      if (!this.runtime) throw new Error('当前 CE 不支持前后台模式')
+      const bot = this.runtimeBot(nameOrId)
+      const onboarding = this.state.agents[bot.name].bot?.onboarding
+      if (onboarding && onboarding.status !== 'ready') throw new Error('请先完成数字人初始化，再修改运行设置')
+      if (onboarding && patch.mode === 'legacy') throw new Error('独立数字人使用前台 + Worker，不能切换到旧会话模式')
+      if ([...this.botRunning].some(key => key.startsWith(`${bot.name}\0`)) || Object.values(this.state.agents[bot.name].groups).some(g => g.botQueue?.length)) throw new Error('旧模式仍有消息在处理，请完成后再切换')
+      return { ok: true, data: await this.runtime.configure(bot.botId, actor, revision, patch) }
+    } catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  async botWorkControl(nameOrId: string, actor: string, control: RuntimeControl): Promise<{ ok: boolean; data?: RuntimeView; error?: string }> {
+    try { if (!this.runtime) throw new Error('当前 CE 不支持前后台模式'); return { ok: true, data: await this.runtime.control(this.runtimeBot(nameOrId).botId, actor, control) } }
+    catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  botArtifact(nameOrId: string, actor: string, artifactId: string): { ok: boolean; data?: { title: string; mime: string; content: string }; error?: string } {
+    try { if (!this.runtime) throw new Error('当前 CE 不支持前后台模式'); return { ok: true, data: this.runtime.artifact(this.runtimeBot(nameOrId).botId, actor, artifactId) } }
+    catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  botUpload(nameOrId: string, actor: string, request: RuntimeUploadRequest): { ok: boolean; data?: unknown; error?: string } {
+    try { if (!this.runtime) throw new Error('当前 CE 不支持聊天附件，请更新 CE'); return { ok: true, data: this.runtime.upload(this.runtimeBot(nameOrId).botId, actor, request) } }
+    catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+  botAttachment(nameOrId: string, actor: string, attachment: Pick<RuntimeAttachment, 'id' | 'kind'>, offset: number, length: number): { ok: boolean; data?: unknown; error?: string } {
+    try { if (!this.runtime) throw new Error('当前 CE 不支持聊天附件，请更新 CE'); return { ok: true, data: this.runtime.readAttachment(this.runtimeBot(nameOrId).botId, actor, attachment, offset, length) } }
+    catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  async checkRuntimeAccess(botId: string, memberId: string, operation: BotOperation): Promise<{ directory: string; permissions: BotPermissions; revision: number }> {
+    const bot = this.runtimeBot(botId)
+    if (!this.runtime?.enabled(bot.botId)) throw new Error('前后台模式已关闭')
+    return this.botToolAuthorization({ name: bot.name, groupId: bot.groupId, memberId, requesterName: bot.name }, operation)
+  }
+
+  async sendRuntimeReply(reply: RuntimeReply): Promise<void> {
+    const bot = this.runtimeBot(reply.botId); const rec = this.state.agents[bot.name]
+    const assertCurrent = () => {
+      if (rec.bot?.retirement || rec.bot?.policy?.revision !== reply.policyRevision || !this.runtime?.enabled(reply.botId) || reply.groupId !== bot.groupId) throw new Error('回复的权限或接收者已改变')
+      if (!this.runtime.maySend(reply)) throw new Error('回复已因任务状态变化失效')
+      if (!rec.groups[bot.groupId]?.botMembers?.some(m => m.phoneId === bot.ownerPhoneId && m.human && !m.guest)) throw new Error('owner 已不在私聊中')
+    }
+    await this.refreshBotMembers(rec, bot.groupId); assertCurrent()
+    const sync = await this.opSync(bot.name, rec, { groupId: bot.groupId }, true)
+    if (!sync.ok) throw new Error(sync.error ?? '读取私聊失败')
+    assertCurrent()
+    const attachments = this.runtime!.replyAttachments(reply)
+    const body = { groupId: bot.groupId, text: reply.text, ...(attachments.length ? { attachments } : {}), opKey: `runtime_${reply.id}` }
+    let result = await this.opSend(bot.name, rec, body)
+    if (!result.ok && result.error?.includes('new_messages')) { assertCurrent(); result = await this.opSend(bot.name, rec, body) }
+    if (!result.ok) throw new Error(result.error ?? '回复发送失败')
+  }
 
   constructor(private readonly opts: ChatHubOpts) {
     this.load()
@@ -185,14 +292,21 @@ export class ChatHub {
       const n = Object.values(this.state.agents).reduce((acc, r) => acc + Object.keys(r.groups).length, 0)
       console.log(`[ce:chat-debug] bootSync:挂载 ${n} 个 (agent,群)`)
     }
-    for (const rec of Object.values(this.state.agents)) {
+    for (const [name, rec] of Object.entries(this.state.agents)) {
+      if (rec.bot?.retirement) continue
       for (const [gid, g] of Object.entries(rec.groups)) {
         try {
           this.rpc('group-sync', gid, {
             groupId: gid,
             memberId: g.memberId,
-            afterSeq: g.lastReadSeq,
+            afterSeq: rec.bot ? g.botHistorySeq ?? 0 : g.lastReadSeq,
+            limit: rec.bot ? 5000 : undefined,
             markRead: false,
+          }).then(result => {
+            if (!result.ok || !rec.bot) return
+            this.captureBotMembers(rec, gid, result.data)
+            this.ingestBotHistory(name, rec, gid, (result.data as { msgs?: GroupStoredMsg[] }).msgs ?? [])
+            void this.drainBot(name, gid)
           }).catch(() => undefined)
         } catch {
           /* 单群失败不影响其他 */
@@ -216,12 +330,17 @@ export class ChatHub {
     }
   }
 
-  private save(): void {
+  private save(strict = false): void {
+    let temporary: string | undefined
     try {
       mkdirSync(join(this.opts.statePath, '..'), { recursive: true })
-      writeFileSync(this.opts.statePath, JSON.stringify(this.state))
-      chmodSync(this.opts.statePath, 0o600)
-    } catch {
+      const path = strict ? temporary = `${this.opts.statePath}.${randomBytes(6).toString('hex')}.tmp` : this.opts.statePath
+      writeFileSync(path, JSON.stringify(this.state), { mode: 0o600 })
+      chmodSync(path, 0o600)
+      if (strict) renameSync(path, this.opts.statePath)
+    } catch (error) {
+      if (temporary) try { rmSync(temporary, { force: true }) } catch { /* 不掩盖原始保存错误。 */ }
+      if (strict) throw new Error(`数字员工注销状态未能保存，请重试：${(error as Error).message}`)
       /* 写失败 → 本次内存有效 */
     }
   }
@@ -263,16 +382,17 @@ export class ChatHub {
       return
     }
     let text = ''
+    let attachments: RuntimeAttachment[] | undefined
     try {
       const pt = JSON.parse(new TextDecoder().decode(open(key, new Uint8Array(Buffer.from(msg.ct, 'base64'))))) as GroupPlaintext
-      if (pt.kind !== 'text' || typeof pt.text !== 'string' || !pt.text.trim()) return
+      if (pt.kind !== 'text' || typeof pt.text !== 'string' || (!pt.text.trim() && !Array.isArray(pt.attachments))) return
       text = pt.text
+      if (Array.isArray(pt.attachments)) attachments = pt.attachments as RuntimeAttachment[]
     } catch {
       return
     }
     const runner = this.opts.agentRunner
     if (!runner && !this.hasTerminalAgents(gid)) return // 无 runner 且无终端型成员:没人可投
-    if (!runner) return // 有终端型成员但没配 runner:runner 为空时 twin 唤醒走 opts.spawnTwin 默认实现前的分支 — 见下
     // 雇佣配额闸(ce 是唯一执行点):超额/到期 → 拒投递 + 房间一条 system 提示(6h 一条防刷)
     const hire = this.state.hires?.[gid]
     if (hire && msg.from.human) {
@@ -301,6 +421,10 @@ export class ChatHub {
     const sessions = runner?.sessions() ?? []
     for (const name of targets) {
       const rec = this.state.agents[name]
+      if (rec.bot) {
+        this.enqueueBot(name, gid, msg, text, attachments)
+        continue
+      }
       const cwd = rec.cwd
       const matched = cwd ? sessions.filter((x) => x.cwd === cwd) : []
       if (matched.length === 0) {
@@ -461,6 +585,7 @@ export class ChatHub {
   /** 雇佣配额闸:投递前查账。返回 null=放行;字符串=拒因(顺带发房间 system 提示)。 */
   private hireGate(h: HireRec): string | null {
     this.accountTwinUsage(h)
+    if (h.meteringUnavailable) return '模型未返回用量，租赁已暂停，请联系主人检查模型服务'
     const q = h.quota
     if (q.expiresAt && Date.now() > q.expiresAt) return '雇佣已到期,请联系主人续期'
     if (q.maxTokens && h.used.tokens >= q.maxTokens) return '雇佣额度已用完,请联系主人续期'
@@ -483,6 +608,7 @@ export class ChatHub {
 
   /** 增量记账:twin log 按「===== 唤醒」标记切运行块,新完成块里解析 usage 累加(无 log 按 0 计)。 */
   private accountTwinUsage(h: HireRec): void {
+    if (this.state.agents[h.agent]?.bot) return
     try {
       const raw = readFileSync(join(this.opts.statePath, '..', `twin-${h.agent}.log`), 'utf8')
       const runs = (raw.match(/===== 唤醒 /g) ?? []).length
@@ -530,10 +656,21 @@ export class ChatHub {
     const ev = env.payload as GroupMetaEvent | undefined
     if (!ev?.groupId) return
     let dirty = false
+    if (ev.member && ['member-joined', 'member-left'].includes(ev.event)) {
+      for (const [name, rec] of Object.entries(this.state.agents)) {
+        const group = rec.bot && rec.groups[ev.groupId]
+        if (!group) continue
+        if (ev.event === 'member-left' && (this.botCommander(rec, ev.groupId, ev.member.memberId) || ev.member.memberId === group.memberId)) this.opts.onBotPolicyChanged?.(name)
+        group.botMembers = (group.botMembers ?? []).filter(member => member.memberId !== ev.member!.memberId)
+        if (ev.event === 'member-joined') group.botMembers.push(this.botMemberIdentity(ev.member))
+        dirty = true
+      }
+    }
     if (ev.event === 'dissolved') {
       delete this.state.keys[ev.groupId]
-      for (const rec of Object.values(this.state.agents)) {
+      for (const [name, rec] of Object.entries(this.state.agents)) {
         if (rec.groups[ev.groupId]) {
+          if (rec.bot) this.opts.onBotPolicyChanged?.(name)
           delete rec.groups[ev.groupId]
           dirty = true
         }
@@ -559,39 +696,515 @@ export class ChatHub {
   // ─── 雇佣网关 RPC(手机隧道;2026-11-19)───────────────────────────────────────
 
   /** 开门:手机雇佣页 → 用邀请码本地 join(复用 opJoin 全路径:身份/群钥槽/手册落盘),记配额账本。 */
-  async hireSetup(p: { code: string; name: string; quota?: HireQuota }): Promise<{ ok: boolean; data?: unknown; error?: string }> {
+  async hireSetup(p: { code: string; name: string; quota?: HireQuota; platform?: string; sourceSessionId?: string; sourceCwd?: string; groupId?: string; botProtocol?: number }, actorPhoneId?: string): Promise<{ ok: boolean; data?: unknown; error?: string }> {
     if (!p.code || !p.name) return { ok: false, error: 'hireSetup 需要 code 与 name' }
     const cwd = this.state.agents[p.name]?.cwd ?? process.cwd()
-    const r = await this.opJoin({ code: p.code, name: p.name, cwd })
+    // 新租赁必须精确绑定来源；复用数字员工的校验和隔离运行，不能按展示名猜目录。
+    const r = p.botProtocol !== undefined || p.sourceSessionId
+      ? await this.addAgent(p, actorPhoneId)
+      : await this.opJoin({ code: p.code, name: p.name, cwd })
     if (!r.ok) return r
     const d = r.data as { groupId: string; groupName: string }
     this.state.hires[d.groupId] = {
       groupId: d.groupId,
       groupName: d.groupName,
       agent: p.name,
+      platform: this.state.agents[p.name]?.platform,
       quota: p.quota ?? {},
       used: { tokens: 0, runs: 0 },
       accountedRuns: 0,
     }
     this.save()
-    return { ok: true, data: { groupId: d.groupId, groupName: d.groupName } }
+    return { ok: true, data: { groupId: d.groupId, groupName: d.groupName, ...(p.sourceSessionId ? { botProtocol: 1 } : {}) } }
   }
 
   /** 账本一览(手机雇佣页的额度/用量展示)。 */
   hireStatus(): { ok: boolean; data?: unknown } {
-    return { ok: true, data: Object.values(this.state.hires) }
+    return { ok: true, data: Object.values(this.state.hires).map(rec => ({ ...rec, platform: rec.platform ?? this.state.agents[rec.agent]?.platform })) }
+  }
+
+  private botApprovals = new Map<string, { name: string; revision: number; approval: BotApproval; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
+
+  private botMemberIdentity(member: GroupMember): BotMemberIdentity {
+    return { memberId: member.memberId, name: member.name, phoneId: member.phoneId, human: member.human, guest: member.guest }
+  }
+
+  /** 成员身份只来自 relay 快照和事件，不采信聊天正文或显示名。 */
+  private captureBotMembers(rec: AgentRec, gid: string, input: unknown): void {
+    const group = rec.groups[gid]
+    if (!rec.bot || !group || !input || typeof input !== 'object') return
+    const data = input as { members?: GroupMember[]; meta?: { createdBy?: string; createdAt?: number } }
+    if (Array.isArray(data.members)) {
+      const commanderIds = (group.botMembers ?? []).filter(member => this.botCommander(rec, gid, member.memberId)).map(member => member.memberId)
+      group.botMembers = data.members.filter(member => typeof member.memberId === 'string').map(member => this.botMemberIdentity(member))
+      if (commanderIds.some(memberId => !this.botCommander(rec, gid, memberId))) {
+        const name = Object.keys(this.state.agents).find(name => this.state.agents[name] === rec)
+        if (name) this.opts.onBotPolicyChanged?.(name)
+      }
+    }
+    if (!group.createdBy && typeof data.meta?.createdBy === 'string') group.createdBy = data.meta.createdBy
+    if (group.createdAt === undefined && typeof data.meta?.createdAt === 'number') group.createdAt = data.meta.createdAt
+    this.save()
+  }
+
+  private async refreshBotMembers(rec: AgentRec, gid: string): Promise<void> {
+    const group = rec.groups[gid]
+    if (!group) throw new Error('BOT 已不在此聊天中')
+    const result = await this.rpc('group-sync', gid, { groupId: gid, memberId: group.memberId, afterSeq: group.botHistorySeq ?? 0, limit: 1, markRead: false })
+    if (!result.ok) throw new Error('无法确认聊天成员身份，请重连后重试')
+    if (!Array.isArray((result.data as { members?: GroupMember[] })?.members)) throw new Error('中继未返回成员身份，请更新中继后重试')
+    this.captureBotMembers(rec, gid, result.data)
+  }
+
+  private botCommander(rec: AgentRec, gid: string, memberId: string): boolean {
+    const policy = rec.bot?.policy
+    const member = rec.groups[gid]?.botMembers?.find(row => row.memberId === memberId)
+    if (!policy || !member?.phoneId || member.human !== true || member.guest) return false
+    if (rec.bot?.id && this.runtime?.enabled(rec.bot.id)) return gid === rec.bot.dmGroupId && member.phoneId === policy.ownerPhoneId
+    return member.phoneId === policy.ownerPhoneId || policy.permissions.commanders === 'members' ||
+      policy.permissions.commanders === 'selected' && policy.permissions.allowedPhoneIds.includes(member.phoneId)
+  }
+
+  /** 旧 BOT 只允许最初私聊的真实创建者接管，后续群主不获得所有权。 */
+  private async canAdoptBot(name: string, rec: AgentRec, actorPhoneId: string): Promise<boolean> {
+    if (!actorPhoneId || !rec.bot) return false
+    if (rec.bot.retirement) return rec.bot.retirement.ownerPhoneId === actorPhoneId
+    if (rec.bot.policy) return rec.bot.policy.ownerPhoneId === actorPhoneId
+    const gid = rec.bot.dmGroupId ?? Object.keys(rec.groups)[0]
+    const group = rec.groups[gid]
+    if (!group || group.groupName !== `私聊·${name}`) return false
+    await this.refreshBotMembers(rec, gid)
+    const currentPolicy = this.state.agents[name]?.bot?.policy
+    if (currentPolicy) return currentPolicy.ownerPhoneId === actorPhoneId
+    return group.createdBy === actorPhoneId && typeof group.createdAt === 'number' && group.createdAt <= rec.joinedAt &&
+      group.botMembers?.some(member => member.phoneId === actorPhoneId && member.human === true && !member.guest) === true
+  }
+
+  private invalidateBotPolicy(name: string, rec: AgentRec): void {
+    if (rec.bot?.id) void this.runtime?.policyChanged(rec.bot.id)
+    for (const group of Object.values(rec.groups)) {
+      delete group.botSessionId; delete group.botSessions
+      for (const pending of group.botQueue ?? []) if (pending.reply && !pending.reply.system) pending.reply = { text: 'BOT 权限已更新，旧回复已作废，请重新发送消息。', system: true, offset: 0 }
+    }
+    for (const [id, pending] of this.botApprovals) {
+      if (pending.name !== name) continue
+      clearTimeout(pending.timer); this.botApprovals.delete(id)
+      pending.reject(new Error('BOT 权限已更新，本次确认失效'))
+    }
+    this.opts.onBotPolicyChanged?.(name)
+  }
+
+  async botPolicy(name: string, actorPhoneId: string, permissions?: unknown): Promise<BotPolicyResult> {
+    try {
+      const rec = this.state.agents[name]
+      if (!rec?.bot || !rec.cwd) throw new Error('找不到本地 BOT')
+      if (!actorPhoneId) throw new Error('请通过已认证手机管理 BOT 权限')
+      const canManage = await this.canAdoptBot(name, rec, actorPhoneId)
+      if (permissions !== undefined) {
+        if (rec.bot.retirement) throw new Error('数字员工已停止或注销，不能修改权限')
+        if (!canManage) throw new Error('只有 BOT 创建者可以修改权限')
+        const validated = validateBotPermissions(permissions)
+        resolveBotDirectory(rec.cwd, validated)
+        if (validated.execute !== 'deny' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱，暂不能授予命令执行权限')
+        if (rec.bot.policy && rec.bot.policy.ownerPhoneId !== actorPhoneId) throw new Error('BOT 已由其他创建者管理')
+        rec.bot.policy = { permissions: validated, ownerPhoneId: actorPhoneId, revision: (rec.bot.policy?.revision ?? 0) + 1 }
+        rec.bot.dmGroupId ??= Object.keys(rec.groups)[0]
+        this.invalidateBotPolicy(name, rec); this.save()
+      }
+      const policy = rec.bot.policy
+      return { ok: true, data: {
+        permissions: policy?.permissions ?? botPermissionPreset('readonly'), ownerPhoneId: policy?.ownerPhoneId,
+        revision: policy?.revision ?? 0, canManage,
+        approvals: canManage ? [...[...this.botApprovals.values()].filter(p => p.name === name && p.approval.expiresAt > Date.now()).map(p => ({ ...p.approval })), ...(rec.bot.id && this.runtime ? this.runtime.approvals(rec.bot.id) : [])] : [],
+        people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true,
+      } }
+    } catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  async botApprove(name: string, actorPhoneId: string, approvalId: string, allow: boolean): Promise<{ ok: boolean; error?: string }> {
+    const rec = this.state.agents[name]
+    if (!actorPhoneId || !rec?.bot?.policy || rec.bot.retirement || rec.bot.policy.ownerPhoneId !== actorPhoneId) return { ok: false, error: '只有有效 BOT 的创建者可以确认操作' }
+    if (approvalId.startsWith('operation_') && rec.bot.id && this.runtime) {
+      try { await this.runtime.approve(rec.bot.id, actorPhoneId, approvalId, allow); return { ok: true } }
+      catch (error) { return { ok: false, error: (error as Error).message } }
+    }
+    const pending = this.botApprovals.get(approvalId)
+    if (!pending || pending.name !== name) return { ok: false, error: '此确认已结束或不存在' }
+    if (pending.revision !== rec.bot.policy.revision || pending.approval.expiresAt <= Date.now()) {
+      clearTimeout(pending.timer); this.botApprovals.delete(approvalId); pending.reject(new Error('本次确认已失效'))
+      return { ok: false, error: '此确认已过期或权限已改变' }
+    }
+    clearTimeout(pending.timer); this.botApprovals.delete(approvalId)
+    if (allow === true) pending.resolve()
+    else pending.reject(new Error('创建者拒绝了本次操作'))
+    return { ok: true }
+  }
+
+  private async botToolAuthorization(context: BotToolContext, operation: BotOperation): Promise<{ directory: string; permissions: BotPermissions; revision: number }> {
+    const rec = this.state.agents[context.name]
+    if (rec?.bot?.retirement) throw new Error('数字员工已停止或注销')
+    if (!rec?.bot?.policy || !rec.cwd) throw new Error('BOT 尚未由创建者配置项目权限')
+    await this.refreshBotMembers(rec, context.groupId)
+    if (rec.bot.retirement) throw new Error('数字员工已停止或注销')
+    const member = rec.groups[context.groupId]?.botMembers?.find(row => row.memberId === context.memberId)
+    if (!member) throw new Error('无法确认消息发送者身份')
+    if (!this.botCommander(rec, context.groupId, context.memberId)) throw new Error('该成员没有指挥 BOT 操作项目的权限')
+    const policy = rec.bot.policy
+    const permissions = validateBotPermissions(policy.permissions)
+    if (!['read', 'create', 'edit', 'delete', 'execute'].includes(operation)) throw new Error('不支持的 BOT 操作')
+    if (operationMode(permissions, operation) === 'deny') throw new Error('创建者已禁止此操作')
+    if (operation === 'execute' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱')
+    return { directory: resolveBotDirectory(rec.cwd, permissions), permissions, revision: policy.revision }
+  }
+
+  async authorizeBotTool(context: BotToolContext, operation: BotOperation, summary: string): Promise<{ directory: string; permissions: BotPermissions; revision: number }> {
+    const assertCurrent = (revision: number): void => {
+      const rec = this.state.agents[context.name]
+      if (rec?.bot?.retirement) throw new Error('数字员工已停止或注销')
+      if (!rec?.bot?.policy || rec.bot.policy.revision !== revision) throw new Error('BOT 权限已改变，本次授权失效')
+      if (!this.botCommander(rec, context.groupId, context.memberId)) throw new Error('发送者身份或项目操作权限已改变，本次授权失效')
+    }
+    const authorization = await this.botToolAuthorization(context, operation)
+    // await 的返回边界也可能与注销/撤权交叉。此处到审批入表之间不能再次让出执行权。
+    assertCurrent(authorization.revision)
+    if (operationMode(authorization.permissions, operation) !== 'ask') return authorization
+    if (this.botApprovals.size >= 64) throw new Error('等待确认的操作过多，请先处理已有请求')
+    const id = randomBytes(18).toString('hex')
+    const createdAt = Date.now(); const timeout = this.opts.approvalTimeoutMs ?? 120_000
+    const approval: BotApproval = { id, operation, summary: String(summary).slice(0, 205000), groupId: context.groupId, requesterName: context.requesterName, createdAt, expiresAt: createdAt + timeout }
+    await new Promise<void>((resolveApproval, reject) => {
+      const timer = setTimeout(() => { this.botApprovals.delete(id); reject(new Error('等待创建者确认超时，本次操作未执行')) }, timeout)
+      this.botApprovals.set(id, { name: context.name, revision: authorization.revision, approval, resolve: resolveApproval, reject, timer })
+    })
+    const current = await this.botToolAuthorization(context, operation)
+    assertCurrent(current.revision)
+    if (current.revision !== authorization.revision) throw new Error('BOT 权限已改变，本次确认失效')
+    return current
   }
 
   /**
    * 声明式拉人(2026-11-20 用户定案:第二种接入渠道,与「终端拉」并列):手机声明
    * 工作路径 + CLI 类型(daemon 在该路径 spawn CLI 处理群消息 = twin 通道),不需要终端在场。
-   * 当前仅支持 Claude Code CLI;后续平台在此分派。join 全路径复用(身份/群钥槽/手册落盘)。
+   * 新 BOT 支持 Claude/Codex 独立聊天；旧版无来源参数仍沿用 legacy join。
    */
-  async addAgent(p: { code: string; name: string; cwd: string; platform?: string }): Promise<{ ok: boolean; data?: unknown; error?: string }> {
-    if (!p.code || !p.name || !p.cwd) return { ok: false, error: 'addAgent 需要 code/name/cwd' }
-    const plat = p.platform ?? 'claude'
-    if (plat !== 'claude') return { ok: false, error: `暂不支持 ${plat}(当前仅 Claude Code CLI;后续版本扩展)` }
-    return await this.opJoin({ code: p.code, name: p.name, cwd: p.cwd, platform: plat })
+  private addAgentPending = new Map<string, Promise<{ ok: boolean; data?: unknown; error?: string }>>()
+  private botRetiring = new Map<string, Promise<{ ok: boolean; data?: { retired: true }; error?: string }>>()
+
+  /** 先持久停止，再逐个退出。失败仍保持停止，创建者可安全重试剩余成员。 */
+  async botRetire(name: string, actorPhoneId: string): Promise<{ ok: boolean; data?: { retired: true }; error?: string }> {
+    try {
+      const rec = this.state.agents[name]
+      if (!actorPhoneId || !rec?.bot || !await this.canAdoptBot(name, rec, actorPhoneId)) throw new Error('只有已认证的数字员工创建者可以注销')
+      // canAdoptBot 可能等待中继快照，必须在 await 后重新检查所有权。
+      if (rec.bot.retirement && rec.bot.retirement.ownerPhoneId !== actorPhoneId || rec.bot.policy && rec.bot.policy.ownerPhoneId !== actorPhoneId) throw new Error('数字员工创建者不匹配')
+      const pending = this.botRetiring.get(name)
+      if (pending) return await pending
+      rec.bot.retirement ??= { ownerPhoneId: actorPhoneId, requestedAt: Date.now() }
+      for (const group of Object.values(rec.groups)) { group.botQueue = []; group.botRealtimeSeqs = [] }
+      this.invalidateBotPolicy(name, rec)
+      for (const [key, controller] of this.botControllers) if (key.startsWith(`${name}\0`)) controller.abort()
+      this.save(true)
+      const operation = (async () => {
+        // 在途入群会发现停止标记并保留成员以便清理；等待它结束后再枚举群。
+        await this.addAgentPending.get(name)?.catch(() => undefined)
+        await Promise.allSettled([...(this.botJoining.get(name) ?? [])])
+        const errors: string[] = []
+        for (const [gid, group] of Object.entries(rec.groups)) {
+          try {
+            const result = await this.rpc('group-leave', gid, { groupId: gid, memberId: group.memberId })
+            if (!result.ok && !['not_member', 'no_group'].includes(result.error?.code ?? '')) throw new Error(result.error?.message ?? result.error?.code ?? '退群失败')
+            delete rec.groups[gid]
+            this.save(true)
+          } catch (error) { errors.push(`${group.groupName}：${(error as Error).message}`) }
+        }
+        if (errors.length) return { ok: false, error: `数字员工已停止，部分聊天尚未退出，请重试注销。${errors.join('；')}` }
+        rec.bot!.retirement!.completedAt ??= Date.now()
+        this.save(true)
+        return { ok: true, data: { retired: true as const } }
+      })()
+      this.botRetiring.set(name, operation)
+      try { return await operation }
+      finally { if (this.botRetiring.get(name) === operation) this.botRetiring.delete(name) }
+    } catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  async addAgent(p: { code: string; name: string; cwd?: string; platform?: string; sourceSessionId?: string; sourceCwd?: string; groupId?: string; botProtocol?: number; botPolicyProtocol?: number; permissions?: unknown; onboarding?: unknown }, actorPhoneId?: string): Promise<{ ok: boolean; data?: unknown; error?: string }> {
+    // 同名调用串行，确保双击/并发邀请不会重复 join 或覆盖来源。
+    const previous = this.addAgentPending.get(p.name)
+    const operation = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(() => this.addAgentInner(p, actorPhoneId))
+    this.addAgentPending.set(p.name, operation)
+    try { return await operation }
+    finally { if (this.addAgentPending.get(p.name) === operation) this.addAgentPending.delete(p.name) }
+  }
+
+  private async addAgentInner(p: Parameters<ChatHub['addAgent']>[0], actorPhoneId?: string): Promise<{ ok: boolean; data?: unknown; error?: string }> {
+    if (!p.code || !p.name || p.name !== p.name.trim() || p.name.length > 60 || /[\r\n\0]/.test(p.name)) return { ok: false, error: 'addAgent 需要有效的 code/name' }
+    if (this.state.agents[p.name]?.bot?.retirement) return { ok: false, error: '此数字员工已停止或注销，请使用新名称创建' }
+    const platform = p.platform ?? 'claude'
+    if (platform !== 'claude' && platform !== 'codex') return { ok: false, error: `不支持 ${platform} BOT（仅 Claude 和 Codex）` }
+    if (p.onboarding !== undefined) return this.onboardAgent(p, actorPhoneId)
+    if (this.state.agents[p.name]?.bot?.onboarding && this.state.agents[p.name].bot?.policy?.ownerPhoneId !== actorPhoneId) return { ok: false, error: '只有 owner 可以管理这位数字人' }
+    // 原有声明式成员保持兼容；新前端必须明确请求 BOT 协议，不默默降级为 legacy。
+    if (p.botProtocol === undefined && !p.sourceSessionId) {
+      if (platform !== 'claude' || !p.cwd) return { ok: false, error: '旧版接入仅支持 Claude 且需要 cwd；Codex 请升级 BOT 前端' }
+      return this.opJoin({ code: p.code, name: p.name, cwd: p.cwd, platform })
+    }
+    if (p.botProtocol !== 1 || !p.sourceSessionId || !p.groupId) return { ok: false, error: 'BOT 接入需要 botProtocol:1/sourceSessionId/groupId' }
+    if (p.permissions !== undefined && (p.botPolicyProtocol !== 1 || !actorPhoneId)) return { ok: false, error: '配置 BOT 权限需要已认证手机和 botPolicyProtocol:1' }
+    if (p.botPolicyProtocol !== undefined && p.botPolicyProtocol !== 1) return { ok: false, error: 'BOT 权限协议不匹配，请更新 APP / CE' }
+    const existing = this.state.agents[p.name]
+    if (existing && (!existing.bot || existing.bot.sourceSessionId !== p.sourceSessionId || existing.platform !== platform)) return { ok: false, error: '该 BOT 名称已由其他来源使用，请换一个名称' }
+    let cwd = existing?.cwd
+    if (!cwd) {
+      const sources = await this.opts.rosterSessions?.()
+      const native = sources?.agentSessions.find(source => source.sid === p.sourceSessionId)
+      if (native) {
+        if (platform !== 'claude' || !native.cwd) return { ok: false, error: '来源 Agent 的平台或工作目录不匹配' }
+        cwd = native.cwd
+      } else {
+        const terminal = sources?.terminals.find(source => source.name === p.sourceSessionId)
+        if (!terminal) return { ok: false, error: '来源 Agent 会话不存在，请在工作台重新接管后重试' }
+        if (terminal.cwd) cwd = terminal.cwd
+        else {
+          if (!this.opts.rootDir || typeof p.sourceCwd !== 'string' || !p.sourceCwd.trim() || /[\r\n\0]/.test(p.sourceCwd)) return { ok: false, error: '无法确认来源 Agent 的工作目录' }
+          // UI 的 / 是 Jupyter 根，不是宿主 OS 的 /；拒绝 .. 越出已连接根目录。
+          const root = resolve(this.opts.rootDir)
+          cwd = resolve(root, p.sourceCwd.replace(/^[/\\]+/, ''))
+          const rel = relative(root, cwd)
+          if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return { ok: false, error: '来源目录超出机器工作根目录' }
+        }
+      }
+    }
+    try { if (!statSync(cwd).isDirectory()) return { ok: false, error: '来源工作目录不是文件夹' }; cwd = realpathSync(cwd) }
+    catch { return { ok: false, error: '来源工作目录不存在，请在工作台确认目录后重试' } }
+    if (!await (this.opts.botCliAvailable ? this.opts.botCliAvailable(platform) : botCliAvailable(platform, this.opts.botCliPaths?.[platform]))) return { ok: false, error: `机器未安装或无法启动 ${platform} CLI，请安装后重试` }
+    let permissions: BotPermissions | undefined
+    try {
+      if (existing?.bot?.policy && p.permissions !== undefined) throw new Error('BOT 已有权限配置，请由创建者在权限设置中修改，入群不能覆盖权限')
+      if (p.permissions !== undefined || !existing && actorPhoneId) {
+        permissions = validateBotPermissions(p.permissions ?? botPermissionPreset('readonly'))
+        resolveBotDirectory(cwd, permissions)
+        if (permissions.execute !== 'deny' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱，暂不能授予命令执行权限')
+        if (existing) throw new Error('已有 BOT 请由创建者在权限设置中配置，入群不能认领权限')
+      }
+    } catch (error) { return { ok: false, error: (error as Error).message } }
+    if (this.state.agents[p.name]?.bot?.retirement) return { ok: false, error: '数字员工已停止，入群请求已取消' }
+    if (existing?.groups[p.groupId]) return { ok: true, data: { botProtocol: 1, botPolicyProtocol: 1, cwd, groupId: p.groupId, policy: (await this.botPolicy(p.name, actorPhoneId ?? '')).data } }
+    const result = await this.opJoin({ code: p.code, name: p.name, cwd, platform, botSourceSessionId: p.sourceSessionId, expectedGroupId: p.groupId })
+    if (!result.ok) return result
+    const joined = result.data as { groupId: string }
+    if (joined.groupId !== p.groupId) return { ok: false, error: '邀请码的房间与请求不匹配' }
+    const rec = this.state.agents[p.name]
+    if (permissions && actorPhoneId && rec.bot) {
+      rec.bot.policy = { permissions, ownerPhoneId: actorPhoneId, revision: 1 }
+      this.invalidateBotPolicy(p.name, rec); this.save()
+    }
+    return { ok: true, data: { ...joined, botProtocol: 1, botPolicyProtocol: 1, cwd, policy: actorPhoneId ? (await this.botPolicy(p.name, actorPhoneId)).data : undefined } }
+  }
+
+  private async onboardAgent(p: Parameters<ChatHub['addAgent']>[0], actor?: string): Promise<{ ok: boolean; data?: unknown; error?: string }> {
+    let reserved: AgentRec | undefined
+    try {
+      if (!actor || p.botProtocol !== 1 || p.botPolicyProtocol !== 1 || !p.groupId) throw new Error('创建数字人需要已认证 owner 和新版入职协议')
+      if (!this.runtime) throw new Error('当前 CE 未启用数字人运行环境，请更新 CE')
+      const setup = validateDigitalPerson(p.onboarding)
+      const cwd = digitalPersonDirectory(this.opts.rootDir, setup.directory)
+      const permissions = validateBotPermissions(p.permissions)
+      if (permissions.directory !== '.' || permissions.commanders !== 'owner' || permissions.allowedPhoneIds.length) throw new Error('数字人必须以所选目录为工作根，且仅 owner 可以指挥')
+      resolveBotDirectory(cwd, permissions)
+      if (permissions.execute !== 'deny' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱，不能授予命令执行权限')
+      const platform = (p.platform ?? 'claude') as BotPlatform
+      const fingerprint = createHash('sha256').update(JSON.stringify({ setup, cwd, platform, permissions, groupId: p.groupId })).digest('hex')
+      let rec = this.state.agents[p.name]
+      if (rec && (rec.bot?.policy?.ownerPhoneId !== actor || rec.bot?.onboarding?.creationId !== setup.creationId || rec.bot.onboarding.fingerprint !== fingerprint)) throw new Error('该名称已有其他数字人或创建配置已改变，请使用原配置重试')
+      if (!rec && Object.values(this.state.agents).some(row => row.bot?.onboarding?.creationId === setup.creationId)) throw new Error('此创建请求已经用于另一位数字人')
+      if (rec?.bot?.retirement) throw new Error('数字人已注销，不能重新初始化')
+      const result = async () => ({ ok: true, data: { botProtocol: 1, botPolicyProtocol: 1, onboardingProtocol: 1, ready: true, cwd,
+        groupId: p.groupId, policy: (await this.botPolicy(p.name, actor)).data } })
+      if (rec?.bot?.onboarding?.status === 'ready') return result()
+      if (!await (this.opts.botCliAvailable ? this.opts.botCliAvailable(platform) : botCliAvailable(platform, this.opts.botCliPaths?.[platform]))) throw new Error(`机器未安装或无法启动 ${platform} CLI，请安装后重试`)
+      if (!rec) {
+        rec = { platform, cwd, joinedAt: Date.now(), groups: {}, bot: { id: randomUUID(), sourceSessionId: `digital:${setup.creationId}`,
+          dmGroupId: p.groupId, policy: { ownerPhoneId: actor, permissions, revision: 1 }, onboarding: { ...setup, fingerprint, status: 'initializing' } } }
+        this.state.agents[p.name] = rec
+      }
+      reserved = rec
+      rec.bot!.onboarding = { ...rec.bot!.onboarding!, status: 'initializing', error: undefined }; this.save(true)
+      if (!rec.groups[p.groupId]) {
+        const joined = await this.opJoin({ code: p.code, name: p.name, cwd, platform, expectedGroupId: p.groupId })
+        if (!joined.ok) throw new Error(joined.error ?? '私聊接入失败')
+      }
+      if (rec.bot?.retirement) throw new Error('数字人已注销，初始化已取消')
+      await this.runtime.initializeBot(rec.bot!.id!, actor, digitalPersonProfile(p.name, setup))
+      if (rec.bot?.retirement) throw new Error('数字人已注销，初始化已取消')
+      rec.bot!.onboarding = { ...rec.bot!.onboarding!, status: 'ready', error: undefined }; this.save(true)
+      void this.drainBot(p.name, p.groupId)
+      return result()
+    } catch (error) {
+      const message = (error as Error).message
+      if (reserved?.bot?.onboarding) { reserved.bot.onboarding.status = 'failed'; reserved.bot.onboarding.error = message; this.save(true) }
+      const own = this.state.agents[p.name]?.bot
+      const registered = !!own?.onboarding && own.policy?.ownerPhoneId === actor && own.onboarding.creationId === (p.onboarding as { creationId?: string })?.creationId
+      return { ok: false, error: message, data: { onboardingProtocol: 1, registered } }
+    }
+  }
+
+  private botRunning = new Set<string>()
+  private botControllers = new Map<string, AbortController>()
+
+  private enqueueBot(name: string, gid: string, msg: GroupStoredMsg, text: string, attachments?: RuntimeAttachment[]): void {
+    if (this.state.agents[name]?.bot?.retirement) return
+    const group = this.state.agents[name]?.groups[gid]
+    if (!group || msg.seq <= (group.botHistorySeq ?? 0) || group.botRealtimeSeqs?.includes(msg.seq)) return
+    ;(group.botRealtimeSeqs ??= []).push(msg.seq)
+    ;(group.botQueue ??= []).push({ seq: msg.seq, text, ...(attachments?.length ? { attachments } : {}), fromName: msg.from.name, fromHuman: msg.from.human === true, fromMemberId: msg.from.memberId })
+    this.save()
+    void this.drainBot(name, gid)
+  }
+
+  private async drainBot(name: string, gid: string): Promise<void> {
+    const runKey = `${name}\0${gid}`
+    if (this.botRunning.has(runKey)) return
+    this.botRunning.add(runKey)
+    try {
+      for (;;) {
+        const rec = this.state.agents[name]
+        const group = rec?.groups[gid]
+        const next = group?.botQueue?.[0]
+        if (!rec?.bot || rec.bot.retirement || !rec.cwd || !group || !next) break
+        // 入职尚未完成或运行时不可用时保留消息，绝不降级成旧 Agent 执行。
+        if (rec.bot.onboarding && (rec.bot.onboarding.status !== 'ready' || !rec.bot.id || !this.runtime?.enabled(rec.bot.id))) break
+        if (rec.bot.id && this.runtime?.enabled(rec.bot.id)) {
+          // 宿主落盘即释放聊天队列；不能在这里等待 Router/Worker 完成。
+          if (gid === rec.bot.dmGroupId && next.fromMemberId) {
+            try {
+              await this.refreshBotMembers(rec, gid)
+              const member = group.botMembers?.find(m => m.memberId === next.fromMemberId)
+              if (member?.human && !member.guest && member.phoneId === rec.bot.policy?.ownerPhoneId) this.runtime.receive(rec.bot.id, { groupId: gid, seq: next.seq, text: next.text, attachments: next.attachments, senderId: member.phoneId!, memberId: next.fromMemberId, createdAt: Date.now() })
+            } catch (error) { console.warn('[ce] Bot 消息等待身份/本地账本恢复:', (error as Error).message); break }
+          }
+          group.botQueue?.shift(); this.save(); continue
+        }
+        if (!next.reply) {
+          // 队列和离线恢复也要检查额度；仅在入口检查会放过已排队的后续消息。
+          const hire = this.state.hires[gid]
+          const denied = hire && this.hireGate(hire)
+          if (denied) {
+            group.botQueue?.shift(); this.save(); this.hireNotice(hire, denied)
+            continue
+          }
+          try {
+            const platform = rec.platform === 'codex' ? 'codex' : 'claude'
+            if (rec.bot.policy) await this.refreshBotMembers(rec, gid)
+            if (rec.bot.retirement || rec.groups[gid] !== group) break
+            const revision = rec.bot.policy?.revision
+            const canUseProject = revision !== undefined && !!next.fromMemberId && this.botCommander(rec, gid, next.fromMemberId)
+            const sessionKey = revision === undefined ? undefined : `${revision}:${canUseProject ? 'project' : 'chat'}`
+            const runtimeBase = join(this.opts.statePath, '..', 'bots', createHash('sha256').update(name).digest('hex').slice(0, 24), createHash('sha256').update(gid).digest('hex').slice(0, 24))
+            const runtimeCwd = sessionKey ? join(runtimeBase, sessionKey.replace(':', '-')) : runtimeBase
+            const grant = canUseProject && next.fromMemberId ? this.opts.openBotTools?.({ name, groupId: gid, memberId: next.fromMemberId, requesterName: next.fromName }) : undefined
+            const controller = new AbortController()
+            this.botControllers.set(runKey, controller)
+            let result: BotTurnResult
+            try {
+              if (hire) { hire.used.runs++; this.save() }
+              result = await (this.opts.runBot ?? runBot)({ platform, executable: this.opts.botCliPaths?.[platform], name, groupId: gid, cwd: runtimeCwd, sourceCwd: rec.cwd,
+                sessionId: sessionKey ? group.botSessions?.[sessionKey] : group.botSessionId,
+                canUseProject: revision !== undefined || this.opts.openBotTools ? canUseProject : undefined,
+                tools: grant?.connection, signal: controller.signal, text: next.text, fromName: next.fromName, fromHuman: next.fromHuman })
+            } finally { grant?.close(); if (this.botControllers.get(runKey) === controller) this.botControllers.delete(runKey) }
+            if (rec.bot.retirement || rec.groups[gid] !== group) break
+            if (hire && result.usage) {
+              hire.used.tokens += result.usage.inputTokens + result.usage.outputTokens
+              this.save()
+            }
+            if (hire?.quota.maxTokens && !result.usage) {
+              hire.meteringUnavailable = true; this.save()
+              throw new Error('模型未返回用量，租赁已暂停，请联系主人检查模型服务')
+            }
+            if (canUseProject) {
+              await this.refreshBotMembers(rec, gid)
+              if (!next.fromMemberId || !this.botCommander(rec, gid, next.fromMemberId)) throw new Error('发送者已不再拥有项目操作权限，本次旧回复已作废')
+            }
+            if (rec.bot.retirement || rec.bot.policy?.revision !== revision || rec.groups[gid] !== group) throw new Error('BOT 权限或成员状态已改变，本次旧回复已作废')
+            if (!result.text.trim()) throw new Error('模型未返回聊天文本')
+            if (result.sessionId) {
+              if (sessionKey) (group.botSessions ??= {})[sessionKey] = result.sessionId
+              else group.botSessionId = result.sessionId
+            }
+            next.reply = { text: result.text, system: false, offset: 0 }
+          } catch (error) {
+            if (rec.bot.retirement) break
+            next.reply = { text: `数字员工暂时无法回复：${(error as Error).message.slice(0, 1500)}。`, system: true, offset: 0 }
+          }
+          // 模型结果/错误先落盘，断线重试只发 outbox，不重复运行模型。
+          this.save()
+        }
+        try { await this.postBotReply(name, rec, gid, next.seq, next.reply) }
+        catch (error) {
+          console.warn(`[ce] BOT ${name} 回复待恢复连接后重发:`, (error as Error).message)
+          break
+        }
+        group.botQueue?.shift(); this.save()
+      }
+    } finally { this.botRunning.delete(runKey) }
+  }
+
+  /** 历史工作游标与已读游标分离；离线消息和发送前同步的消息也必须进入待办。 */
+  private ingestBotHistory(name: string, rec: AgentRec, gid: string, messages: GroupStoredMsg[]): void {
+    const group = rec.groups[gid]
+    const key = this.keyOf(gid)
+    if (!group || !key) return
+    for (const msg of [...messages].sort((a, b) => a.seq - b.seq)) {
+      if (msg.seq <= (group.botHistorySeq ?? 0)) continue
+      // 只恢复当前 BOT 的待办；不能把历史再次投给同房间的 legacy Agent。
+      if (!msg.revokedAt && msg.from.memberId !== group.memberId && (msg.from.human || msg.mentions?.includes(name))) {
+        try {
+          const pt = JSON.parse(new TextDecoder().decode(open(key, new Uint8Array(Buffer.from(msg.ct, 'base64'))))) as GroupPlaintext
+          if (pt.kind === 'text' && typeof pt.text === 'string' && (pt.text.trim() || Array.isArray(pt.attachments))) this.enqueueBot(name, gid, msg, pt.text, Array.isArray(pt.attachments) ? pt.attachments as RuntimeAttachment[] : undefined)
+        } catch { /* 损坏消息跳过，与正常消息解密行为一致。 */ }
+      }
+      group.botHistorySeq = Math.max(group.botHistorySeq ?? 0, msg.seq)
+    }
+    group.botRealtimeSeqs = group.botRealtimeSeqs?.filter(seq => seq > (group.botHistorySeq ?? 0))
+    this.save()
+  }
+
+  private async postBotReply(name: string, rec: AgentRec, gid: string, inputSeq: number, reply: { text: string; system: boolean; offset: number }): Promise<void> {
+    const key = this.keyOf(gid)
+    if (!key) throw new Error('群钥未下发')
+    // relay 限制的是加密后 base64 长度。中文/emoji 不能只按 UTF-16 字符数拆分。
+    const sealedOverhead = seal(key, new Uint8Array()).byteLength
+    const jsonByteBudget = Math.floor(GROUP_LIMITS.plaintextMaxChars * 2 / 4) * 3 - sealedOverhead
+    const emptyJsonBytes = Buffer.byteLength(JSON.stringify({ kind: reply.system ? 'system' : 'text', text: '' }))
+    const ensureCurrent = () => {
+      if (rec.bot?.retirement) throw new Error('数字员工已停止或注销')
+      if (rec.groups[gid]?.botQueue?.find(pending => pending.seq === inputSeq)?.reply !== reply) throw new Error('BOT 权限已更新，旧回复已作废')
+    }
+    while (reply.offset < reply.text.length) {
+      ensureCurrent()
+      let end = reply.offset
+      let jsonBytes = emptyJsonBytes
+      // 按 code point 迭代保留代理对，同时计入 JSON 的引号/反斜杠/控制字符转义。
+      for (const character of reply.text.slice(reply.offset)) {
+        const bytes = Buffer.byteLength(JSON.stringify(character).slice(1, -1))
+        if (end - reply.offset + character.length > GROUP_LIMITS.plaintextMaxChars || jsonBytes + bytes > jsonByteBudget) break
+        end += character.length; jsonBytes += bytes
+      }
+      if (end === reply.offset) throw new Error('消息密文长度预算不足')
+      const chunk = reply.text.slice(reply.offset, end)
+      const sync = await this.opSync(name, rec, { groupId: gid }, true)
+      if (!sync.ok) throw new Error(sync.error ?? '读取房间失败')
+      ensureCurrent()
+      const opKey = 'bot_' + createHash('sha256').update(`${name}\0${gid}\0${inputSeq}\0${reply.offset}`).digest('hex').slice(0, 32)
+      let result = await this.opSend(name, rec, { groupId: gid, text: chunk, system: reply.system, opKey })
+      if (!result.ok && result.error?.includes('new_messages')) {
+        ensureCurrent()
+        result = await this.opSend(name, rec, { groupId: gid, text: chunk, system: reply.system, opKey })
+      }
+      if (!result.ok) throw new Error(result.error ?? '回复发送失败')
+      reply.offset = end; this.save()
+    }
   }
 
   /** 关灯:删账本(房间解散由手机侧 group-dissolve 走既有通道,这里只管 ce 侧记账)。 */
@@ -699,10 +1312,22 @@ export class ChatHub {
 
   // ─── 各 op ──────────────────────────────────────────────────────────────────
 
+  private botJoining = new Map<string, Set<Promise<{ ok: boolean; data?: unknown; error?: string }>>>()
+
   private async opJoin(body: Record<string, unknown>): Promise<{ ok: boolean; data?: unknown; error?: string }> {
+    const name = String(body.name ?? '').trim()
+    const joins = this.botJoining.get(name) ?? new Set<Promise<{ ok: boolean; data?: unknown; error?: string }>>()
+    const operation = this.opJoinInner(body)
+    joins.add(operation); this.botJoining.set(name, joins)
+    try { return await operation }
+    finally { joins.delete(operation); if (!joins.size) this.botJoining.delete(name) }
+  }
+
+  private async opJoinInner(body: Record<string, unknown>): Promise<{ ok: boolean; data?: unknown; error?: string }> {
     const code = String(body.code ?? '')
     const name = String(body.name ?? '').trim()
     if (!code || !name) return { ok: false, error: 'join 需要 code 与 --name' }
+    if (this.state.agents[name]?.bot?.retirement) return { ok: false, error: '此数字员工已停止或注销，请使用新名称创建' }
     const cwd = body.cwd ? String(body.cwd) : process.cwd()
     const platform = body.platform ? String(body.platform) : undefined
     const reclaim = body.reclaim === true
@@ -722,9 +1347,21 @@ export class ChatHub {
     const gid = data.groupId
     const me = data.snapshot.members.find((m) => m.name === name && !m.human)
     if (!me) return { ok: false, error: 'join 应答里找不到自己的成员记录(异常)' }
+    const retiring = this.state.agents[name]
+    if (retiring?.bot?.retirement) {
+      // 注销发生在入群请求发出后：登记该成员交给注销清理，不能复活员工或漏退此群。
+      retiring.groups[gid] = { memberId: me.memberId, groupName: data.snapshot.meta.name, lastReadSeq: data.snapshot.seq, botQueue: [] }
+      this.save(true)
+      return { ok: false, error: '数字员工已停止，入群请求已取消' }
+    }
+    if (body.expectedGroupId && gid !== body.expectedGroupId) {
+      const rollback = await this.rpc('group-leave', gid, { groupId: gid, memberId: me.memberId })
+      if (!Object.values(this.state.agents).some(rec => rec.groups[gid])) { delete this.state.keys[gid]; this.save() }
+      return { ok: false, error: rollback.ok ? '邀请码的房间与请求不匹配，已撤回接入' : '邀请码的房间与请求不匹配，撤回失败，请检查房间成员' }
+    }
     let rec = this.state.agents[name]
     if (!rec) {
-      rec = { platform, cwd, joinedAt: Date.now(), groups: {} }
+      rec = { platform, cwd, joinedAt: Date.now(), groups: {}, ...(typeof body.botSourceSessionId === 'string' ? { bot: { sourceSessionId: body.botSourceSessionId } } : {}) }
       this.state.agents[name] = rec
     } else {
       // reclaim 搬家:cwd/platform 跟着新终端走(2026-11-20 真机抓出 —— 本尊投递按 rec.cwd 找
@@ -732,13 +1369,15 @@ export class ChatHub {
       rec.cwd = cwd
       if (platform) rec.platform = platform
     }
-    rec.groups[gid] = { memberId: me.memberId, groupName: data.snapshot.meta.name, lastReadSeq: data.snapshot.seq }
+    rec.groups[gid] = { memberId: me.memberId, groupName: data.snapshot.meta.name, lastReadSeq: data.snapshot.seq, ...(rec.bot ? { botHistorySeq: data.snapshot.seq } : {}) }
+    if (rec.bot) { rec.bot.dmGroupId ??= gid; this.captureBotMembers(rec, gid, data.snapshot) }
     this.save()
-    this.writeSkill(rec.cwd ?? cwd)
+    if (!rec.bot) this.writeSkill(rec.cwd ?? cwd)
     return { ok: true, data: { groupId: gid, groupName: data.snapshot.meta.name, memberId: me.memberId, members: data.snapshot.members } }
   }
 
   private async opSend(_name: string, rec: AgentRec, body: Record<string, unknown>): Promise<{ ok: boolean; data?: unknown; error?: string }> {
+    if (rec.bot?.retirement) return { ok: false, error: '数字员工已停止或注销' }
     let gid = String(body.groupId ?? '')
     const text = String(body.text ?? '')
     let g: AgentGroupRec
@@ -749,15 +1388,16 @@ export class ChatHub {
     } catch (e) {
       return { ok: false, error: (e as Error).message }
     }
-    if (!text.trim()) return { ok: false, error: '空消息' }
+    const attachments = Array.isArray(body.attachments) ? body.attachments as RuntimeAttachment[] : undefined
+    if (!text.trim() && !attachments?.length) return { ok: false, error: '空消息' }
     if (text.length > GROUP_LIMITS.plaintextMaxChars) return { ok: false, error: `超限(>${GROUP_LIMITS.plaintextMaxChars} 字符)` }
     const key = this.keyOf(gid)
     if (!key) return { ok: false, error: '群钥未下发:等手机端分发(成员刚加入会有一次延迟)' }
     const mentions = Array.isArray(body.mentions) ? (body.mentions as string[]).map(String) : undefined
     const r = await this.rpc('group-post', gid, {
       // ct 走 base64(协议:字符串;裸 Uint8Array 经 JSON.stringify 会变对象 —— L2 管道测试抓的断层)
-      ct: Buffer.from(seal(key, new TextEncoder().encode(JSON.stringify({ kind: body.system === true ? 'system' : 'text', text } satisfies GroupPlaintext)))).toString('base64'),
-      opKey: 'ok_' + randomBytes(6).toString('hex'),
+      ct: Buffer.from(seal(key, new TextEncoder().encode(JSON.stringify({ kind: body.system === true ? 'system' : 'text', text, ...(attachments?.length ? { attachments } : {}) } satisfies GroupPlaintext)))).toString('base64'),
+      opKey: typeof body.opKey === 'string' ? body.opKey : 'ok_' + randomBytes(6).toString('hex'),
       replyTo: typeof body.replyTo === 'number' ? body.replyTo : undefined,
       mentions,
       readUpTo: g.lastReadSeq,
@@ -814,12 +1454,13 @@ export class ChatHub {
     const r = await this.rpc('group-sync', gid, {
       groupId: gid,
       memberId: g.memberId,
-      afterSeq: markRead ? g.lastReadSeq : 0, // 偷看(inbox)从头粗拉,自行过滤未读
-      limit: typeof body.limit === 'number' ? body.limit : undefined,
+      afterSeq: rec.bot ? g.botHistorySeq ?? 0 : markRead ? g.lastReadSeq : 0, // BOT 用独立工作游标补洞；legacy 偷看从头读。
+      limit: typeof body.limit === 'number' ? body.limit : rec.bot ? 5000 : undefined,
       markRead,
     })
     if (!r.ok) return { ok: false, error: `${r.error?.code}: ${r.error?.message}` }
     const data = r.data as { msgs: GroupStoredMsg[]; seq: number }
+    if (rec.bot) { this.captureBotMembers(rec, gid, r.data); this.ingestBotHistory(_name, rec, gid, data.msgs ?? []) }
     const msgs = this.decryptAll(key, data.msgs ?? [])
     if (markRead) {
       g.lastReadSeq = Math.max(g.lastReadSeq, data.seq ?? 0)
@@ -836,6 +1477,7 @@ export class ChatHub {
       const r = await this.rpc('group-sync', gid, { groupId: gid, memberId: g.memberId, afterSeq: 0, markRead: false, limit: 200 })
       if (!r.ok) continue
       const data = r.data as { msgs: GroupStoredMsg[]; seq: number }
+      if (rec.bot) this.captureBotMembers(rec, gid, r.data)
       const unreadMsgs = (data.msgs ?? []).filter((m) => m.seq > g.lastReadSeq && m.from.memberId !== g.memberId)
       const msgs = this.decryptAll(key, unreadMsgs)
       items.push({
@@ -862,6 +1504,7 @@ export class ChatHub {
     }
     const r = await this.rpc('group-leave', gid, { groupId: gid, memberId: g.memberId })
     if (!r.ok) return { ok: false, error: `${r.error?.code}: ${r.error?.message}` }
+    if (rec.bot) this.opts.onBotPolicyChanged?.(_name)
     delete rec.groups[gid]
     this.save()
     return { ok: true }
@@ -884,11 +1527,16 @@ export class ChatHub {
   // ─── roster(识别判定链聚合;S2)──────────────────────────────────────────────
 
   async roster(): Promise<{
+    botProtocol: 1
+    botPolicyProtocol: 1
+    botOnboardingProtocol: 1
+    people: Array<{ phoneId: string; name: string }>
+    commandSandbox: boolean
     agents: Array<{ name: string; platform?: string; cwd?: string; groups: string[] }>
     suspects: Array<{ platform: string; label: string; pid: number; cwd?: string; argv: string }>
     terminals: Array<{ id: string; source: 'jupyter' | 'agent'; status: 'connected' | 'suspect' | 'unconfirmed' | 'plain'; reason: string; cwd?: string }>
   }> {
-    const agents = Object.entries(this.state.agents).map(([name, rec]) => ({
+    const agents = Object.entries(this.state.agents).filter(([, rec]) => !rec.bot?.retirement).map(([name, rec]) => ({
       name,
       platform: rec.platform,
       cwd: rec.cwd,
@@ -921,7 +1569,7 @@ export class ChatHub {
       // ce 管辖的 agent 会话(cc-*):平台已知(claude),天然是「已接入候选」
       terminals.push({ id: s.sid, source: 'agent', status: 'connected', reason: 'ce 管辖的 agent 会话(已接入候选)', cwd: s.cwd })
     }
-    return { agents, suspects, terminals }
+    return { botProtocol: 1, botPolicyProtocol: 1, botOnboardingProtocol: 1, people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true, agents, suspects, terminals }
   }
 
   private keyOf(gid: string): Uint8Array | null {

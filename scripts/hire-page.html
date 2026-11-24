@@ -1,247 +1,83 @@
 <!doctype html>
-<!--
-  雇佣网关访客页(单文件,relay /hire/* 伺服;2026-11-19)。
-  - code 从 URL path(/hire/<code>)、房钥从 URL fragment(#k=…)—— fragment 不随 HTTP 上行,relay 不见钥。
-  - 密文格式与手机/ce 同一套:seal = 24B nonce || secretbox(XSalsa20-Poly1305, tweetnacl)。
-  - WS 通路:首帧 {type:'guest-hello', code}(明文,不进 URL);入房后全部走 GroupFrame wire
-    ({type:9, payload: b64(信封 JSON)}),op 白名单 sync/post/ack/revoke。
--->
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>雇佣对话</title>
+<meta name="theme-color" content="#f5f7fb">
+<meta name="referrer" content="no-referrer">
+<title>Agent_NET · 与数字员工协作</title>
 <style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; margin: 0; }
-  body { font: 15px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f4f5f7; color: #1c1e21; }
-  @media (prefers-color-scheme: dark) { body { background: #101214; color: #e6e8ea; } }
-  #app { max-width: 640px; margin: 0 auto; height: 100dvh; display: flex; flex-direction: column; }
-  header { padding: 12px 16px; font-weight: 600; border-bottom: 1px solid rgba(128,128,128,.25); display: flex; align-items: baseline; gap: 8px; }
-  header small { font-weight: 400; opacity: .6; }
-  #log { flex: 1; overflow-y: auto; padding: 12px 12px 4px; }
-  .row { display: flex; margin: 6px 0; }
-  .row.me { justify-content: flex-end; }
-  .bubble { max-width: 82%; padding: 8px 12px; border-radius: 14px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.06); word-break: break-word; }
-  @media (prefers-color-scheme: dark) { .bubble { background: #1d2126; } }
-  .row.me .bubble { background: #d9f0ff; }
-  @media (prefers-color-scheme: dark) { .row.me .bubble { background: #1f3a4d; } }
-  .who { font-size: 12px; opacity: .55; margin: 0 8px 2px; }
-  .tomb { opacity: .55; font-style: italic; }
-  .sys { text-align: center; font-size: 12px; opacity: .55; margin: 8px 0; }
-  .bubble table { border-collapse: collapse; margin: 4px 0; font-size: 13px; }
-  .bubble th, .bubble td { border: 1px solid rgba(128,128,128,.4); padding: 3px 8px; }
-  .bubble code { background: rgba(128,128,128,.18); padding: 1px 4px; border-radius: 4px; }
-  #banner { display: none; text-align: center; padding: 8px; background: rgba(255,180,0,.15); font-size: 13px; }
-  form { display: flex; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid rgba(128,128,128,.25); }
-  input[type=text] { flex: 1; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(128,128,128,.35); background: transparent; color: inherit; font: inherit; }
-  button { padding: 10px 16px; border-radius: 10px; border: 0; background: #2b7de9; color: #fff; font: inherit; }
-  button:disabled { opacity: .4; }
-  #setup { margin: auto; padding: 24px; max-width: 420px; width: 100%; }
-  #setup textarea { width: 100%; height: 72px; margin: 12px 0; padding: 10px; border-radius: 8px; border: 1px solid rgba(128,128,128,.35); background: transparent; color: inherit; font: inherit; }
-  #setup .err { color: #d33; font-size: 13px; min-height: 18px; }
-  #setup p { font-size: 13px; opacity: .7; }
-  #toast { position: fixed; left: 50%; bottom: 88px; transform: translateX(-50%); background: rgba(0,0,0,.75); color: #fff; padding: 8px 14px; border-radius: 8px; font-size: 13px; display: none; }
+:root{color-scheme:light;--ink:#1c2941;--muted:#8590a3;--line:#e7ebf2;--blue:#3569ee;--surface:#fff;--page:#f5f7fb;font-family:"PingFang SC","Microsoft YaHei",-apple-system,BlinkMacSystemFont,sans-serif;font-synthesis:none}
+*{box-sizing:border-box}body{margin:0;color:var(--ink);background:var(--page);font-size:14px;line-height:1.6}button,textarea{font:inherit}button{cursor:pointer;-webkit-tap-highlight-color:transparent}button:focus-visible,textarea:focus-visible{outline:3px solid #3569ee66;outline-offset:4px}button:disabled{cursor:default}svg{display:block;flex:none}button[hidden],[hidden]{display:none!important}
+#app{height:100dvh;min-height:400px;display:grid;grid-template-columns:290px minmax(0,1fr);max-width:1800px;margin:auto}
+.brand-panel{background:#14223c;color:#fff;position:relative;overflow:hidden;padding:37px 29px;display:flex;flex-direction:column}.brand-panel:before{content:"";position:absolute;inset:0;background:radial-gradient(ellipse at 130% 35%,#477be840,transparent 60%),radial-gradient(ellipse at -30% 90%,#426d7733,transparent 55%);pointer-events:none}.brand-panel>*{position:relative}.brand{display:flex;align-items:center;gap:11px;font-size:20px;font-weight:750;letter-spacing:-.6px}.brand>svg{width:34px;height:34px}.brand em{font-style:normal;font-weight:450;color:#a5b9de}.rail-tag{align-self:flex-start;display:flex;align-items:center;gap:7px;margin-top:69px;border:1px solid #b4c8f023;border-radius:30px;padding:5px 10px;color:#b4c6e6;font-size:10px;letter-spacing:1.6px}.rail-tag i{width:5px;height:5px;border-radius:50%;background:#91b2fd}.brand-panel h1{font-size:35px;line-height:1.5;letter-spacing:-1.4px;font-weight:600;margin:18px 0 12px}.brand-panel h1 span{color:#9cbaff}.rail-description{font-size:12px;line-height:1.9;color:#a8b7cf;margin:0;max-width:210px}.network-art{margin:23px -17px 0;width:calc(100% + 34px);max-height:230px;opacity:.9}.rail-benefits{display:grid;gap:18px;margin-top:auto;padding-top:30px}.rail-benefits>div{display:flex;align-items:center;gap:11px;color:#b8c5dc;font-size:12px}.rail-benefits svg{width:17px;height:17px;stroke:#83a7f8}.rail-foot{font-size:10px;color:#7385a2;letter-spacing:1.3px;margin-top:42px}
+.workspace{min-width:0;display:flex;flex-direction:column;height:100%;position:relative}.workspace-header{display:flex;align-items:center;gap:13px;min-height:91px;padding:20px 38px;border-bottom:1px solid var(--line);background:#ffffffa6;flex:none}.agent-avatar{display:grid;place-items:center;flex:none;width:43px;height:43px;border-radius:15px;background:#e9efff;color:var(--blue)}.agent-avatar svg{width:27px;height:27px}.header-copy{flex:1;min-width:0}.header-copy h2{font-size:16px;line-height:1.5;margin:0;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.header-copy p{margin:2px 0 0;font-size:11px;color:var(--muted)}.connection{display:flex;align-items:center;gap:7px;color:#8994a5;font-size:11px;white-space:nowrap}.connection i{width:6px;height:6px;background:#a3adbc;border-radius:50%}.connection[data-status=online] i{background:#5b9d7b;box-shadow:0 0 0 3px #5b9d7b12}.connection[data-status=loading] i{animation:pulse 1.5s infinite}.mobile-brand{display:none}
+#log{min-height:0;flex:1;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#dbe1eb transparent;padding:28px max(32px,calc((100% - 760px)/2));scroll-behavior:smooth}.welcome{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:35px 0 30px;text-align:center;animation:arrive .45s ease both}.welcome-mark{display:grid;place-items:center;width:72px;height:72px;border-radius:25px;background:linear-gradient(140deg,#fefefe,#e7edfd);border:1px solid #fff;box-shadow:0 8px 22px #203d7b09;color:var(--blue);margin-bottom:24px}.welcome-mark svg{width:43px;height:43px}.welcome-eyebrow{font-size:10px;color:#95a1b6;letter-spacing:2.5px;margin:0 0 10px}.welcome h1{font-size:clamp(24px,2.4vw,34px);line-height:1.5;letter-spacing:-1px;font-weight:650;margin:0}.welcome h1 span{color:var(--blue)}.welcome-description{font-size:13px;color:#8b96a9;line-height:1.9;margin:14px 0 28px}.starters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;width:100%;max-width:630px;text-align:left}.starter{text-align:left;padding:17px 15px;border:1px solid var(--line);border-radius:16px;background:#ffffffa6;color:var(--ink);transition:border .2s,transform .2s}.starter:hover{transform:translateY(-2px);border-color:#b5c6ef;background:#fff}.starter svg{width:20px;height:20px;color:#7494df;margin-bottom:15px}.starter strong{display:block;font-size:12px;font-weight:600}.starter small{font-size:10px;display:block;color:#9aa4b5;margin-top:6px}
+.day-divider{font-size:10px;color:#a0aaba;text-align:center;margin:5px 0 27px;letter-spacing:1px}.row{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 24px;animation:arrive .22s ease both}.row.me{align-items:flex-end}.message-meta{display:flex;align-items:center;gap:9px;font-size:10px;color:#9aa4b3;margin:0 2px 7px}.message-meta .who{color:#66748c;font-weight:550}.bubble{max-width:min(90%,660px);padding:14px 18px;background:#fff;border:1px solid #e8ecf4;border-radius:3px 18px 18px 18px;color:#34415a;font-size:14px;line-height:1.85;overflow-wrap:anywhere;box-shadow:0 3px 10px #23375803}.row.me .bubble{background:#e8efff;border-color:#e1e9fc;border-radius:18px 3px 18px 18px;color:#284575}.bubble p{margin:0 0 10px}.bubble p:last-child{margin-bottom:0}.bubble code{font-family:ui-monospace,monospace;font-size:.88em;background:#788aa014;padding:2px 5px;border-radius:5px}.bubble pre{overflow:auto;white-space:pre;padding:14px;background:#f1f4f9;border-radius:10px;max-width:100%}.bubble pre code{background:none;padding:0}.bubble table{border-collapse:collapse;display:block;overflow:auto;font-size:12px;margin:10px 0}.bubble td,.bubble th{padding:7px 10px;border:1px solid #dce3ee}.bubble th{background:#f1f4fa}.bubble h3{font-size:15px;margin:16px 0 9px}.bubble h3:first-child{margin-top:0}.bubble ul,.bubble ol{padding-left:22px}.message-actions{display:flex;align-items:center;gap:12px;color:#a0abba;margin-top:5px;font-size:10px}.message-actions button{border:0;background:none;color:inherit;font-size:10px;padding:2px 0}.message-actions button:hover{color:var(--blue)}.message-actions .failed{color:#c26458}.tomb{background:transparent!important;border:0!important;box-shadow:none;color:#a1aab8!important;font-size:12px;padding:5px}.sys{text-align:center;color:#8e99a9;font-size:11px;padding:8px 12px;margin:14px 0}.waiting{display:flex;align-items:center;gap:9px;color:#8c99b0;font-size:11px;padding:0 2px 22px}.waiting i{width:5px;height:5px;background:#9eb4e5;border-radius:50%;animation:pulse 1.4s infinite}.waiting i:nth-child(2){animation-delay:.2s}.waiting i:nth-child(3){animation-delay:.4s}.waiting span{margin-left:5px}
+.compose-area{flex:none;padding:5px max(32px,calc((100% - 760px)/2)) max(19px,env(safe-area-inset-bottom));background:linear-gradient(0deg,var(--page) 90%,#f5f7fb00)}.composer{background:#fff;border:1px solid #e0e6f0;border-radius:21px;padding:15px 15px 11px;box-shadow:0 5px 22px #2a466608;transition:border .2s,box-shadow .2s}.composer:focus-within{border-color:#b4c6ef;box-shadow:0 5px 22px #3569ee0d}#msg{display:block;resize:none;border:0;outline:none!important;background:transparent;color:var(--ink);width:100%;font-size:14px;line-height:1.7;min-height:30px;max-height:150px;padding:0 3px;scrollbar-width:thin}#msg::placeholder{color:#acb5c4}.composer-bottom{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-top:8px}.composer-hint{color:#a1adbd;font-size:10px;padding-left:3px}.send-button{display:grid;place-items:center;width:35px;height:35px;border-radius:12px;border:0;background:var(--blue);color:#fff;transition:background .2s,transform .2s}.send-button:disabled{background:#e9edf4;color:#acb9ce}.send-button:not(:disabled):active{transform:scale(.94)}.send-button svg{width:18px;height:18px}.compose-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:9px;color:#a4aebb;margin-top:12px;padding:0 3px}.compose-footer>span:first-child{display:flex;align-items:center;gap:5px}.compose-footer svg{width:11px;height:11px}.compose-footer b{font-weight:650;letter-spacing:.2px;color:#8391a7}
+#notice{display:none;align-items:center;justify-content:space-between;gap:14px;border:1px solid #e8dccc;background:#f9f3e9;color:#9b7f56;font-size:12px;padding:11px 16px;border-radius:13px;margin-bottom:12px}#notice button{flex:none;color:#84643a;background:none;border:0;font-size:12px}#setup{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:35px 20px}.setup-icon{width:59px;height:59px;display:grid;place-items:center;border-radius:20px;background:#e9eef9;color:#7390c7;margin-bottom:22px}.setup-icon svg{width:27px;height:27px}#setup h1{font-size:23px;font-weight:600;letter-spacing:-.5px;margin:0 0 10px}#setup p{max-width:320px;font-size:13px;color:#929daf;line-height:1.9;margin:0}#retry{border:0;background:var(--blue);color:#fff;border-radius:11px;font-size:12px;padding:10px 24px;margin-top:23px}#toast{position:fixed;left:50%;bottom:190px;transform:translateX(-50%);background:#1c2941ed;color:#fff;border-radius:12px;padding:11px 17px;max-width:90vw;font-size:12px;box-shadow:0 6px 20px #16234520;z-index:10;display:none}
+@keyframes pulse{50%{opacity:.35}}@keyframes arrive{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+@media(min-width:1500px){.brand-panel{padding-left:40px;padding-right:35px}#app{grid-template-columns:320px minmax(0,1fr)}}
+@media(max-width:1050px){#app{grid-template-columns:235px minmax(0,1fr)}.brand-panel{padding:30px 23px}.brand-panel h1{font-size:30px}.rail-tag{margin-top:55px}.workspace-header{padding:20px 26px}.starters{gap:7px}.starter{text-align:left;padding:14px 11px}.starter small{display:none}}
+@media(max-width:767px){#app{display:flex}.brand-panel{display:none}.workspace{width:100%}.workspace-header{padding:14px 20px;min-height:79px;gap:11px}.agent-avatar{width:39px;height:39px;border-radius:13px}.header-copy h2{font-size:14px}.header-copy p{font-size:10px}.connection{font-size:10px;gap:5px}.connection i{width:5px;height:5px}.mobile-brand{display:block;font-size:9px;color:#8f9bb0;letter-spacing:.4px;font-weight:650}.header-copy p{margin-top:2px}#log{padding:24px 20px 6px}.welcome{padding:20px 0 30px}.welcome-mark{width:65px;height:65px;border-radius:23px;margin-bottom:23px}.welcome h1{font-size:26px}.welcome-description{font-size:12px;margin:13px 0 25px;max-width:255px}.welcome-eyebrow{font-size:9px}.starters{grid-template-columns:1fr;max-width:360px;gap:8px}.starter{display:flex;align-items:center;gap:12px;padding:13px 15px;border-radius:13px}.starter svg{width:17px;height:17px;margin:0}.starter strong{font-size:12px;font-weight:500}.starter small{display:block;margin:0 0 0 auto;font-size:10px}.compose-area{padding:4px 16px max(13px,env(safe-area-inset-bottom))}.composer{border-radius:18px;padding:13px 12px 10px}.composer-hint{font-size:9px}.compose-footer{font-size:8px;padding:0 2px}.bubble{max-width:92%;padding:12px 15px;font-size:14px}.row{margin-bottom:23px}.network-art{display:none}}
+@media(max-width:360px){.workspace-header{padding:12px 16px;gap:9px}.header-copy p{max-width:180px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}#log{padding-left:16px;padding-right:16px}.welcome h1{font-size:23px}.starter small{display:none}.composer-hint{max-width:190px}.compose-footer{font-size:8px;gap:4px}.compose-footer>span:first-child{gap:3px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs><symbol id="network-mark" viewBox="0 0 48 48"><g fill="none" stroke="currentColor" stroke-linecap="round"><path d="M11 33 14 13" stroke-width="2.2"/><path d="m14 13 18 17" stroke-width="3.6"/><path d="m32 30 6-19" stroke-width="2.7"/><path d="m32 30 5 10" stroke-width="1.6"/><path d="m14 13 24-2" stroke-width="1.1"/></g><g fill="currentColor"><circle cx="11" cy="33" r="4.4"/><circle cx="14" cy="13" r="2.6"/><circle cx="32" cy="30" r="5.9"/><circle cx="38" cy="11" r="3.5"/><circle cx="37" cy="40" r="1.9"/></g></symbol><symbol id="arrow-up" viewBox="0 0 24 24"><path d="m6 12 6-6 6 6M12 6v13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol><symbol id="spark" viewBox="0 0 24 24"><path d="m12 3 2.6 6.4L21 12l-6.4 2.6L12 21l-2.6-6.4L3 12l6.4-2.6L12 3Z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linejoin="round"/></symbol><symbol id="lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol></defs></svg>
 <div id="app">
-  <header><span id="gname">雇佣对话</span><small id="state"></small></header>
-  <div id="banner">雇佣已结束(主人已关闭)</div>
-  <div id="log"></div>
-  <form id="box" hidden><input type="text" id="msg" maxlength="10000" placeholder="输入消息…" autocomplete="off"><button>发送</button></form>
-  <div id="setup">
-    <h3>雇佣对话</h3>
-    <p>请粘贴主人发给你的<b>完整链接</b>(链接里带着这间会客室的钥匙,缺了打不开)。</p>
-    <textarea id="link" placeholder="https://…/hire/XXXX-XXXX#k=…"></textarea>
-    <div class="err" id="setupErr"></div>
-    <button id="go">进入</button>
-  </div>
-  <div id="toast"></div>
-</div>
+<aside class="brand-panel" aria-label="Agent_NET">
+ <div class="brand"><svg aria-hidden="true"><use href="#network-mark"/></svg><span>Agent<em>_NET</em></span></div>
+ <div class="rail-tag"><i></i>YOUR SHARED WORKSPACE</div>
+ <h1>好想法，<br><span>现在开工。</span></h1>
+ <p class="rail-description">让专业的数字员工成为你的搭档。<br>从一个问题开始，把想法向前推进。</p>
+ <svg class="network-art" viewBox="0 0 260 230" aria-hidden="true"><defs><radialGradient id="halo"><stop stop-color="#709cff" stop-opacity=".17"/><stop offset="1" stop-color="#709cff" stop-opacity="0"/></radialGradient></defs><circle cx="140" cy="113" r="110" fill="url(#halo)"/><g fill="none" stroke="#6488c3" stroke-linecap="round"><path d="m42 164 28-109 100 89 42-96" stroke-width="1.5"/><path d="m70 55 142-7M170 144l31 54M42 164l128-20" stroke-width=".6" opacity=".7"/><circle cx="170" cy="144" r="34" stroke-width=".6" opacity=".35"/><circle cx="170" cy="144" r="51" stroke-width=".5" opacity=".14"/></g><g fill="#acc6ff"><circle cx="42" cy="164" r="8"/><circle cx="70" cy="55" r="4"/><circle cx="170" cy="144" r="13"/><circle cx="212" cy="48" r="6"/><circle cx="201" cy="198" r="3"/></g><g fill="#6086bf"><circle cx="101" cy="197" r="2"/><circle cx="34" cy="86" r="2"/><circle cx="225" cy="127" r="2"/></g></svg>
+ <div class="rail-benefits"><div><svg><use href="#spark"/></svg>一起拆解问题</div><div><svg><use href="#arrow-up"/></svg>让思路成为结果</div><div><svg><use href="#lock"/></svg>专属于这次协作的对话</div></div>
+ <div class="rail-foot">SMALL SCREEN. BIG POSSIBILITIES.</div>
+</aside>
+<main class="workspace">
+ <header class="workspace-header"><div class="agent-avatar"><svg aria-hidden="true"><use href="#network-mark"/></svg></div><div class="header-copy"><h2 id="gname">你的数字员工</h2><p>Agent_NET <span aria-hidden="true">/</span> 共享协作空间</p></div><div class="connection" id="connection" data-status="loading" role="status"><i></i><span id="state">正在连接</span></div></header>
+ <section id="log" aria-label="对话记录" aria-live="polite" aria-relevant="additions text"><div id="setup"><div class="setup-icon"><svg aria-hidden="true"><use href="#network-mark"/></svg></div><h1 id="setupTitle">正在连接你的搭档</h1><p id="setupDescription">为这次协作准备一个安静的空间。</p><button id="retry" hidden>重新连接</button></div></section>
+ <div class="compose-area"><div id="notice" role="status"><span id="noticeText"></span><button id="reconnect" hidden>重新连接</button></div><form id="box" class="composer"><textarea id="msg" rows="1" maxlength="10000" placeholder="正在连接…" aria-label="发送给数字员工的消息" autocomplete="off" disabled></textarea><div class="composer-bottom"><span class="composer-hint">Enter 发送 · Shift + Enter 换行</span><button id="send" class="send-button" aria-label="发送" disabled><svg aria-hidden="true"><use href="#arrow-up"/></svg></button></div></form><div class="compose-footer"><span><svg aria-hidden="true"><use href="#lock"/></svg>私密对话 · 内容仅对会话成员可见</span><span>Powered by <b>Agent_NET</b></span></div></div>
+</main>
+</div><div id="toast" role="status"></div>
 <script>__NACL_JS__</script>
 <script>
-'use strict'
-// ─── 工具 ────────────────────────────────────────────────────────────────────
-const enc = new TextEncoder(), dec = new TextDecoder()
-const b64e = (u8) => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s) }
-const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0))
-const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
-const $ = (id) => document.getElementById(id)
-function toast(t, ms = 2600) { const el = $('toast'); el.textContent = t; el.style.display = 'block'; clearTimeout(el._t); el._t = setTimeout(() => (el.style.display = 'none'), ms) }
-
-// ─── 密文原语(与 ce src/shared/crypto.ts 同形)─────────────────────────────────
-const seal = (key, pt) => { const n = nacl.secretbox.nonceLength, nonce = nacl.randomBytes(n), ct = nacl.secretbox(pt, nonce, key), out = new Uint8Array(n + ct.length); out.set(nonce); out.set(ct, n); return out }
-const open_ = (key, sealed) => { const n = nacl.secretbox.nonceLength, pt = nacl.secretbox.open(sealed.subarray(n), sealed.subarray(0, n), key); if (!pt) throw new Error('bad seal'); return pt }
-const sealText = (key, text) => b64e(seal(key, enc.encode(JSON.stringify({ kind: 'text', text }))))
-const openText = (key, ct) => { const p = JSON.parse(dec.decode(open_(key, b64d(ct)))); return p }
-
-// ─── 状态 ────────────────────────────────────────────────────────────────────
-const S = { code: '', key: null, ws: null, groupId: '', memberId: '', groupName: '', msgs: new Map(), readUpTo: 0, pending: new Map(), ended: false, resending: false }
-
-function frame(env) { return JSON.stringify({ type: 9, payload: b64e(enc.encode(JSON.stringify(env))) }) }
-function send(env) { if (S.ws && S.ws.readyState === 1) S.ws.send(frame(env)) }
-function rpc(env) { env.reqId = 'gq_' + Math.random().toString(36).slice(2, 10); S.pending.set(env.reqId, env); send(env) }
-
-// ─── 渲染 ────────────────────────────────────────────────────────────────────
-function mdTable(rows) { return '<table><thead><tr>' + rows[0].map((h) => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>' + rows.slice(2).map((r) => '<tr>' + r.map((c) => '<td>' + c + '</td>').join('') + '</tr>').join('') + '</tbody></table>' }
-function inlineMd(s) { return s.replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>') }
-function md(src) {
-  const lines = esc(src).split('\n'); let html = ''
-  for (let i = 0; i < lines.length; i++) {
-    const isSep = (l) => /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(l)
-    if (lines[i].includes('|') && i + 1 < lines.length && isSep(lines[i + 1])) {
-      const rows = []
-      while (i < lines.length && lines[i].includes('|')) {
-        rows.push(lines[i].replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => inlineMd(c.trim()))); i++
-      }
-      html += mdTable(rows); continue
-    }
-    html += inlineMd(lines[i]) + '<br>'
-  }
-  return html
-}
-function nearBottom() { const l = $('log'); return l.scrollHeight - l.scrollTop - l.clientHeight < 80 }
-function render() {
-  const stick = nearBottom(), log = $('log'), me = S.memberId
-  const seqs = [...S.msgs.keys()].sort((a, b) => a - b)
-  log.innerHTML = seqs.map((q) => {
-    const m = S.msgs.get(q) // Map 必须 .get(下标取值恒 undefined → render 炸被 onmessage 吞,页面全空白)
-    if (m.sys) return `<div class="sys">${esc(m.text)}</div>`
-    if (m.revoked) return `<div class="row${m.fromId === me ? ' me' : ''}"><div class="bubble tomb">消息已撤回</div></div>`
-    const who = m.fromId === me ? '' : `<div class="who">${esc(m.fromName)}</div>`
-    const tip = m.fromId === me ? ' title="点击撤回"' : ''
-    return `<div class="row${m.fromId === me ? ' me' : ''}">${who}<div class="bubble"${tip} data-seq="${q}">${md(m.text)}</div></div>`
-  }).join('')
-  if (stick) log.scrollTop = log.scrollHeight
-}
-$('log').addEventListener('click', (e) => {
-  const b = e.target.closest('.bubble')
-  if (!b || !b.dataset.seq) return
-  const q = Number(b.dataset.seq)
-  if (!confirm('撤回这条消息?')) return
-  rpc({ op: 'group-revoke', groupId: S.groupId, payload: { seq: q, memberId: S.memberId } })
-})
-
-// ─── 协议入向 ────────────────────────────────────────────────────────────────
-function mergeEnv(env) {
-  if (env.op === 'group-result') {
-    const r = env.payload || {}, p = S.pending.get(r.reqId || env.reqId)
-    if (!p) return
-    S.pending.delete(r.reqId || env.reqId)
-    if (p._for === 'sync') {
-      if (!r.ok) return toast('读取失败:' + (r.error || {}).code)
-      let last = S.readUpTo
-      for (const m of r.data.msgs || []) { absorb(m); last = Math.max(last, m.seq) }
-      S.readUpTo = last
-      render()
-      ack()
-    }
-    if (p._for === 'post') {
-      if (r.ok) { S.readUpTo = Math.max(S.readUpTo, r.data.seq || 0); return }
-      if ((r.error || {}).code === 'new_messages') {
-        for (const m of (r.data || {}).msgs || []) absorb(m)
-        render(); ack()
-        if (!S.resending) { S.resending = true; setTimeout(() => { S.resending = false; doSend(p._text) }, 150) }
-      } else toast((r.error || {}).message || '发送失败')
-    }
-    return
-  }
-  if (env.op === 'group-msg') {
-    absorb(env.payload)
-    render(); ack()
-    return
-  }
-  if (env.op === 'group-meta') {
-    const ev = env.payload || {}
-    if (ev.event === 'dissolved') { S.ended = true; $('banner').style.display = 'block'; $('box').hidden = true }
-    if (ev.event === 'member-joined' && ev.member) toast(ev.member.name + ' 进入了会客室')
-    return
-  }
-}
-function absorb(m) {
-  if (!m || typeof m.seq !== 'number') return
-  if (m.revokedAt) { S.msgs.set(m.seq, { seq: m.seq, revoked: true, fromId: m.from.memberId }); return }
-  try {
-    const pt = openText(S.key, m.ct)
-    if (pt.kind === 'system') S.msgs.set(m.seq, { seq: m.seq, sys: true, text: pt.text })
-    else if (pt.kind === 'text') S.msgs.set(m.seq, { seq: m.seq, text: pt.text, fromName: m.from.name, fromId: m.from.memberId })
-  } catch { /* 解不开(钥不对/非本房间):跳过 */ }
-}
-function ack() { if (S.readUpTo > 0) send({ op: 'group-ack', groupId: S.groupId, payload: { groupId: S.groupId, memberId: S.memberId, upToSeq: S.readUpTo } }) }
-function doSend(text) {
-  rpc({ _for: 'post', _text: text, op: 'group-post', groupId: S.groupId, payload: { ct: sealText(S.key, text), opKey: 'gu_' + b64e(nacl.randomBytes(6)), readUpTo: S.readUpTo, memberId: S.memberId } })
-}
-$('box').addEventListener('submit', (e) => {
-  e.preventDefault()
-  const t = $('msg').value.trim()
-  if (!t || S.ended) return
-  $('msg').value = ''
-  doSend(t)
-})
-
-// ─── 连接 ────────────────────────────────────────────────────────────────────
-function start() {
-  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/guest')
-  S.ws = ws
-  $('state').textContent = '连接中…'
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'guest-hello', code: S.code }))
-  ws.onmessage = (e) => {
-    let d
-    try { d = JSON.parse(e.data) } catch { return }
-    if (d.type === 'guest-joined') {
-      S.groupId = d.groupId; S.memberId = d.memberId; S.groupName = d.groupName || '雇佣对话'
-      $('gname').textContent = S.groupName
-      $('state').textContent = '已连接'
-      $('setup').style.display = 'none'; $('box').hidden = false
-      rpc({ _for: 'sync', op: 'group-sync', groupId: S.groupId, payload: { groupId: S.groupId, memberId: S.memberId, afterSeq: 0, limit: 200 } })
-      return
-    }
-    if (d.type === 'error') { backToSetup(d.reason || '连接被拒'); return }
-    // 群帧:{type:9,payload:b64}
-    try { mergeEnv(JSON.parse(dec.decode(b64d(d.payload)))) } catch { /* 脏帧忽略 */ }
-  }
-  ws.onclose = () => {
-    if (S.ended) return
-    $('state').textContent = '已断开'
-    if (S.groupId) { toast('连接断开,3 秒后重连…'); setTimeout(start, 3000) } else backToSetup('连接已断开')
-  }
-}
-function backToSetup(reason) {
-  $('setupErr').textContent = reason || ''
-  $('setup').style.display = 'block'; $('box').hidden = true
-  if (S.ws) { try { S.ws.onclose = null; S.ws.close() } catch {} }
-  S.groupId = ''; S.ws = null
-}
-$('go').addEventListener('click', () => {
-  const raw = $('link').value.trim()
-  const err = $('setupErr')
-  err.textContent = ''
-  try {
-    const u = new URL(raw)
-    const m = u.pathname.match(/\/hire\/([A-Z2-7]{4,9}-[A-Z2-7]{4,9})/i)
-    const k = (u.hash || '').match(/^#k=([A-Za-z0-9+/=]+)$/)
-    if (!m || !k) throw new Error('链接不完整')
-    S.code = m[1].toUpperCase()
-    S.key = b64d(k[1])
-    if (S.key.length !== 32) throw new Error('钥匙格式不对')
-    $('setup').style.display = 'none'
-    start()
-  } catch (e2) { err.textContent = '链接不完整:请原样粘贴主人发的完整链接(' + e2.message + ')' }
-});
-// ↑ 分号必须:无分号 + 下一行 ( 开头 = ASI 把 init 解析成对上一条返回值的调用(首载即炸)
-
-// ─── 入口:URL 自带 code+key 则直接进,否则出setup ────────────────────────────────
-(function init() {
-  const m = location.pathname.match(/\/hire\/([A-Z2-7]{4,9}-[A-Z2-7]{4,9})/i)
-  const k = (location.hash || '').match(/^#k=([A-Za-z0-9+/=]+)$/)
-  if (m && k) {
-    S.code = m[1].toUpperCase()
-    try { S.key = b64d(k[1]) } catch { S.key = null }
-    if (S.key && S.key.length === 32) { $('setup').style.display = 'none'; start(); return }
-  }
-  /* 留在 setup 面板 */
-})()
+'use strict';
+const enc=new TextEncoder(),dec=new TextDecoder(),$=id=>document.getElementById(id);
+const b64e=u=>{let s='';for(let i=0;i<u.length;i+=0x8000)s+=String.fromCharCode.apply(null,u.subarray(i,i+0x8000));return btoa(s)};
+const b64d=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const S={code:'',key:null,ws:null,groupId:'',memberId:'',groupName:'',msgs:new Map(),pending:new Map(),outbox:new Map(),readUpTo:0,ended:false,ready:false,generation:0,reconnectTimer:null,reconnectAttempt:0,waiting:false,syncing:false};
+function toast(text){$('toast').textContent=text;$('toast').style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').style.display='none',3500)}
+function status(text,kind='offline'){$('state').textContent=text;$('connection').dataset.status=kind}
+function notice(text,retry=false){$('noticeText').textContent=text;$('notice').style.display=text?'flex':'none';$('reconnect').hidden=!retry}
+function composer(){const online=S.ready&&!S.ended;$('msg').disabled=!online;$('send').disabled=!online||!$('msg').value.trim();$('msg').placeholder=S.ended?'这次协作已结束':online?'说说你想完成什么…':'连接恢复后即可继续对话';$('msg').style.height='auto';$('msg').style.height=Math.min(150,$('msg').scrollHeight)+'px'}
+function setup(title,description,retry=false){S.ready=false;status(S.ended?'已结束':'暂未连接');$('log').innerHTML='<div id="setup"><div class="setup-icon"><svg aria-hidden="true"><use href="#network-mark"/></svg></div><h1>'+esc(title)+'</h1><p>'+esc(description)+'</p><button id="retry"'+(retry?'':' hidden')+'>重新连接</button></div>';composer()}
+const sealText=text=>{const nonce=nacl.randomBytes(24),ct=nacl.secretbox(enc.encode(JSON.stringify({kind:'text',text})),nonce,S.key),out=new Uint8Array(24+ct.length);out.set(nonce);out.set(ct,24);return b64e(out)};
+function openText(ct){const raw=b64d(ct),p=nacl.secretbox.open(raw.subarray(24),raw.subarray(0,24),S.key);if(!p)throw Error('无法解锁对话');return JSON.parse(dec.decode(p))}
+function frame(env){return JSON.stringify({type:9,payload:b64e(enc.encode(JSON.stringify(env)))})}
+function send(env){if(S.ws?.readyState===1)S.ws.send(frame(env))}
+function rpc(op,payload){return new Promise((resolve,reject)=>{if(S.ws?.readyState!==1)return reject(Error('连接已断开'));const reqId='gq_'+cryptoId(),timer=setTimeout(()=>{S.pending.delete(reqId);reject(Error('响应超时，请重试'))},15000);S.pending.set(reqId,{resolve,reject,timer});send({op,groupId:S.groupId,reqId,payload})})}
+function cryptoId(){return b64e(nacl.randomBytes(9)).replace(/[^a-zA-Z0-9]/g,'')}
+function disconnect(){clearTimeout(S.reconnectTimer);S.reconnectTimer=null;S.generation++;const ws=S.ws;S.ws=null;if(ws){ws.onclose=null;ws.onmessage=null;ws.onerror=null;ws.close()}for(const p of S.pending.values()){clearTimeout(p.timer);p.reject(Error('连接已断开'))}S.pending.clear();S.syncing=false;S.ready=false;composer()}
+function inline(text){return text.replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')}
+function md(src){const lines=esc(src).split('\n');let html='',code=null,list=false;for(let i=0;i<lines.length;i++){const line=lines[i];if(/^```/.test(line)){if(code!==null){html+='<pre><code>'+code.join('\n')+'</code></pre>';code=null}else{if(list){html+='</ul>';list=false}code=[]}continue}if(code!==null){code.push(line);continue}if(line.includes('|')&&i+1<lines.length&&/^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i+1])){if(list){html+='</ul>';list=false}const rows=[];while(i<lines.length&&lines[i].includes('|')){rows.push(lines[i].replace(/^\s*\|/,'').replace(/\|\s*$/,'').split('|').map(c=>inline(c.trim())));i++}i--;html+='<table><thead><tr>'+rows[0].map(c=>'<th>'+c+'</th>').join('')+'</tr></thead><tbody>'+rows.slice(2).map(r=>'<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')+'</tbody></table>';continue}if(/^\s*[-*] /.test(line)){if(!list){html+='<ul>';list=true}html+='<li>'+inline(line.replace(/^\s*[-*] /,''))+'</li>';continue}if(list){html+='</ul>';list=false}if(/^#{1,6} /.test(line))html+='<h3>'+inline(line.replace(/^#{1,6} /,''))+'</h3>';else html+=line?inline(line)+'<br>':'<br>'}if(code!==null)html+='<pre><code>'+code.join('\n')+'</code></pre>';if(list)html+='</ul>';return html.replace(/(?:<br>)+$/,'')}
+function welcome(){return '<div class="welcome"><div class="welcome-mark"><svg aria-hidden="true"><use href="#network-mark"/></svg></div><p class="welcome-eyebrow">A LITTLE HELP. A BIG DIFFERENCE.</p><h1>把想法，交给<span>你的搭档。</span></h1><p class="welcome-description">一个问题、一点灵感，或一个待完成的任务。<br>从这里开始，一起把它做好。</p><div class="starters"><button class="starter" data-prompt="我有一个想法，帮我一起梳理思路。"><svg aria-hidden="true"><use href="#spark"/></svg><strong>一起梳理思路</strong><small>让想法更清晰</small></button><button class="starter" data-prompt="帮我拆解一个任务，制定可执行的步骤。"><svg aria-hidden="true"><use href="#arrow-up"/></svg><strong>拆解一个任务</strong><small>找到下一步</small></button><button class="starter" data-prompt="我想听听你的专业建议。"><svg aria-hidden="true"><use href="#network-mark"/></svg><strong>聊聊专业建议</strong><small>换个角度思考</small></button></div></div>'}
+function render(){const log=$('log'),stick=log.scrollHeight-log.scrollTop-log.clientHeight<100;let html='';for(const m of [...S.msgs.values()].sort((a,b)=>a.seq-b.seq)){if(m.sys){html+='<div class="sys">'+esc(m.text)+'</div>';continue}const me=m.fromId===S.memberId,time=m.ts?new Date(m.ts).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):'';html+='<article class="row'+(me?' me':'')+'"><div class="message-meta"><span class="who">'+esc(me?'你':m.fromName||S.groupName)+'</span><time>'+esc(time)+'</time></div><div class="bubble'+(m.revoked?' tomb':'')+'">'+(m.revoked?'消息已撤回':md(m.text))+'</div>'+(me&&!m.revoked?'<div class="message-actions"><button data-revoke="'+m.seq+'" aria-label="撤回这条消息">撤回</button></div>':'')+'</article>'}for(const [id,m] of S.outbox){html+='<article class="row me"><div class="message-meta"><span class="who">你</span></div><div class="bubble">'+md(m.text)+'</div><div class="message-actions">'+(m.failed?'<button class="failed" data-retry="'+id+'">发送失败，点击重试</button>':'<span>正在发送…</span>')+'</div></article>'}if(S.waiting)html+='<div class="waiting" role="status"><i></i><i></i><i></i><span>正在等待搭档回复…</span></div>';log.innerHTML=html||welcome();if(stick)log.scrollTop=log.scrollHeight}
+function absorb(m){if(!m||typeof m.seq!=='number')return;if(m.revokedAt){const old=S.msgs.get(m.seq);S.msgs.set(m.seq,{...old,seq:m.seq,revoked:true,fromId:m.from?.memberId});S.readUpTo=Math.max(S.readUpTo,m.seq);return}try{const p=openText(m.ct);if(!['text','system'].includes(p.kind)||typeof p.text!=='string')return;const me=m.from?.memberId===S.memberId;S.msgs.set(m.seq,{seq:m.seq,sys:p.kind==='system'||m.system===true,text:p.text,fromId:m.from?.memberId,fromName:m.from?.name,ts:m.ts});if(me){for(const [id,item] of S.outbox)if(item.opKey===m.opKey)S.outbox.delete(id)}else if(!m.from?.human)S.waiting=false;S.readUpTo=Math.max(S.readUpTo,m.seq)}catch{S.key=null;disconnect();notice('');setup('邀请信息无法解锁会话','请邀请方重新分享完整链接，再从链接进入。');status('无法解锁');$('msg').placeholder='请重新获取完整邀请链接'}}
+function ack(){if(S.readUpTo>0)send({op:'group-ack',groupId:S.groupId,payload:{groupId:S.groupId,memberId:S.memberId,upToSeq:S.readUpTo}})}
+async function sync(){if(S.syncing)return;const gen=S.generation;S.syncing=true;try{let after=S.readUpTo;for(let page=0;page<30;page++){const r=await rpc('group-sync',{groupId:S.groupId,memberId:S.memberId,afterSeq:after,limit:200});if(gen!==S.generation)return;if(!r.ok)throw Error(r.error?.message||'读取对话失败');const msgs=r.data.msgs||[];for(const m of msgs){absorb(m);if(gen!==S.generation)return}const last=msgs.reduce((n,m)=>Math.max(n,m.seq),after);if(msgs.length<200||last<=after)break;after=last}ack();render()}finally{if(gen===S.generation)S.syncing=false}}
+async function post(id){const item=S.outbox.get(id);if(!item||item.sending||!S.ready)return;item.failed=false;item.sending=true;render();try{for(let attempt=0;attempt<3;attempt++){const r=await rpc('group-post',{ct:item.ct,opKey:item.opKey,readUpTo:S.readUpTo,memberId:S.memberId});if(r.ok){S.outbox.delete(id);S.waiting=true;if(!S.msgs.has(r.data.seq))S.msgs.set(r.data.seq,{seq:r.data.seq,text:item.text,fromId:S.memberId,fromName:'你',ts:Date.now()});S.readUpTo=Math.max(S.readUpTo,r.data.seq||0);ack();render();return}if(r.error?.code!=='new_messages')throw Error(r.error?.message||'发送失败');for(const m of r.data?.msgs||[])absorb(m);await sync()}throw Error('消息较多，请重试')}catch(error){item.failed=true;toast(error.message);render()}finally{item.sending=false}}
+function submit(){const text=$('msg').value.trim();if(!text||!S.ready||S.ended)return;const id=cryptoId();S.outbox.set(id,{text,ct:sealText(text),opKey:'gu_'+id,failed:false,sending:false});$('msg').value='';composer();render();$('log').scrollTop=$('log').scrollHeight;void post(id)}
+$('box').addEventListener('submit',e=>{e.preventDefault();submit()});$('msg').addEventListener('input',composer);$('msg').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();submit()}});
+$('log').addEventListener('click',async e=>{const retry=e.target.closest('#retry');if(retry){start();return}const starter=e.target.closest('[data-prompt]');if(starter&&S.ready){$('msg').value=starter.dataset.prompt;composer();$('msg').focus();return}const resend=e.target.closest('[data-retry]');if(resend){void post(resend.dataset.retry);return}const revoke=e.target.closest('[data-revoke]');if(!revoke||!S.ready)return;const seq=Number(revoke.dataset.revoke),m=S.msgs.get(seq);if(m?.fromId!==S.memberId||!confirm('撤回这条消息？'))return;try{const r=await rpc('group-revoke',{seq,memberId:S.memberId});if(!r.ok)throw Error(r.error?.message||'撤回失败');S.msgs.set(seq,{...m,revoked:true});render()}catch(error){toast(error.message)}});
+$('reconnect').addEventListener('click',()=>start());
+function start(){if(!S.code||!S.key||S.ended)return;disconnect();const gen=S.generation;status('正在连接','loading');if(S.groupId)notice('正在恢复连接…');else setup('正在连接你的搭档','为这次协作准备一个安静的空间。');status('正在连接','loading');const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/guest');S.ws=ws;const timeout=setTimeout(()=>{if(gen===S.generation&&!S.ready){ws.close()}},12000);ws.onopen=()=>{ws.send(JSON.stringify({type:'guest-hello',code:S.code}))};ws.onmessage=async event=>{if(gen!==S.generation)return;let d;try{d=JSON.parse(event.data)}catch{return}if(d.type==='guest-joined'){clearTimeout(timeout);S.groupId=d.groupId;S.memberId=d.memberId;S.groupName=String(d.groupName||'你的数字员工').replace(/^雇佣[·・\s]*/,'');$('gname').textContent=S.groupName;document.title=S.groupName+' · Agent_NET';S.ready=true;S.reconnectAttempt=0;status('已连接','online');notice('');composer();try{await sync()}catch(error){if(gen===S.generation)notice(error.message,true)}return}if(d.type==='error'){disconnect();const reason=String(d.reason||'');S.ended=/不存在|关闭|到期|失效|锁定|次数/.test(reason);setup(S.ended?'这份邀请暂时无法使用':'暂时无法进入会话',S.ended?'请联系邀请方，获取一份新的邀请链接。':reason||'请稍后重试，或联系邀请方检查连接。',!S.ended);return}try{const env=JSON.parse(dec.decode(b64d(d.payload)));if(env.op==='group-result'){const r=env.payload||{},id=r.reqId||env.reqId,p=S.pending.get(id);if(p){clearTimeout(p.timer);S.pending.delete(id);p.resolve(r)}return}if(env.op==='group-msg'){absorb(env.payload);if(!S.key)return;render();ack()}if(env.op==='group-meta'&&env.payload?.event==='dissolved'){S.ended=true;disconnect();status('已结束');notice('这次协作已结束，感谢与你一起工作。');if(!S.msgs.size)setup('这次协作已结束','如需继续，请联系邀请方获取新的邀请。');composer()}}catch{}};ws.onerror=()=>{};ws.onclose=()=>{clearTimeout(timeout);if(gen!==S.generation||S.ended)return;S.ready=false;composer();for(const p of S.pending.values()){clearTimeout(p.timer);p.reject(Error('连接已断开'))}S.pending.clear();S.syncing=false;status('连接已断开');if(S.reconnectAttempt>=3){if(S.groupId)notice('暂时无法连接，已保留当前对话。',true);else setup('搭档暂时还未连接','请检查网络后重试，或联系邀请方。',true);return}const delay=[1500,3000,6000][S.reconnectAttempt++];if(S.groupId)notice('连接暂时中断，正在自动重连…',true);S.reconnectTimer=setTimeout(start,delay)}}
+(function init(){const path=location.pathname.match(/^\/hire\/([A-Z2-7]{4,9}-[A-Z2-7]{4,9})\/?$/i),hash=location.hash.match(/^#k=([A-Za-z0-9+/=]+)$/);if(!path||!hash){setup('邀请信息不完整','请让邀请方重新分享完整链接，再从链接直接进入。');return}try{S.code=path[1].toUpperCase();S.key=b64d(hash[1]);if(S.key.length!==32)throw Error('key');start()}catch{setup('邀请信息不完整','请让邀请方重新分享完整链接，再从链接直接进入。')}})();
+window.addEventListener('online',()=>{if(!S.ready&&!S.ended&&S.key){S.reconnectAttempt=0;start()}});
+window.addEventListener('pagehide',()=>disconnect());
 </script>
 </body>
 </html>

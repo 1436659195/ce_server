@@ -1,0 +1,493 @@
+import { afterEach, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { BotRuntimeService, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
+import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
+import type { RuntimeBot, RuntimeTask } from '../src/cli/bot-runtime/types'
+import type { BotOperation } from '../src/cli/bot-permissions'
+import type { CodexToolCall, CodexTurn } from '../src/cli/bot-runtime/codex'
+
+const cleanups: Array<() => Promise<void>> = []
+afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
+const waitFor = async (fn: () => boolean) => { for (let i = 0; i < 100 && !fn(); i++) await Bun.sleep(10); expect(fn()).toBe(true) }
+function gate() {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => { release = resolve })
+  return { promise, release }
+}
+interface FixtureOptions {
+  accessDelayMs?: number
+  accessGate?: ReturnType<typeof gate>
+  firstWorkerCloseGate?: ReturnType<typeof gate>
+  seed?: (store: BotRuntimeStore, bot: RuntimeBot) => void
+  runTool?: (tool: string, args: Record<string, unknown>, dir: string) => Promise<string>
+  routerReads?: (call: (tool: string, args?: Record<string, unknown>) => Promise<unknown>) => Promise<void>
+}
+function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: FixtureOptions | number = {}) {
+  const options = typeof optionsOrDelay === 'number' ? { accessDelayMs: optionsOrDelay } : optionsOrDelay
+  const dir = mkdtempSync(join(tmpdir(), 'ce-worker-life-'))
+  const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
+  const bot: RuntimeBot = { botId: 'bot-a', name: '助理', groupId: 'dm', ownerPhoneId: 'owner', sourceCwd: dir, directory: dir, platform: 'codex', commandSandbox: true, policyRevision: 1, permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'ask', execute: 'ask', commanders: 'members', allowedPhoneIds: [] } }
+  store.saveSettings({ botId: bot.botId, mode: 'router-worker', revision: 1, profile: '', model: '', experiences: [] })
+  options.seed?.(store, bot)
+  const sent: string[] = []; const actions: string[] = []; const steers: string[] = []; const workerPayloads: string[] = []
+  let workerOptions: RuntimeClientOptions | undefined; let workerDone: ((v: CodexTurn) => void) | undefined; let started = 0; let calls = 0
+  let workerClients = 0; let workerCloses = 0
+  const service = new BotRuntimeService({ routerQuietMs: 0, store, rootDir: dir, getBot: () => bot, sendReply: async reply => { sent.push(reply.text) },
+    checkAccess: async () => {
+      if (options.accessDelayMs) await Bun.sleep(options.accessDelayMs)
+      if (options.accessGate) await options.accessGate.promise
+      return { directory: bot.directory, permissions: bot.permissions, revision: bot.policyRevision }
+    },
+    openTools: (_bot, _member, authorize) => ({ close() {}, call: async (tool, args) => {
+      const operations: Record<string, BotOperation> = { delete_file: 'delete', edit_file: 'edit', create_file: 'create', run_command: 'execute' }
+      const operation = operations[tool] ?? 'read'
+      await authorize(operation, String(args.path)); actions.push(tool)
+      return options.runTool ? options.runTool(tool, args, dir) : '文件内容'
+    } }),
+    createClient: (role, opts) => {
+      if (role === 'worker') workerOptions = opts
+      const workerNumber = role === 'worker' ? ++workerClients : 0
+      let clientDone: ((v: CodexTurn) => void) | undefined
+      const threadId = `thread-${role}`
+      return {
+        initialize: async () => {}, startThread: async () => threadId, resumeThread: async () => threadId,
+        startTurn: async (_threadId, text) => {
+          if (role === 'router') {
+            const decision = decisions.shift()
+            const call = (tool: string, args: Record<string, unknown> = {}) => opts.onToolCall({ threadId, turnId: 'turn-router', callId: `router-${++calls}`, tool, arguments: args })
+            const done = Promise.resolve().then(async () => {
+              await options.routerReads?.(call)
+              if (decision) await call('router_decide', { policyRevision: 1, feasibility: 'can', ...decision })
+              return { id: 'turn-router', status: 'completed' }
+            })
+            return { threadId, turnId: 'turn-router', done }
+          }
+          started++
+          workerPayloads.push(text)
+          return { threadId, turnId: 'turn-worker', done: new Promise<CodexTurn>(r => { workerDone = clientDone = r }) }
+        },
+        steer: async (_thread, _turn, text) => { steers.push(text); return 'turn-worker' },
+        interrupt: async () => { clientDone?.({ id: 'turn-worker', status: 'interrupted' }) },
+        close: async () => {
+          if (role === 'worker') {
+            workerCloses++; clientDone?.({ id: 'turn-worker', status: 'interrupted' })
+            if (workerNumber === 1) await options.firstWorkerCloseGate?.promise
+          }
+        },
+      }
+    },
+  })
+  cleanups.push(async () => {
+    options.firstWorkerCloseGate?.release(); options.accessGate?.release()
+    await service.close()
+    await Promise.resolve()
+    store.close(); rmSync(dir, { recursive: true, force: true })
+  })
+  const send = (seq: number, text: string, senderId = 'owner') => service.receive(bot.botId, { groupId: 'dm', seq, text, senderId, memberId: 'member-owner', createdAt: Date.now() })
+  const workerCall = (tool: string, args: Record<string, unknown> = {}) => workerOptions!.onToolCall({ threadId: 'thread-worker', turnId: 'turn-worker', callId: `worker-${++calls}`, tool, arguments: args } satisfies CodexToolCall)
+  return { store, service, bot, dir, send, sent, steers, actions, workerPayloads, workerCall, started: () => started, workerCloses: () => workerCloses, complete: () => workerDone?.({ id: 'turn-worker', status: 'completed' }) }
+}
+const start = { action: 'start', delivery: 'chat', replyText: '我先看现有材料。', newCase: { title: '论文 A', object: '论文 A', goal: '解读' }, goal: '写报告', acceptance: ['交付报告'], allowedOps: ['read', 'create', 'edit', 'delete'], exclusions: [] }
+
+test('上传材料进入 Worker 原消息与活动补充，读取图片返回多模态内容而非 base64 文本', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions)
+  const upload = (name: string, bytes: Buffer) => {
+    const begun = f.service.upload(f.bot.botId, 'owner', { action: 'begin', requestId: crypto.randomUUID(), name, size: bytes.length, mime: '' }) as { id: string }
+    f.service.upload(f.bot.botId, 'owner', { action: 'chunk', uploadId: begun.id, offset: 0, data: bytes.toString('base64') })
+    return f.service.upload(f.bot.botId, 'owner', { action: 'finish', uploadId: begun.id, hash: createHash('sha256').update(bytes).digest('hex') }) as any
+  }
+  const text = upload('brief.txt', Buffer.from('重点分析成本'))
+  f.service.receive(f.bot.botId, { groupId: 'dm', seq: 1, senderId: 'owner', memberId: 'member-owner', text: '根据附件写报告', attachments: [text], createdAt: Date.now() })
+  await waitFor(() => f.started() === 1)
+  expect(JSON.parse(f.workerPayloads[0]).originalMessage.attachments[0].id).toBe(text.id)
+  expect(await f.workerCall('work_read_attachment', { attachmentId: text.id })).toMatchObject({ text: '重点分析成本', eof: true })
+  const unrelated = upload('other.txt', Buffer.from('未发送的文件'))
+  await expect(f.workerCall('work_read_attachment', { attachmentId: unrelated.id })).rejects.toThrow('卷宗')
+  const png = upload('图.png', Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a9sAAAAASUVORK5CYII=', 'base64'))
+  const task = f.store.tasks()[0]
+  decisions.push({ action: 'append', taskId: task.id, expectedRevision: 1, replyText: '我会结合这张图。' })
+  f.service.receive(f.bot.botId, { groupId: 'dm', seq: 2, senderId: 'owner', memberId: 'member-owner', text: '再参考图片', attachments: [png], createdAt: Date.now() })
+  await waitFor(() => f.steers.length === 1)
+  expect(JSON.parse(f.steers[0]).input.attachments[0].id).toBe(png.id)
+  const image = await f.workerCall('work_read_attachment', { attachmentId: png.id }) as any
+  expect(image.contentItems[1]).toMatchObject({ type: 'inputImage', imageUrl: expect.stringContaining('data:image/png;base64,') })
+  const forwarded = await f.workerCall('work_publish_attachment', { attachmentId: png.id }) as { artifactId: string }
+  expect(f.store.artifact(forwarded.artifactId)).toMatchObject({ name: '图.png', mime: 'image/png', hash: png.hash })
+})
+
+test('项目导出生成真实成果快照，finish 不得省略已经准备好的附件', async () => {
+  const f = fixture([start], { runTool: async () => JSON.stringify({ name: 'report.html', data: Buffer.from('<h1>实际报告</h1>').toString('base64') }) })
+  f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const op = await f.workerCall('project_export_file', { path: 'report.html' }) as { operationId: string }
+  await waitFor(() => f.store.operation(op.operationId)?.state === 'completed')
+  const poll = await f.workerCall('project_poll', { operationId: op.operationId }) as { result: string }
+  const artifact = JSON.parse(poll.result)
+  expect(artifact.name).toBe('report.html')
+  expect(poll.result).not.toContain(Buffer.from('<h1>实际报告</h1>').toString('base64'))
+  const task = f.store.tasks()[0]
+  await expect(f.workerCall('work_finish', { revision: task.revision, text: '报告写好了。', artifactIds: [], checks: ['读取核对'] })).rejects.toThrow('附件')
+  await f.workerCall('work_finish', { revision: task.revision, text: '报告在附件里。', artifactIds: [artifact.artifactId], checks: ['读取核对'] })
+  expect(f.service.replyAttachments(f.store.replies(f.bot.botId).find(r => r.purpose === 'result')!)).toMatchObject([{ kind: 'artifact', name: 'report.html' }])
+})
+
+test('先只发附件再说用途时，前台可把前序用户材料关联到新卷宗', async () => {
+  const decisions: Array<Record<string, unknown>> = [{ action: 'reply', replyText: '希望我怎样处理这份材料？' }]
+  const f = fixture(decisions)
+  const bytes = Buffer.from('材料要求：报告必须讨论缓存污染。')
+  const upload = f.service.upload(f.bot.botId, 'owner', { action: 'begin', requestId: 'prior-file', name: 'prior.txt', mime: '', size: bytes.length }) as { id: string }
+  f.service.upload(f.bot.botId, 'owner', { action: 'chunk', uploadId: upload.id, offset: 0, data: bytes.toString('base64') })
+  const ref = f.service.upload(f.bot.botId, 'owner', { action: 'finish', uploadId: upload.id, hash: createHash('sha256').update(bytes).digest('hex') }) as any
+  const source = f.service.receive(f.bot.botId, { groupId: 'dm', seq: 1, senderId: 'owner', memberId: 'member-owner', text: '', attachments: [ref], createdAt: Date.now() })
+  await waitFor(() => f.store.inbox(source.id)?.state === 'routed')
+  expect(f.store.tasks()).toHaveLength(0)
+  decisions.push({ ...start, sourceInputIds: [source.id] })
+  f.send(2, '用刚才上传的材料写报告')
+  await waitFor(() => f.started() === 1)
+  expect(JSON.parse(f.workerPayloads[0]).availableAttachments).toMatchObject([{ id: ref.id }])
+  expect(await f.workerCall('work_read_attachment', { attachmentId: ref.id })).toMatchObject({ text: bytes.toString('utf8') })
+})
+
+function seedTask(store: BotRuntimeStore, bot: RuntimeBot): RuntimeTask {
+  const message = store.receive({ botId: bot.botId, groupId: bot.groupId, seq: 1, text: '写论文报告', senderId: bot.ownerPhoneId, memberId: 'member-owner', createdAt: Date.now() })
+  return store.acceptWork({ inputId: message.id, newCase: start.newCase, goal: start.goal, acceptance: start.acceptance, replyText: start.replyText,
+    mandate: { ownerPhoneId: bot.ownerPhoneId, policyRevision: bot.policyRevision, directory: bot.directory, allowedOps: ['read', 'create', 'edit', 'delete'], exclusions: [], mode: 'execute' } })
+}
+
+test('前台能按文件名找回超出最近窗口的纯附件消息', async () => {
+  let found: unknown
+  const f = fixture([{ action: 'reply', replyText: '这份材料希望重点分析什么？' }], {
+    seed: (store, bot) => {
+      for (let seq = 1; seq <= 24; seq++) {
+        const message = store.receive({ botId: bot.botId, groupId: bot.groupId, seq, senderId: bot.ownerPhoneId, memberId: 'owner', text: seq === 1 ? '' : '闲聊', createdAt: seq,
+          ...(seq === 1 ? { attachments: [{ id: 'upload-prior', kind: 'upload' as const, botId: bot.botId, name: 'brief.txt', mime: 'text/plain', size: 1, hash: 'a'.repeat(64) }] } : {}) })
+        store.markInput(message.id, 'routed')
+      }
+    },
+    routerReads: async call => { found = await call('chat_search', { query: 'brief.txt' }) },
+  })
+  f.send(25, '请再找找我以前发的材料')
+  await waitFor(() => found !== undefined)
+  expect(found).toMatchObject([{ text: '', attachments: [{ name: 'brief.txt' }] }])
+})
+
+test('闲聊无工单；原消息重放不再次运行 Router 或发回复', async () => {
+  const f = fixture([{ action: 'reply', replyText: '今天想聊什么？' }])
+  f.send(1, '你好'); f.send(1, '你好')
+  await waitFor(() => f.sent.length === 1)
+  expect(f.store.tasks()).toHaveLength(0)
+  expect(f.started()).toBe(0)
+})
+test('活动 Worker 中追加原话立即 steer；前台不等待完成，专业回答直接发出', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions)
+  f.send(1, '写论文 A 报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  decisions.push({ action: 'append', taskId: task.id, expectedRevision: 1, replyText: '可以，加上局限分析。' })
+  f.send(2, '加一节局限分析')
+  await waitFor(() => f.steers.length === 1)
+  expect(f.steers[0]).toContain('加一节局限分析')
+  expect(f.store.task(task.id)?.state).toBe('running')
+  const addition = f.store.inputs(task.id)[0]
+  await f.workerCall('work_consume_input', { inputId: addition.id })
+  await f.workerCall('work_report', { summary: '正在补充局限分析', resolutions: [{ inputId: addition.id, resolution: '已纳入报告大纲' }] })
+  await f.workerCall('work_reply', { replyToInputId: addition.inboxId, text: '局限分析会覆盖样本偏差和泛化范围。' })
+  await waitFor(() => f.sent.includes('局限分析会覆盖样本偏差和泛化范围。'))
+  expect(f.started()).toBe(1)
+})
+
+test('长工具执行中追问进度进入原 Worker，答案从统一出口发出后原任务继续交付', async () => {
+  const toolGate = gate()
+  const decisions: Array<Record<string, unknown>> = [start]
+  const inspections: any[] = []
+  const f = fixture(decisions, {
+    runTool: async () => { await toolGate.promise; return '已读完材料' },
+    routerReads: async call => { const task = f.store.tasks()[0]; if (task) inspections.push(await call('task_inspect', { taskId: task.id })) },
+  })
+  try {
+    f.send(1, '核对材料并写报告'); await waitFor(() => f.started() === 1)
+    const task = f.store.tasks()[0]; const runId = f.store.runs()[0].id
+    await f.service.flush('bot-a')
+    const sentBeforeReport = f.sent.length
+    await f.workerCall('work_report', { summary: '已列出材料清单，正在读取正文' })
+    expect(f.sent.length).toBe(sentBeforeReport)
+    const operation = await f.workerCall('project_read_file', { path: 'paper.txt' }) as { operationId: string }
+    await waitFor(() => f.store.operation(operation.operationId)?.state === 'running')
+    decisions.push({ action: 'ask_worker', taskId: task.id, expectedRevision: 1, replyText: '我确认一下现在的进展。' })
+    f.send(2, '现在做到哪了？')
+    await waitFor(() => f.steers.length === 1)
+    expect(inspections[0]).toMatchObject({ summaryUpdatedAt: expect.any(Number), observedAt: expect.any(Number), activeOperations: [{ id: operation.operationId, state: 'running' }] })
+    const input = f.store.inputs(task.id)[0]
+    expect(input.kind).toBe('ask_worker')
+    await f.workerCall('work_consume_input', { inputId: input.id })
+    await f.workerCall('work_reply', { replyToInputId: input.id, text: '材料清单已核对，正文读取仍在执行，尚未开始写报告。' })
+    await waitFor(() => f.sent.includes('材料清单已核对，正文读取仍在执行，尚未开始写报告。'))
+    expect(f.store.operation(operation.operationId)?.state).toBe('running')
+    expect(f.store.task(task.id)?.state).toBe('running')
+    expect(f.started()).toBe(1); expect(f.store.runs()[0].id).toBe(runId)
+    await f.workerCall('work_report', { summary: '已回答进度，继续等待材料读取', resolutions: [{ inputId: input.id, resolution: '已直接回答当前状态，继续原任务' }] })
+    toolGate.release(); await waitFor(() => f.store.operation(operation.operationId)?.state === 'completed')
+    await f.workerCall('work_finish', { revision: 2, text: '材料已核对完成。', artifactIds: [], checks: ['已确认读取结果'] })
+    f.complete(); await waitFor(() => f.sent.includes('材料已核对完成。'))
+    expect(f.store.task(task.id)?.state).toBe('completed')
+    expect(f.store.replies('bot-a').filter(r => r.purpose === 'answer')).toHaveLength(1)
+    expect(f.started()).toBe(1)
+  } finally { toolGate.release() }
+})
+test('非 owner 不能指挥；审批归 owner，批准只执行一次', async () => {
+  const f = fixture([start])
+  expect(() => f.send(1, '删文件', 'other')).toThrow(/owner|创建者/)
+  f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const op = await f.workerCall('project_delete_file', { path: 'old.txt' }) as { operationId: string }
+  expect(f.actions).toHaveLength(0)
+  expect(f.service.approvals('bot-a')).toHaveLength(1)
+  await expect(f.service.approve('bot-a', 'other', op.operationId, true)).rejects.toThrow(/owner|创建者/)
+  await f.service.approve('bot-a', 'owner', op.operationId, true)
+  await waitFor(() => f.actions.length === 1)
+  await expect(f.service.approve('bot-a', 'owner', op.operationId, true)).rejects.toThrow(/结束|不存在/)
+  expect(f.actions).toEqual(['delete_file'])
+})
+test('停止后拒绝旧 Worker 交付；未知执行记录重启时不自动重复操作', async () => {
+  const f = fixture([start]); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  await f.service.control('bot-a', 'owner', { action: 'stop', taskId: task.id, expectedRevision: 1, requestId: 'stop-1' })
+  expect(f.store.task(task.id)?.state).toBe('stopped')
+  await expect(f.workerCall('work_finish', { revision: 1, text: '完成。', artifactIds: [], checks: ['检查通过'] })).rejects.toThrow()
+  expect(f.sent).not.toContain('完成。')
+})
+
+test('两个并行项目调用跨过异步验权时，也只能有一个操作被接受', async () => {
+  const f = fixture([start], 20); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const results = await Promise.allSettled([f.workerCall('project_read_file', { path: 'a' }), f.workerCall('project_read_file', { path: 'b' })])
+  expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1)
+})
+
+test('必要问题的答案在旧轮次结束前到达，可立即恢复同一 Worker 的操作权', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  const question = await f.workerCall('work_ask_user', { text: '报告要侧重方法还是局限？', options: ['方法', '局限'] }) as { questionId: string }
+  decisions.push({ action: 'answer', taskId: task.id, expectedRevision: 1, questionId: question.questionId, replyText: '我会侧重局限。' })
+  f.send(2, '侧重局限'); await waitFor(() => f.steers.length === 1)
+  expect(f.store.task(task.id)?.state).toBe('running')
+  await expect(f.workerCall('project_read_file', { path: 'paper.txt' })).resolves.toHaveProperty('operationId')
+})
+
+test('成功交付后的旧 Worker 不能再提问或重新打开已完成工单', async () => {
+  const f = fixture([start]); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  await f.workerCall('work_finish', { revision: 1, text: '报告完成。', artifactIds: [], checks: ['检查通过'] })
+  await expect(f.workerCall('work_ask_user', { text: '还需要确认吗？' })).rejects.toThrow()
+  expect(f.store.task(task.id)?.state).toBe('completed')
+})
+
+test('同一追问的输入 ID 和原消息 ID 共用一条回复，不能分条规避正文上限', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  decisions.push({ action: 'ask_worker', taskId: task.id, expectedRevision: 1, replyText: '我把当前大纲给你。' })
+  f.send(2, '报告覆盖什么？'); await waitFor(() => f.steers.length === 1)
+  const input = f.store.inputs(task.id)[0]
+  await f.workerCall('work_reply', { replyToInputId: input.id, text: '第一部分：方法。' })
+  await f.workerCall('work_reply', { replyToInputId: input.inboxId, text: '第二部分：局限。' })
+  await waitFor(() => f.sent.includes('第一部分：方法。'))
+  const replies = f.store.replies('bot-a').filter(r => r.purpose === 'answer')
+  expect(replies).toHaveLength(1)
+  expect(replies[0].inputId).toBe(input.inboxId)
+  expect(f.sent).not.toContain('第二部分：局限。')
+})
+
+test('审批在 Worker 关闭期间到达，等旧进程退出后由后继 Worker 执行一次', async () => {
+  const closing = gate()
+  const f = fixture([start], { firstWorkerCloseGate: closing }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]; const oldRun = f.store.runs()[0]
+  const op = await f.workerCall('project_delete_file', { path: 'old.txt' }) as { operationId: string }
+  f.complete(); await waitFor(() => f.workerCloses() > 0)
+  await f.service.approve('bot-a', 'owner', op.operationId, true)
+  expect(f.store.task(task.id)?.state).toBe('queued')
+  expect(f.actions).toEqual([])
+  expect(f.started()).toBe(1)
+  expect(f.steers).toEqual([])
+  closing.release()
+  await waitFor(() => f.started() === 2 && f.actions.length === 1)
+  expect(f.store.runs().find(r => r.id === oldRun.id)?.state).toBe('exited')
+  expect(f.store.task(task.id)?.state).toBe('running')
+  expect(f.store.operation(op.operationId)?.runId).toBe(f.store.task(task.id)?.latestRunId)
+  expect(f.actions).toEqual(['delete_file'])
+})
+
+test('必要答案在 Worker 关闭期间到达，原话留给后继轮次且不向旧轮次 steer', async () => {
+  const closing = gate(); const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { firstWorkerCloseGate: closing }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  const question = await f.workerCall('work_ask_user', { text: '报告面向谁？' }) as { questionId: string }
+  f.complete(); await waitFor(() => f.workerCloses() > 0)
+  decisions.push({ action: 'answer', taskId: task.id, questionId: question.questionId, expectedRevision: 1, replyText: '我会按研究人员的背景来写。' })
+  f.send(2, '面向研究人员，务必保留局限分析')
+  await waitFor(() => f.store.inputs(task.id).length === 1)
+  expect(f.steers).toEqual([])
+  expect(f.store.inputs(task.id)[0].delivery).toBe('pending')
+  expect(f.store.task(task.id)?.state).toBe('queued')
+  closing.release(); await waitFor(() => f.started() === 2)
+  const payload = JSON.parse(f.workerPayloads[1])
+  expect(payload.pendingInputs).toHaveLength(1)
+  expect(payload.pendingInputs[0].text).toBe('面向研究人员，务必保留局限分析')
+  expect(payload.task.revision).toBe(2)
+  expect(f.store.task(task.id)?.state).toBe('running')
+})
+
+test('写入后异常保留真实副作用，未知结果只允许读取，owner 核对后不自动重播', async () => {
+  const f = fixture([start], { runTool: async (tool, _args, dir) => {
+    const path = join(dir, 'report.txt')
+    if (tool === 'edit_file') { writeFileSync(path, '已经写入一次'); throw new Error('写入后执行中断，结果未知') }
+    return readFileSync(path, 'utf8')
+  } })
+  f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  const op = await f.workerCall('project_edit_file', { path: 'report.txt', content: '已经写入一次' }) as { operationId: string }
+  await waitFor(() => f.store.operation(op.operationId)?.state === 'unknown')
+  expect(readFileSync(join(f.dir, 'report.txt'), 'utf8')).toBe('已经写入一次')
+  await expect(f.workerCall('project_edit_file', { path: 'report.txt', content: '重复写入' })).rejects.toThrow(/未知|核对/)
+  const read = await f.workerCall('project_read_file', { path: 'report.txt' }) as { operationId: string }
+  await waitFor(() => f.store.operation(read.operationId)?.state === 'completed')
+  expect(f.store.operation(read.operationId)?.result).toBe('已经写入一次')
+  const request = { action: 'reconcile' as const, taskId: task.id, expectedRevision: 1, requestId: 'resolve-write', operationId: op.operationId, text: '已核对报告文件，当前内容只写入了一次', confirmedStopped: true }
+  await expect(f.service.control('bot-a', 'owner', request)).rejects.toThrow(/停止/)
+  await f.service.control('bot-a', 'owner', { action: 'stop', taskId: task.id, expectedRevision: 1, requestId: 'stop-for-check' })
+  await expect(f.service.control('bot-a', 'other', request)).rejects.toThrow(/owner|创建者/)
+  await expect(f.service.control('bot-a', 'owner', { ...request, confirmedStopped: false })).rejects.toThrow(/停止/)
+  await expect(f.service.control('bot-a', 'owner', { ...request, text: '' })).rejects.toThrow(/核对说明/)
+  await f.service.control('bot-a', 'owner', request)
+  await waitFor(() => f.started() === 2)
+  expect(f.store.operation(op.operationId)?.state).toBe('reconciled')
+  expect(f.store.operation(op.operationId)?.reconciliation?.actor).toBe('owner')
+  expect(f.workerPayloads[1]).toContain(request.text)
+  await expect(f.service.control('bot-a', 'owner', request)).resolves.toHaveProperty('protocol', 1)
+  expect(f.started()).toBe(2)
+  expect(f.actions.filter(a => a === 'edit_file')).toHaveLength(1)
+  expect(readFileSync(join(f.dir, 'report.txt'), 'utf8')).toBe('已经写入一次')
+})
+
+test('重启遗留 Worker 即使没有工具操作，也须 owner 确认旧执行后才能恢复', async () => {
+  let task!: RuntimeTask
+  const f = fixture([], { seed: (store, bot) => {
+    task = seedTask(store, bot)
+    store.saveRun({ id: 'orphan-run', botId: bot.botId, taskId: task.id, state: 'running', threadId: 'orphan-thread', createdAt: Date.now(), updatedAt: Date.now() })
+    store.updateTask(task.id, { state: 'running', latestRunId: 'orphan-run' })
+  } })
+  expect(f.store.task(task.id)?.state).toBe('recovering')
+  expect(f.store.operations()).toEqual([])
+  expect(f.service.view('bot-a', 'owner').recoveries).toEqual([{ taskId: task.id, runIds: ['orphan-run'], canReconcile: true }])
+  const resume = { action: 'resume' as const, taskId: task.id, expectedRevision: 1, requestId: 'resume-orphan' }
+  await expect(f.service.control('bot-a', 'owner', resume)).rejects.toThrow(/旧执行|未知|核对/)
+  // “停止”只能停止本进程实际持有的执行，不能为上次遗留进程作退出证明。
+  await f.service.control('bot-a', 'owner', { ...resume, action: 'stop', requestId: 'stop-orphan' })
+  await expect(f.service.control('bot-a', 'owner', { ...resume, requestId: 'resume-after-stop' })).rejects.toThrow(/旧执行|未知|核对/)
+  expect(f.started()).toBe(0)
+  const reconcile = { ...resume, action: 'reconcile' as const, requestId: 'resolve-orphan', text: '已在本机确认上次 Worker 及其项目命令全部退出', confirmedStopped: true }
+  await expect(f.service.control('bot-a', 'owner', { ...reconcile, confirmedStopped: false })).rejects.toThrow(/停止/)
+  await f.service.control('bot-a', 'owner', reconcile)
+  await waitFor(() => f.started() === 1)
+  expect(f.store.runs().find(r => r.id === 'orphan-run')?.state).toBe('exited')
+  expect(f.store.runs().find(r => r.id === 'orphan-run')?.reconciliation?.note).toBe(reconcile.text)
+  expect(f.service.view('bot-a', 'owner').recoveries).toEqual([])
+  await expect(f.service.control('bot-a', 'owner', reconcile)).resolves.toHaveProperty('protocol', 1)
+  expect(f.started()).toBe(1)
+  expect(f.store.task(task.id)?.latestRunId).not.toBe('orphan-run')
+  expect(f.actions).toEqual([])
+})
+
+test('停止期间到达的审批被拒绝，进程实际关闭前不完成停止且不执行操作', async () => {
+  const closing = gate()
+  const f = fixture([start], { firstWorkerCloseGate: closing }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  const op = await f.workerCall('project_delete_file', { path: 'old.txt' }) as { operationId: string }
+  let stopped = false
+  const stopping = f.service.control('bot-a', 'owner', { action: 'stop', taskId: task.id, expectedRevision: 1, requestId: 'stop-before-approval' }).then(() => { stopped = true })
+  await waitFor(() => f.workerCloses() > 0)
+  expect(stopped).toBe(false)
+  await expect(f.service.approve('bot-a', 'owner', op.operationId, true)).rejects.toThrow()
+  expect(f.store.operation(op.operationId)?.state).toBe('failed')
+  expect(f.actions).toEqual([])
+  closing.release(); await stopping
+  expect(f.store.task(task.id)?.state).toBe('stopped')
+  expect(f.store.runs().every(r => r.state === 'exited')).toBe(true)
+  expect(f.started()).toBe(1)
+})
+
+test('宿主停机时仍在验权的项目调用不得在晚到的验权结果后执行', async () => {
+  const access = gate()
+  const f = fixture([start], { accessGate: access }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const pending = f.workerCall('project_edit_file', { path: 'report.txt', content: '不能落盘' }).then(
+    () => ({ error: undefined }), error => ({ error: error as Error }),
+  )
+  await f.service.close()
+  access.release()
+  const result = await pending
+  expect(result.error?.message).toMatch(/停止|失效/)
+  expect(f.actions).toEqual([])
+  expect(f.store.operations()).toEqual([])
+  expect(f.store.tasks()[0].state).toBe('stopped')
+})
+
+test('必要问题回答成功后重试同一个控制请求，不受旧版本或已清除 question 阻挡', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  const question = await f.workerCall('work_ask_user', { text: '报告面向谁？' }) as { questionId: string }
+  decisions.push({ action: 'answer', taskId: task.id, expectedRevision: 1, questionId: question.questionId, replyText: '我会面向研究人员继续。' })
+  const request = { action: 'answer' as const, taskId: task.id, expectedRevision: 1, questionId: question.questionId, requestId: 'answer-reconnect', text: '研究人员' }
+  await f.service.control('bot-a', 'owner', request)
+  await waitFor(() => f.steers.length === 1)
+  expect(f.store.task(task.id)?.revision).toBe(2)
+  expect(f.store.task(task.id)?.question).toBeUndefined()
+  await expect(f.service.control('bot-a', 'owner', request)).resolves.toHaveProperty('protocol', 1)
+  await expect(f.service.control('bot-a', 'other', request)).rejects.toThrow(/owner|创建者/)
+  expect(f.store.inputs(task.id)).toHaveLength(1)
+  expect(f.steers).toHaveLength(1)
+  expect(f.store.task(task.id)?.revision).toBe(2)
+})
+
+test('Router 查工单只披露有限未处理输入，不把已处理长历史灌入上下文', async () => {
+  let task!: RuntimeTask; let inspected: any
+  const f = fixture([{ action: 'reply', replyText: '我看到了当前处理范围。' }], {
+    seed: (store, bot) => {
+      task = seedTask(store, bot)
+      for (let i = 0; i < 20; i++) {
+        const message = store.receive({ botId: bot.botId, groupId: bot.groupId, seq: i + 2, text: `补充 ${i}：${'材料'.repeat(1000)}`, senderId: bot.ownerPhoneId, memberId: 'member-owner', createdAt: Date.now() })
+        const input = store.acceptInput({ inputId: message.id, taskId: task.id, expectedRevision: i + 1, kind: 'append', replyText: '范围明确。' })
+        if (i < 15) { store.consumeInput(input.id, task.id); store.resolveInput(input.id, task.id, '历史详细结论'.repeat(1000)) }
+      }
+    },
+    routerReads: async call => { inspected = await call('task_inspect', { taskId: task.id }) },
+  })
+  f.send(30, '当前任务是什么？'); await waitFor(() => inspected !== undefined)
+  expect(JSON.stringify(inspected).length).toBeLessThanOrEqual(4000)
+  expect(inspected.inputs).toHaveLength(3)
+  expect(inspected.inputs.map((i: { text: string }) => i.text)).toEqual(expect.arrayContaining([expect.stringContaining('补充 17'), expect.stringContaining('补充 18'), expect.stringContaining('补充 19')]))
+  expect(JSON.stringify(inspected)).not.toContain('历史详细结论')
+})
+
+test('Router 渐进式经验查询既限制单次内容，也限制本轮累计内容', async () => {
+  const results: unknown[] = []; const errors: string[] = []
+  const f = fixture([{ action: 'reply', replyText: '我会根据已读取的经验判断。' }], {
+    seed: (store, bot) => store.saveSettings({ ...store.settings(bot.botId), experiences: [
+      { id: 'small', summary: '摘要', detail: '验'.repeat(2900), source: '本地测试', active: true },
+      { id: 'large', summary: '摘要', detail: '验'.repeat(5000), source: '本地测试', active: true },
+    ] }),
+    routerReads: async call => {
+      for (const experienceId of ['large', 'small', 'small', 'small']) {
+        try { results.push(await call('experience_read', { experienceId })) }
+        catch (error) { errors.push((error as Error).message) }
+      }
+    },
+  })
+  f.send(1, '以前有类似经验吗？'); await waitFor(() => f.sent.length === 1)
+  expect(results).toHaveLength(2)
+  expect(errors).toHaveLength(2)
+  expect(errors.every(error => error.includes('内容预算'))).toBe(true)
+  expect(results.reduce<number>((sum, value) => sum + JSON.stringify(value).length, 0)).toBeLessThanOrEqual(8000)
+})

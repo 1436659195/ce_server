@@ -1,0 +1,82 @@
+import { afterEach, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { ChatHub } from '../src/cli/chat'
+import { BotRuntimeService } from '../src/cli/bot-runtime/service'
+import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
+import { seal, open } from '../src/shared/crypto'
+import { createHash } from 'node:crypto'
+import { writeFileSync } from 'node:fs'
+import type { GroupEnvelope } from '../src/shared/group'
+
+const cleanups: Array<() => Promise<void>> = []
+afterEach(async () => { for (const f of cleanups.splice(0)) await f() })
+async function fixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-runtime-rpc-'))
+  const key = new Uint8Array(32).fill(7); let legacyRuns = 0
+  const posted: any[] = []
+  let chat: ChatHub
+  const members = [{ memberId: 'owner-member', phoneId: 'owner', name: 'Owner', human: true }, { memberId: 'other-member', phoneId: 'other', name: 'Other', human: true }]
+  chat = new ChatHub({ cid: 'machine', privKey: new Uint8Array(32), pubKey: new Uint8Array(32), statePath: join(dir, 'chat.json'), rootDir: dir, procLister: () => [], botCliAvailable: async () => true, rosterSessions: async () => ({ terminals: [{ name: 'term-source', cwd: dir }], agentSessions: [] }), runBot: async () => { legacyRuns++; return { text: 'legacy' } }, commandSandbox: () => true,
+    sendEnvelope: (env: GroupEnvelope) => queueMicrotask(() => {
+      if (env.op === 'group-post') posted.push(JSON.parse(new TextDecoder().decode(open(key, Buffer.from((env.payload as any).ct, 'base64')))))
+      const p = env.payload as Record<string, unknown>; const gid = String(env.groupId ?? p.inviteCode)
+      chat.onEnvelope({ op: 'group-result', payload: { reqId: env.reqId, ok: true, data: env.op === 'group-join' ? { groupId: gid, snapshot: { seq: 0, meta: { name: '私聊·Test', createdBy: 'owner', createdAt: 0 }, members: [...members, { memberId: 'bot', ...(p.member as object) }] } } : { meta: { createdBy: 'owner', createdAt: 0 }, members, msgs: [], seq: 0 } } })
+    }),
+  })
+  chat.setKey('dm', Buffer.from(key).toString('base64')); chat.setKey('team', Buffer.from(key).toString('base64'))
+  await chat.addAgent({ code: 'dm', name: 'Test', groupId: 'dm', platform: 'codex', sourceSessionId: 'term-source', botProtocol: 1, botPolicyProtocol: 1, permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'allow', execute: 'allow', commanders: 'members', allowedPhoneIds: [] } }, 'owner')
+  await chat.addAgent({ code: 'team', name: 'Test', groupId: 'team', platform: 'codex', sourceSessionId: 'term-source', botProtocol: 1 }, 'owner')
+  const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
+  const runtime = new BotRuntimeService({ routerQuietMs: 0, store, rootDir: dir, getBot: name => chat.runtimeBot(name), sendReply: reply => chat.sendRuntimeReply(reply), checkAccess: (bot, memberId, op) => chat.checkRuntimeAccess(bot.botId, memberId, op), openTools: () => { throw new Error('not used') }, createClient: () => ({ initialize: async () => {}, startThread: async () => { throw new Error('model disabled in RPC test') }, resumeThread: async () => 'x', startTurn: async () => { throw new Error('not used') }, steer: async () => 'x', interrupt: async () => {}, close: async () => {} }) })
+  chat.attachBotRuntime(runtime)
+  cleanups.push(async () => { await runtime.close(); store.close(); rmSync(dir, { recursive: true, force: true }) })
+  const message = (seq: number, groupId = 'dm', memberId = 'owner-member', body: object = { text: '你好' }) => chat.onEnvelope({ op: 'group-msg', groupId, payload: { seq, ts: Date.now(), from: { memberId, name: 'Owner', human: true }, ct: Buffer.from(seal(key, new TextEncoder().encode(JSON.stringify({ kind: 'text', ...body })))).toString('base64') } })
+  return { chat, runtime, store, message, dir, posted, legacyRuns: () => legacyRuns }
+}
+test('runtime 管理只允许真实 owner，Bot ID 持久且切换后群入口不能走旧执行链', async () => {
+  const f = await fixture()
+  expect((await f.chat.botRuntime('Test', 'other')).ok).toBe(false)
+  const before = await f.chat.botRuntime('Test', 'owner')
+  expect(before).toMatchObject({ ok: true, data: { settings: { mode: 'legacy', revision: 0 } } })
+  expect((await f.chat.botRuntimeUpdate('Test', 'owner', 0, { mode: 'router-worker' })).ok).toBe(true)
+  const botId = f.chat.runtimeBot('Test').botId
+  expect(f.chat.runtimeBot(botId).botId).toBe(botId)
+  f.message(1, 'dm'); f.message(1, 'team'); f.message(2, 'dm', 'other-member')
+  await Bun.sleep(50)
+  expect(f.legacyRuns()).toBe(0)
+  expect(f.store.messages(botId)).toHaveLength(1)
+})
+
+test('附件 RPC 校验连接 owner；无文字的附件消息也持久进入 Runtime', async () => {
+  const f = await fixture()
+  await f.chat.botRuntimeUpdate('Test', 'owner', 0, { mode: 'router-worker' })
+  const begin = { action: 'begin' as const, requestId: 'file-1', name: 'input.txt', size: 5, mime: 'text/plain' }
+  expect(f.chat.botUpload('Test', 'other', begin).ok).toBe(false)
+  const upload = f.chat.botUpload('Test', 'owner', begin).data as { id: string }
+  f.chat.botUpload('Test', 'owner', { action: 'chunk', uploadId: upload.id, offset: 0, data: Buffer.from('hello').toString('base64') })
+  const attachment = f.chat.botUpload('Test', 'owner', { action: 'finish', uploadId: upload.id, hash: createHash('sha256').update('hello').digest('hex') }).data
+  f.message(1, 'dm', 'owner-member', { text: '', attachments: [attachment] })
+  await Bun.sleep(50)
+  expect(f.store.messages(f.chat.runtimeBot('Test').botId)[0].attachments).toMatchObject([{ name: 'input.txt' }])
+  expect(f.chat.botAttachment('Test', 'other', { id: upload.id, kind: 'upload' }, 0, 10).ok).toBe(false)
+  expect(f.chat.botAttachment('Test', 'owner', { id: upload.id, kind: 'upload' }, 0, 10)).toMatchObject({ ok: true, data: { data: Buffer.from('hello').toString('base64') } })
+})
+
+test('Worker 回复的成果引用与正文一起加密发送，不把本地路径或文件字节放进群消息', async () => {
+  const f = await fixture()
+  await f.chat.botRuntimeUpdate('Test', 'owner', 0, { mode: 'router-worker' })
+  const bot = f.chat.runtimeBot('Test')
+  const input = f.store.receive({ botId: bot.botId, groupId: 'dm', seq: 100, senderId: 'owner', memberId: 'owner-member', text: '写报告', createdAt: Date.now() })
+  const task = f.store.acceptWork({ inputId: input.id, newCase: { title: '报告', object: '报告', goal: '报告' }, goal: '写报告', acceptance: [], mandate: { ownerPhoneId: 'owner', policyRevision: bot.policyRevision, directory: bot.directory, allowedOps: ['read'], exclusions: [], mode: 'execute' }, replyText: '开始整理。' })
+  f.store.cancelReplies(bot.botId)
+  f.store.updateTask(task.id, { state: 'running' })
+  const path = join(f.dir, 'report.html'); const content = '<h1>完整报告</h1>'; writeFileSync(path, content)
+  f.store.saveArtifact({ id: 'artifact-report', botId: bot.botId, caseId: task.caseId, taskId: task.id, path, title: '报告', name: 'report.html', mime: 'text/html', size: Buffer.byteLength(content), hash: createHash('sha256').update(content).digest('hex'), revision: 1, createdAt: Date.now() })
+  f.store.finishTask(task.id, 1, '报告在附件中。', ['artifact-report'])
+  await f.chat.sendRuntimeReply(f.store.pendingReplies(bot.botId)[0])
+  expect(f.posted[0]).toMatchObject({ text: '报告在附件中。', attachments: [{ id: 'artifact-report', kind: 'artifact', name: 'report.html' }] })
+  expect(JSON.stringify(f.posted)).not.toContain(path)
+  expect(JSON.stringify(f.posted)).not.toContain(content)
+})

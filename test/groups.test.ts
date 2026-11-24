@@ -5,8 +5,12 @@
  *       邀请三态、重名拒/reclaim、reclaim 活跃卫兵、跨机冒名拒、群钥槽(在线转发/离线暂存)、持久化回放。
  */
 import { test, expect } from 'bun:test'
+import { mkdirSync, mkdtempSync, renameSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { generateKeyPair, seal, open, sharedSecret } from '../src/shared/crypto'
 import { GroupRegistry, type GroupRegistryCtx } from '../src/relay/groups'
+import { Hub } from '../src/relay/hub'
 import type { GroupEnvelope, GroupMember, GroupResult, GroupStoredMsg } from '../src/shared/group'
 
 // ─── 假件 ──────────────────────────────────────────────────────────────────
@@ -29,13 +33,13 @@ class FakeWS {
 
 type MetaMap = Map<FakeWS, { role: 'cli' | 'phone' | 'guest'; phoneId?: string; cid?: string }>
 
-function makeRegistry(load?: () => string | null): { reg: GroupRegistry; saved: string[] } {
+function makeRegistry(load?: () => string | null, beforeSave?: (plain: string) => void): { reg: GroupRegistry; saved: string[] } {
   const saved: string[] = []
   const ctx: GroupRegistryCtx = {
     meta: (ws) => (reg as unknown as { __meta?: MetaMap }).__meta?.get(ws as FakeWS),
     send: (ws, data) => (ws as FakeWS).send(data),
     loadState: load ?? (() => null),
-    saveState: (plain) => saved.push(plain),
+    saveState: (plain) => { beforeSave?.(plain); saved.push(plain) },
   }
   const reg = new GroupRegistry(ctx)
   return { reg, saved }
@@ -448,6 +452,159 @@ test('resolveAgentSeat:未 pair/绑定校验/跨成员拒', () => {
   expect(reg.resolveAgentSeat(code, 'm_别的成员').ok).toBe(false)
 })
 
+test('外部接入码撤销仅群主可做，未使用和重复撤销幂等，重启后不能配对', () => {
+  const { reg, saved } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const { groupId } = createAndInvite(reg, phone)
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'code', payload: { groupId } }))
+  const code = ((phone.last().payload as GroupResult).data as { code: string }).code
+  const other = new FakeWS('other'); bind(reg, other, { role: 'phone', phoneId: 'ph_other' })
+  reg.handle(other, JSON.stringify({ op: 'group-agent-code-revoke', groupId, reqId: 'bad', payload: { groupId, code } }))
+  expect((other.last().payload as GroupResult).ok).toBe(false)
+  expect(reg.guestHelloAgent(code, '可接入', 'claude', new FakeWS('allowed')).ok).toBe(true)
+  for (let i = 0; i < 2; i++) {
+    reg.handle(phone, JSON.stringify({ op: 'group-agent-code-revoke', groupId, reqId: `revoke${i}`, payload: { groupId, code } }))
+    expect(phone.last().payload).toMatchObject({ ok: true, data: { revoked: true } })
+  }
+  const restored = makeRegistry(() => saved.at(-1)!).reg
+  expect(restored.guestHelloAgent(code, '可接入', 'claude', new FakeWS('denied')).ok).toBe(false)
+  expect(restored.resolveAgentSeat(code).ok).toBe(false)
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'unused', payload: { groupId } }))
+  const unused = ((phone.last().payload as GroupResult).data as { code: string }).code
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-revoke', groupId, reqId: 'unused-revoke', payload: { groupId, code: unused } }))
+  expect(reg.guestHelloAgent(unused, '未入房', undefined, new FakeWS('unused')).ok).toBe(false)
+})
+
+test('撤销已配对员工清理所有在线身份，禁止冒认其他访客，保留历史和同连接其他房间', () => {
+  const { reg } = makeRegistry()
+  const phone = new FakeWS('phone')
+  const { groupId } = createAndInvite(reg, phone)
+  const issue = (gid: string) => {
+    reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId: gid, reqId: 'issue', payload: { groupId: gid } }))
+    return ((phone.last().payload as GroupResult).data as { code: string }).code
+  }
+  const code = issue(groupId)
+  const worker = new FakeWS('worker'), duplicate = new FakeWS('duplicate'), peer = new FakeWS('peer')
+  for (const ws of [worker, duplicate, peer]) bind(reg, ws, { role: 'guest' })
+  const seat = reg.guestHelloAgent(code, '外部员工', 'claude', worker)
+  expect(seat.ok).toBe(true); if (!seat.ok) return
+  reg.guestHelloAgent(code, '外部员工', 'claude', duplicate)
+  const peerSeat = reg.guestHelloAgent(issue(groupId), '另一个员工', 'codex', peer)
+  expect(peerSeat.ok).toBe(true); if (!peerSeat.ok) return
+  reg.handle(worker, JSON.stringify({ op: 'group-post', groupId, reqId: 'post', payload: { memberId: seat.memberId, ct: 'RETAINED', readUpTo: 0 } }))
+  expect((worker.last().payload as GroupResult).ok).toBe(true)
+  const otherGroup = createAndInvite(reg, phone, '第二个房间').groupId
+  const otherSeat = reg.guestHelloAgent(issue(otherGroup), '另一间身份', 'claude', worker)
+  expect(otherSeat.ok).toBe(true); if (!otherSeat.ok) return
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-revoke', groupId, reqId: 'revoke', payload: { groupId, code } }))
+  expect(phone.last().payload).toMatchObject({ ok: true, data: { revoked: true } })
+  expect(reg.resolveAgentSeat(code, seat.memberId).ok).toBe(false)
+  const before = worker.sent.length, duplicateBefore = duplicate.sent.length
+  reg.handle(phone, JSON.stringify({ op: 'group-post', groupId, reqId: 'new', payload: { ct: 'AFTER-REVOKE', readUpTo: 1 } }))
+  expect(worker.sent.length).toBe(before); expect(duplicate.sent.length).toBe(duplicateBefore)
+  for (const ws of [worker, duplicate]) {
+    for (const memberId of [seat.memberId, peerSeat.memberId]) {
+      reg.handle(ws, JSON.stringify({ op: 'group-sync', groupId, reqId: 'spoof', payload: { memberId, afterSeq: 0 } }))
+      expect(ws.last().payload).toMatchObject({ ok: false, error: { code: 'not_member' } })
+    }
+  }
+  reg.handle(worker, JSON.stringify({ op: 'group-sync', groupId: otherGroup, reqId: 'other', payload: { memberId: otherSeat.memberId, afterSeq: 0 } }))
+  expect((worker.last().payload as GroupResult).ok).toBe(true)
+  reg.handle(phone, JSON.stringify({ op: 'group-sync', groupId, reqId: 'history', payload: { afterSeq: 0 } }))
+  const data = (phone.last().payload as GroupResult).data as { msgs: GroupStoredMsg[]; members: GroupMember[] }
+  expect(data.msgs[0].ct).toBe('RETAINED')
+  expect(data.members.some(m => m.memberId === seat.memberId)).toBe(false)
+  expect(peer.sent.map((_, i) => peer.env(i)).some(e => e.op === 'group-meta' && (e.payload as { event?: string; member?: GroupMember }).event === 'member-left' && (e.payload as { member?: GroupMember }).member?.memberId === seat.memberId)).toBe(true)
+})
+
+test('撤销落盘失败明确报错且继续阻断当前访问，重试完成持久化', () => {
+  let failSave = false
+  const { reg, saved } = makeRegistry(undefined, () => { if (failSave) throw new Error('disk unavailable') })
+  const phone = new FakeWS('phone')
+  const { groupId } = createAndInvite(reg, phone)
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-set', groupId, reqId: 'issue' }))
+  const code = ((phone.last().payload as GroupResult).data as { code: string }).code
+  failSave = true
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-revoke', groupId, reqId: 'fail', payload: { groupId, code } }))
+  expect(phone.last().payload).toMatchObject({ ok: false, error: { code: 'storage_error' } })
+  expect(reg.guestHelloAgent(code, '已阻断', undefined, new FakeWS('blocked')).ok).toBe(false)
+  failSave = false
+  reg.handle(phone, JSON.stringify({ op: 'group-agent-code-revoke', groupId, reqId: 'retry', payload: { groupId, code } }))
+  expect(phone.last().payload).toMatchObject({ ok: true, data: { revoked: true } })
+  expect(makeRegistry(() => saved.at(-1)!).reg.guestHelloAgent(code, '已阻断', undefined, new FakeWS('blocked-after-restart')).ok).toBe(false)
+})
+
+test('退群落盘失败不广播或假成功，内存已移除后的重试持久成功才补成员离开事件', () => {
+  let failSave = false
+  const { reg, saved } = makeRegistry(undefined, () => { if (failSave) throw new Error('disk unavailable') })
+  const phone = new FakeWS('phone'), cli = new FakeWS('cli')
+  const { groupId, code } = createAndInvite(reg, phone)
+  bind(reg, cli, { role: 'cli', cid: 'machine' })
+  reg.handle(cli, JSON.stringify({ op: 'group-join', reqId: 'join', payload: { inviteCode: code, member: { name: '待注销员工' } } }))
+  const snapshot = (cli.last().payload as GroupResult).data as { snapshot: { members: GroupMember[] } }
+  const memberId = snapshot.snapshot.members.find(m => m.name === '待注销员工')!.memberId
+  const leftEvents = () => phone.sent.map((_, i) => phone.env(i)).filter(e => e.op === 'group-meta' && (e.payload as { event: string }).event === 'member-left')
+  const leave = () => reg.handle(cli, JSON.stringify({ op: 'group-leave', groupId, reqId: 'leave', payload: { groupId, memberId } }))
+  failSave = true
+  for (let i = 0; i < 2; i++) {
+    leave()
+    expect(cli.last().payload).toMatchObject({ ok: false, error: { code: 'storage_error' } })
+    expect(leftEvents()).toHaveLength(0)
+  }
+  // 磁盘仍有旧成员，重启后仍需退群；不能已在 ce 侧清掉重试记录。
+  const restored = makeRegistry(() => saved.at(-1)!).reg
+  bind(restored, phone, { role: 'phone', phoneId: 'ph_1' })
+  restored.handle(phone, JSON.stringify({ op: 'group-sync', groupId, reqId: 'disk-before', payload: { afterSeq: 0 } }))
+  expect(((phone.last().payload as GroupResult).data as { members: GroupMember[] }).members.some(m => m.memberId === memberId)).toBe(true)
+  failSave = false
+  leave()
+  expect((cli.last().payload as GroupResult).ok).toBe(true)
+  expect(leftEvents()).toHaveLength(1)
+  expect((leftEvents()[0].payload as { member: GroupMember }).member.memberId).toBe(memberId)
+  // 完全不在内存的重试也需确认当前状态已落盘，不能把 storage_error 降成 not_member。
+  failSave = true; leave()
+  expect(cli.last().payload).toMatchObject({ ok: false, error: { code: 'storage_error' } })
+  failSave = false; leave()
+  expect(cli.last().payload).toMatchObject({ ok: false, error: { code: 'not_member' } })
+  expect(leftEvents()).toHaveLength(1)
+})
+
+test('真实 Hub 退群写盘失败保持可重试，恢复磁盘后保存且重启不会复活成员', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ce-leave-disk-'))
+  try {
+    const groupFile = join(dir, 'groups.json'), backup = join(dir, 'groups-before.json')
+    const hub = new Hub(join(dir, 'state.json'), 100, null, groupFile)
+    const phone = new FakeWS('phone'), cli = new FakeWS('cli')
+    const { sid, token } = hub.register('machine', cli)
+    expect(hub.joinPhone(sid, token, phone, 'ph_1')).toBe(true)
+    const reg = hub.groups!
+    const { groupId, code } = createAndInvite(reg, phone)
+    reg.handle(cli, JSON.stringify({ op: 'group-join', reqId: 'join', payload: { inviteCode: code, member: { name: '待注销员工' } } }))
+    const data = (cli.last().payload as GroupResult).data as { snapshot: { members: GroupMember[] } }
+    const memberId = data.snapshot.members.find(m => m.name === '待注销员工')!.memberId
+    renameSync(groupFile, backup); mkdirSync(groupFile)
+    const leave = () => reg.handle(cli, JSON.stringify({ op: 'group-leave', groupId, reqId: 'leave', payload: { groupId, memberId } }))
+    leave()
+    expect(cli.last().payload).toMatchObject({ ok: false, error: { code: 'storage_error' } })
+    expect(phone.sent.map((_, i) => phone.env(i)).some(e => e.op === 'group-meta' && (e.payload as { event: string }).event === 'member-left')).toBe(false)
+    const stale = new Hub(join(dir, 'state.json'), 100, null, backup)
+    const staleCli = new FakeWS('stale'), stalePhone = new FakeWS('stale-phone')
+    const staleConn = stale.register('machine', staleCli)
+    stale.joinPhone(staleConn.sid, staleConn.token, stalePhone, 'ph_1')
+    stale.groups!.handle(stalePhone, JSON.stringify({ op: 'group-sync', groupId, reqId: 'stale', payload: { afterSeq: 0 } }))
+    expect(((stalePhone.last().payload as GroupResult).data as { members: GroupMember[] }).members.some(m => m.memberId === memberId)).toBe(true)
+    rmSync(groupFile, { recursive: true }); renameSync(backup, groupFile)
+    leave()
+    expect((cli.last().payload as GroupResult).ok).toBe(true)
+    const reloaded = new Hub(join(dir, 'state.json'), 100, null, groupFile)
+    const newCli = new FakeWS('new-cli'), newPhone = new FakeWS('new-phone')
+    const conn = reloaded.register('machine', newCli)
+    reloaded.joinPhone(conn.sid, conn.token, newPhone, 'ph_1')
+    reloaded.groups!.handle(newPhone, JSON.stringify({ op: 'group-sync', groupId, reqId: 'new', payload: { afterSeq: 0 } }))
+    expect(((newPhone.last().payload as GroupResult).data as { members: GroupMember[] }).members.some(m => m.memberId === memberId)).toBe(false)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('sync 应答随行成员名单(2026-11-20:掉线错过 member-joined 的自愈路)', () => {
   const { reg } = makeRegistry()
   const phone = new FakeWS('phone')
@@ -461,6 +618,8 @@ test('sync 应答随行成员名单(2026-11-20:掉线错过 member-joined 的自
   const members = (r.data as { members?: Array<{ name: string }> }).members ?? []
   expect(members.some((m) => m.name === '客座CC')).toBe(true)
   expect(members.some((m) => m.name === '主人')).toBe(true)
+  expect((r.data as { meta: { createdBy: string; createdAt: number } }).meta).toMatchObject({ createdBy: 'ph_1' })
+  expect((r.data as { meta: { createdAt: number } }).meta.createdAt).toBeGreaterThan(0)
 })
 
 test('心跳(markRead:false)不刷 lastSeenAt —— reclaim 卫兵不被 daemon 心跳污染', () => {

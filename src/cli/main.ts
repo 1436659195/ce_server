@@ -46,7 +46,13 @@ import { ensureJupyter, promptUnanswerable, type JupyterInstallDeps } from './ju
 import { resolvePythonBin } from './python'
 import { runConsole } from './console'
 import { installWorkshop, defaultWorkshopRoot, resolveWorkshopDir } from './workshop'
-import { ChatHub, type HireQuota } from './chat'
+import { ChatHub } from './chat'
+import { BotToolService, runBotToolBridge } from './bot-tools'
+import { BotRuntimeStore } from './bot-runtime/store'
+import { BotRuntimeService, type RuntimeControl } from './bot-runtime/service'
+import type { RuntimeAttachment, RuntimeSettings, RuntimeUploadRequest } from './bot-runtime/types'
+import { commandSandboxAvailable } from './bot-command-sandbox'
+import type { BotPermissions } from './bot-permissions'
 import { runChatCli } from './chat-cli'
 import { renderQr } from './qr'
 import { rotateLogIfBig } from './log'
@@ -603,11 +609,23 @@ async function main(): Promise<void> {
     cwd: root, // jupyter root_dir(OS 路径):CC 对话 cwd 的 base,手机传的相对路径相对它拼
   })
   let qrPrinted = false
-  const chatHub = new ChatHub({
+  const commandSandbox = await commandSandboxAvailable()
+  let botToolEndpoint = ''
+  const botTools: BotToolService = new BotToolService({
+    endpoint: () => botToolEndpoint,
+    authorize: (context, operation, summary) => chatHub.authorizeBotTool(context, operation, summary),
+  })
+  const chatHub: ChatHub = new ChatHub({
     cid,
     privKey: identity.privateKey,
     pubKey: identity.publicKey,
     statePath: join(homedir(), '.ce', 'chat-state.json'),
+    rootDir: root,
+    botCliPaths: { claude: claudeBin ?? undefined },
+    people: () => loadPaired().map(person => ({ phoneId: person.id, name: person.name })),
+    commandSandbox: () => commandSandbox,
+    openBotTools: context => botTools.open(context),
+    onBotPolicyChanged: name => botTools.revoke(name),
     sendEnvelope: (env) => sendFrame({ type: FrameType.GroupFrame, payload: enc.encode(JSON.stringify(env)) }),
     // roster 数据源:本机会话表(jupyter 终端 + ce 管辖的 agent 会话;识别判定链在 ChatHub)
     rosterSessions: async () => {
@@ -622,6 +640,28 @@ async function main(): Promise<void> {
     },
     agentRunner,
   })
+  const botRuntimeStore = new BotRuntimeStore(join(homedir(), '.ce', 'bot-runtime.sqlite'))
+  const botRuntime = new BotRuntimeService({
+    store: botRuntimeStore, rootDir: join(homedir(), '.ce'),
+    claudeExecutable: claudeBin ?? undefined,
+    getBot: nameOrId => chatHub.runtimeBot(nameOrId),
+    sendReply: reply => chatHub.sendRuntimeReply(reply),
+    checkAccess: (bot, memberId, operation) => chatHub.checkRuntimeAccess(bot.botId, memberId, operation),
+    openTools: (bot, memberId, authorize) => {
+      // 每个具体操作一个短期凭据；模型不可见，取消时立即撤销。
+      const grant = botTools.open({ name: bot.name, groupId: bot.groupId, memberId, requesterName: bot.name }, (_context, operation, summary) => authorize(operation, summary))
+      return { call: (tool, args) => botTools.call(grant.connection.token, tool, args), close: () => grant.close() }
+    },
+  })
+  chatHub.attachBotRuntime(botRuntime)
+  let shuttingDownRuntime = false
+  const stopRuntime = () => {
+    if (shuttingDownRuntime) return
+    shuttingDownRuntime = true
+    void botRuntime.close().finally(() => { botRuntimeStore.close(); process.exit(0) })
+  }
+  process.once('SIGINT', stopRuntime)
+  process.once('SIGTERM', stopRuntime)
   let reconnectDelay = 2000
 
   // ── CC 移动审查楔子(M25 通用审批 + M26 CC hooks 本地接收器)───────────────────────
@@ -785,6 +825,7 @@ async function main(): Promise<void> {
       async fetch(req) {
         const url = new URL(req.url)
         if (url.pathname.startsWith('/control/')) return controlRoute(req, url)
+        if (url.pathname === '/bot/tool') return botTools.handle(req)
         if (url.pathname === '/chat/op' && req.method === 'POST') {
           // ce chat 薄 CLI 入口(仅 127.0.0.1 可达,与 /hook 同一收口):参数形状见 chat.ts localOp
           try {
@@ -813,6 +854,7 @@ async function main(): Promise<void> {
     })
     const hookPort = hookServer.port
     if (hookPort !== undefined) {
+      botToolEndpoint = `http://127.0.0.1:${hookPort}/bot/tool`
       console.log(`[ce] CC hooks 接收器监听 127.0.0.1:${hookPort}(PreToolUse 审批 / PostToolUse 转发)`)
       writeCcSettings(hookPort)
       // 记 daemon 元信息:控制台据此发现并连上控制端点;退出时清理(避免留 stale 指向)。
@@ -1479,12 +1521,39 @@ async function main(): Promise<void> {
             resp = { ok: true, data: await chatHub.roster() }
           } else if (req.op === 'chat.hireSetup') {
             // 雇佣开门(2026-11-19 雇佣网关):用邀请码本地 join 入雇佣房间 + 记配额账本
-            const q = req as { code?: string; name?: string; quota?: HireQuota }
-            resp = await chatHub.hireSetup({ code: q.code ?? '', name: q.name ?? '', quota: q.quota })
+            const q = req as Partial<Parameters<ChatHub['hireSetup']>[0]>
+            resp = await chatHub.hireSetup({ ...q, code: q.code ?? '', name: q.name ?? '' }, srcPhone)
           } else if (req.op === 'chat.addAgent') {
-            // 声明式拉人(2026-11-20):手机声明工作路径+CLI → daemon 本地 join(twin 通道;当前仅 Claude Code)
-            const q = req as { code?: string; name?: string; cwd?: string; platform?: string }
-            resp = await chatHub.addAgent({ code: q.code ?? '', name: q.name ?? '', cwd: q.cwd ?? '', platform: q.platform })
+            // BOT 接入:精确来源、幂等入群、Claude/Codex 独立聊天；旧调用仍兼容声明式成员。
+            const q = req as Partial<Parameters<ChatHub['addAgent']>[0]>
+            resp = await chatHub.addAgent({ ...q, code: q.code ?? '', name: q.name ?? '' }, srcPhone)
+          } else if (req.op === 'chat.botRuntime' || req.op === 'chat.botWork') {
+            const q = req as { name?: string; botId?: string }
+            resp = await chatHub.botRuntime(q.botId ?? q.name ?? '', srcPhone)
+          } else if (req.op === 'chat.botRuntimeUpdate') {
+            const q = req as { name?: string; botId?: string; expectedRevision?: number; patch?: Partial<Pick<RuntimeSettings, 'mode' | 'profile' | 'model'>> }
+            resp = await chatHub.botRuntimeUpdate(q.botId ?? q.name ?? '', srcPhone, q.expectedRevision ?? -1, q.patch ?? {})
+          } else if (req.op === 'chat.botWorkControl') {
+            const q = req as { name?: string; botId?: string; control?: RuntimeControl }
+            resp = q.control ? await chatHub.botWorkControl(q.botId ?? q.name ?? '', srcPhone, q.control) : { ok: false, error: '缺少任务控制参数' }
+          } else if (req.op === 'chat.botUpload') {
+            const q = req as { name?: string; botId?: string; request?: RuntimeUploadRequest }
+            resp = q.request ? chatHub.botUpload(q.botId ?? q.name ?? '', srcPhone, q.request) : { ok: false, error: '缺少附件上传参数' }
+          } else if (req.op === 'chat.botAttachment') {
+            const q = req as { name?: string; botId?: string; attachment?: Pick<RuntimeAttachment, 'id' | 'kind'>; offset?: number; length?: number }
+            resp = q.attachment ? chatHub.botAttachment(q.botId ?? q.name ?? '', srcPhone, q.attachment, q.offset ?? 0, q.length ?? 262144) : { ok: false, error: '缺少附件引用' }
+          } else if (req.op === 'chat.botArtifact') {
+            const q = req as { name?: string; botId?: string; artifactId?: string }
+            resp = chatHub.botArtifact(q.botId ?? q.name ?? '', srcPhone, q.artifactId ?? '')
+          } else if (req.op === 'chat.botPolicy') {
+            const q = req as { name?: string; permissions?: BotPermissions }
+            resp = await chatHub.botPolicy(q.name ?? '', srcPhone, q.permissions)
+          } else if (req.op === 'chat.botRetire') {
+            const q = req as { name?: string }
+            resp = await chatHub.botRetire(q.name ?? '', srcPhone)
+          } else if (req.op === 'chat.botApprove') {
+            const q = req as { name?: string; approvalId?: string; allow?: boolean }
+            resp = await chatHub.botApprove(q.name ?? '', srcPhone, q.approvalId ?? '', q.allow === true)
           } else if (req.op === 'chat.hireStatus') {
             // 雇佣账本一览(手机雇佣页展示额度/用量)
             resp = chatHub.hireStatus()
@@ -1647,7 +1716,12 @@ async function main(): Promise<void> {
 // (main);否则跑控制台 TUI(console.ts)。
 // daemon 加全局错误兜底:小意外记日志不退,严重错误退出(由控制台/系统拉起)+清 stale daemon.json。
 const wsFlag = process.argv.find((a) => a === '--workshop' || a.startsWith('--workshop='))
-if (process.argv[2] === 'chat') {
+if (process.argv.includes('--bot-tools')) {
+  runBotToolBridge(process.env.CE_BOT_TOOLS_ENDPOINT ?? '', process.env.CE_BOT_TOOLS_TOKEN ?? '').catch(() => {
+    console.error('[ce bot] 工具桥接启动失败')
+    process.exit(1)
+  })
+} else if (process.argv[2] === 'chat') {
   runChatCli(process.argv.slice(3)).catch((e) => {
     console.error('[ce chat]', (e as Error).message)
     process.exit(1)

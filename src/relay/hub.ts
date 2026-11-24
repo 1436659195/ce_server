@@ -138,12 +138,9 @@ export class Hub {
               }
             },
             saveState: (plain) => {
-              try {
-                writeFileSync(groupsPath!, encryptState(plain, this.stateKey))
-                chmodSync(groupsPath!, 0o600)
-              } catch {
-                /* 写失败 → 忽略(内存有效) */
-              }
+              // GroupRegistry 统一捕获；撤销接入等操作需要明确确认已落盘。
+              writeFileSync(groupsPath!, encryptState(plain, this.stateKey))
+              chmodSync(groupsPath!, 0o600)
             },
           })
         : null
