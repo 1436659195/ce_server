@@ -116,7 +116,7 @@ export class BotAttachmentFiles {
     for (const ref of refs) this.store.saveUpload({ ...this.upload(bot, actor, ref.id), claimed: true })
     return refs
   }
-  bytes(bot: RuntimeBot, actor: string, ref: Pick<RuntimeAttachment, 'id' | 'kind'>): { attachment: RuntimeAttachment; bytes: Buffer } {
+  bytes(bot: RuntimeBot, actor: string, ref: Pick<RuntimeAttachment, 'id' | 'kind'>): { attachment: RuntimeAttachment; bytes: Buffer; path: string } {
     this.owner(bot, actor)
     let path: string; let attachment: RuntimeAttachment
     if (ref.kind === 'upload') {
@@ -129,7 +129,7 @@ export class BotAttachmentFiles {
     } else throw new Error('附件引用无效')
     const bytes = readFileSync(path)
     if (bytes.length !== attachment.size || sha256(bytes) !== attachment.hash) throw new Error('附件快照已改变，请重新上传或生成')
-    return { attachment, bytes }
+    return { attachment, bytes, path }
   }
   read(bot: RuntimeBot, actor: string, ref: Pick<RuntimeAttachment, 'id' | 'kind'>, offset: number, length: number): { data: string; bytes: number; totalSize: number; eof: boolean } {
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1 || length > 524286) throw new Error('附件读取范围无效')

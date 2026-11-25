@@ -4,9 +4,11 @@ import { mkdirSync } from 'node:fs'
 import { createSdkMcpServer, query, tool, type Options as SDKOptions, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod/v4'
 import { CodexToolOutput, type CodexActiveTurn, type CodexToolCall, type CodexToolSpec, type CodexTurn } from './codex'
+import type { WorkerAccessMode } from './worker-policy'
 
 interface Options {
   cwd: string; model?: string; effort?: 'low' | 'medium' | 'high'; executable?: string
+  accessMode?: WorkerAccessMode
   onToolCall(call: CodexToolCall): Promise<unknown>
   /** Host-only test seams; never populated from chat or remote RPC. */
   query?: (params: { prompt: AsyncIterable<SDKUserMessage>; options: SDKOptions }) => Query
@@ -29,8 +31,7 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
-/** CC is a model/session runner only. Native tools and inherited agents are unavailable;
- * all project access is performed by CE's permission-checked host tools. */
+/** Router 仅使用宿主工具；全权限 Worker 在项目目录使用完整 CC。 */
 export class ClaudeRuntime {
   private initialization?: Promise<void>
   private thread?: Thread
@@ -118,6 +119,7 @@ export class ClaudeRuntime {
     // The service closes the client after interruption; the result may arrive first.
   }
   private boot(thread: Thread): void {
+    const fullAccess = this.options.accessMode === 'full-access'
     const names = thread.tools.map(t => `mcp__ce_runtime__${t.name}`)
     const allowed = new Set(names)
     const tools = thread.tools.map(spec => {
@@ -155,12 +157,13 @@ export class ClaudeRuntime {
     })
     this.conversation = (this.options.query ?? query)({ prompt: this.inputs, options: {
       cwd: this.options.cwd, pathToClaudeCodeExecutable: this.executable, abortController: this.abort,
-      tools: [], allowedTools: [], settingSources: [], strictMcpConfig: true, skills: [], agents: {}, plugins: [],
+      ...(fullAccess ? { tools: { type: 'preset' as const, preset: 'claude_code' as const }, settingSources: ['user', 'project', 'local'] as SDKOptions['settingSources'], sandbox: { enabled: false } }
+        : { tools: [], allowedTools: [], settingSources: [], strictMcpConfig: true, skills: [], agents: {}, plugins: [], settings: { disableAllHooks: true, autoMemoryEnabled: false, enabledPlugins: {} } }),
       mcpServers: { ce_runtime: createSdkMcpServer({ name: 'ce_runtime', version: '1', tools }) },
-      canUseTool: async (name, input) => allowed.has(name) && !!this.active && !this.closing && !this.active.interrupted
+      canUseTool: async (name, input) => (fullAccess || allowed.has(name)) && !!this.active && !this.closing && !this.active.interrupted
         ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: '数字人只能使用当前宿主明确授权的工具' },
-      permissionMode: 'default', settings: { disableAllHooks: true, autoMemoryEnabled: false, enabledPlugins: {} },
-      systemPrompt: thread.instructions, ...(thread.resume ? { resume: thread.id } : { sessionId: thread.id }),
+      permissionMode: 'default',
+      systemPrompt: fullAccess ? { type: 'preset', preset: 'claude_code', append: thread.instructions } : thread.instructions, ...(thread.resume ? { resume: thread.id } : { sessionId: thread.id }),
       persistSession: !thread.ephemeral, model: this.options.model, effort: this.options.effort ?? 'low',
       includePartialMessages: true, extraArgs: { 'replay-user-messages': null },
       env: { ...process.env, CLAUDECODE: undefined, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false' },
@@ -173,7 +176,7 @@ export class ClaudeRuntime {
       for await (const message of conversation) {
         if (this.closing) break
         if (message.type === 'system' && message.subtype === 'init') {
-          if (message.session_id !== thread.id || message.tools.some(name => !allowed.has(name))) throw new Error('CC 运行环境包含未授权工具或会话不匹配')
+          if (message.session_id !== thread.id || (this.options.accessMode !== 'full-access' && message.tools.some(name => !allowed.has(name)))) throw new Error('CC 运行环境包含未授权工具或会话不匹配')
         }
         if (message.type === 'user' && message.uuid) this.active?.pendingInputs.delete(message.uuid)
         if (message.type === 'result') this.finishResult(message)

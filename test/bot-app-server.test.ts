@@ -6,10 +6,10 @@ import { CodexAppServer, CodexToolOutput, type CodexToolCall, type CodexNotifica
 
 const clients: CodexAppServer[] = []
 const dirs: string[] = []
-function client(onToolCall = async (_call: CodexToolCall): Promise<unknown> => ({}), onNotification?: (event: CodexNotification) => void) {
+function client(onToolCall = async (_call: CodexToolCall): Promise<unknown> => ({}), onNotification?: (event: CodexNotification) => void, accessMode?: 'full-access') {
   const cwd = mkdtempSync(join(tmpdir(), 'ce-app-server-test-'))
   dirs.push(cwd)
-  const instance = new CodexAppServer({ cwd, command: [process.execPath, join(import.meta.dir, 'fixtures/bot-app-server.ts')], onToolCall, onNotification, requestTimeoutMs: 200 })
+  const instance = new CodexAppServer({ cwd, accessMode, command: [process.execPath, join(import.meta.dir, 'fixtures/bot-app-server.ts')], onToolCall, onNotification, requestTimeoutMs: 200 })
   clients.push(instance)
   return instance
 }
@@ -31,6 +31,23 @@ afterEach(async () => {
 })
 
 describe('Codex app-server transport', () => {
+  test('全权限 Worker 启动和恢复保留工作环境，原生 Shell 不会触发 Router 工具拦截', async () => {
+    const c = client(undefined, undefined, 'full-access')
+    const thread = await c.startThread({ instructions: '不要更改工作目录之外的文件', tools: [] })
+    let config = await c.call<any>('test/config', {})
+    expect(config.thread.sandbox).toBe('danger-full-access')
+    expect(config.thread.environments).toBeUndefined()
+    expect(config.thread.runtimeWorkspaceRoots).toBeUndefined()
+    expect(config.thread.baseInstructions).toBeUndefined()
+    expect(config.thread.developerInstructions).toContain('不要更改工作目录之外的文件')
+    const turn = await c.startTurn(thread, 'native-shell')
+    expect((await turn.done).status).toBe('completed')
+    await c.resumeThread(thread, { instructions: '继续遵守工作目录约束' })
+    config = await c.call<any>('test/config', {})
+    expect(config.thread.sandbox).toBe('danger-full-access')
+    expect(config.turn.environments).toBeUndefined()
+    expect(c.closed).toBe(false)
+  })
   test('图片工具结果走结构化 inputImage，保持当前轮次和授权工具校验', async () => {
     let resolve!: (value: unknown) => void
     const returned = new Promise(r => { resolve = r })

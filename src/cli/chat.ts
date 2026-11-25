@@ -34,7 +34,8 @@ import { CE_CHAT_SKILL_MD, CE_CHAT_SKILL_NAME } from './chat-skill'
 import { botCliAvailable, runBot, type BotPlatform, type BotTurn, type BotTurnResult } from './bot-runtime'
 import { botPermissionPreset, operationMode, resolveBotDirectory, validateBotPermissions, type BotApproval, type BotOperation, type BotPermissions, type BotPolicyInfo, type BotToolContext, type StoredBotPolicy } from './bot-permissions'
 import type { BotRuntimeService, RuntimeControl } from './bot-runtime/service'
-import type { RuntimeAttachment, RuntimeBot, RuntimeReply, RuntimeSettings, RuntimeUploadRequest, RuntimeView } from './bot-runtime/types'
+import type { RuntimeAttachment, RuntimeBot, RuntimeMemoryControl, RuntimeReply, RuntimeSettings, RuntimeUploadRequest, RuntimeView } from './bot-runtime/types'
+import { fullAccessPermissions } from './bot-runtime/worker-policy'
 import { digitalPersonDirectory, digitalPersonProfile, validateDigitalPerson, type DigitalPersonState } from './bot-onboarding'
 
 type BotMemberIdentity = Pick<GroupMember, 'memberId' | 'name' | 'phoneId' | 'human' | 'guest'>
@@ -212,7 +213,7 @@ export class ChatHub {
     const [name, rec] = entry; const policy = rec.bot?.policy
     if (!rec.bot || rec.bot.retirement || !policy || !rec.cwd) throw new Error('Bot 未配置 owner 权限或已注销')
     if (!rec.bot.id) { rec.bot.id = randomUUID(); this.save(true) }
-    return { botId: rec.bot.id, name, groupId: rec.bot.dmGroupId ?? Object.keys(rec.groups)[0], ownerPhoneId: policy.ownerPhoneId, sourceCwd: rec.cwd, directory: resolveBotDirectory(rec.cwd, policy.permissions), permissions: policy.permissions, policyRevision: policy.revision, commandSandbox: this.opts.commandSandbox?.() === true, platform: rec.platform ?? 'claude' }
+    return { botId: rec.bot.id, name, groupId: rec.bot.dmGroupId ?? Object.keys(rec.groups)[0], ownerPhoneId: policy.ownerPhoneId, sourceCwd: rec.cwd, directory: resolveBotDirectory(rec.cwd, policy.permissions), permissions: fullAccessPermissions(policy.permissions), policyRevision: policy.revision, commandSandbox: false, workerAccessMode: 'full-access', platform: rec.platform ?? 'claude' }
   }
 
   async botRuntime(nameOrId: string, actor: string): Promise<{ ok: boolean; data?: RuntimeView; error?: string }> {
@@ -237,6 +238,20 @@ export class ChatHub {
     catch (error) { return { ok: false, error: (error as Error).message } }
   }
 
+  async botMemoryControl(nameOrId: string, actor: string, control: RuntimeMemoryControl): Promise<{ ok: boolean; data?: RuntimeView; error?: string }> {
+    try { if (!this.runtime) throw new Error('当前 CE 不支持记忆管理，请更新 CE'); return { ok: true, data: await this.runtime.memoryControl(this.runtimeBot(nameOrId).botId, actor, control) } }
+    catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  /** 主人撤回了消息：通知把这个群当私聊的 Bot 作废以它为原话的记忆。 */
+  private revokeBotMessage(gid: string, seq: number, at: number): void {
+    if (!this.runtime) return
+    for (const rec of Object.values(this.state.agents)) {
+      if (!rec.bot?.id || rec.bot.retirement || !(gid in rec.groups)) continue
+      try { this.runtime.revokeMessage(rec.bot.id, gid, seq, at) } catch { /* 单个 Bot 失败不影响其他 */ }
+    }
+  }
+
   botArtifact(nameOrId: string, actor: string, artifactId: string): { ok: boolean; data?: { title: string; mime: string; content: string }; error?: string } {
     try { if (!this.runtime) throw new Error('当前 CE 不支持前后台模式'); return { ok: true, data: this.runtime.artifact(this.runtimeBot(nameOrId).botId, actor, artifactId) } }
     catch (error) { return { ok: false, error: (error as Error).message } }
@@ -254,7 +269,7 @@ export class ChatHub {
   async checkRuntimeAccess(botId: string, memberId: string, operation: BotOperation): Promise<{ directory: string; permissions: BotPermissions; revision: number }> {
     const bot = this.runtimeBot(botId)
     if (!this.runtime?.enabled(bot.botId)) throw new Error('前后台模式已关闭')
-    return this.botToolAuthorization({ name: bot.name, groupId: bot.groupId, memberId, requesterName: bot.name }, operation)
+    return this.botToolAuthorization({ name: bot.name, groupId: bot.groupId, memberId, requesterName: bot.name }, operation, true)
   }
 
   async sendRuntimeReply(reply: RuntimeReply): Promise<void> {
@@ -308,6 +323,10 @@ export class ChatHub {
             this.ingestBotHistory(name, rec, gid, (result.data as { msgs?: GroupStoredMsg[] }).msgs ?? [])
             void this.drainBot(name, gid)
           }).catch(() => undefined)
+          // 离线期间的撤回不在常规补拉范围内（它只补新消息）：从头上限 200 条，只看撤回墓碑。
+          if (rec.bot) this.rpc('group-sync', gid, { groupId: gid, memberId: g.memberId, afterSeq: 0, limit: 200, markRead: false })
+            .then(result => { if (result.ok) for (const msg of ((result.data as { msgs?: GroupStoredMsg[] } | undefined)?.msgs ?? [])) if (msg.revokedAt) this.revokeBotMessage(gid, msg.seq, msg.revokedAt) })
+            .catch(() => undefined)
         } catch {
           /* 单群失败不影响其他 */
         }
@@ -376,6 +395,8 @@ export class ChatHub {
     const gid = env.groupId
     const msg = env.payload as GroupStoredMsg | undefined
     if (!gid || !msg) return
+    // 撤回墓碑：正文已清、解不开密文，直接通知 Bot 作废以它为原话的记忆。
+    if (msg.revokedAt) { this.revokeBotMessage(gid, msg.seq, msg.revokedAt); return }
     const key = this.keyOf(gid)
     if (!key) {
       if (process.env.CE_CHAT_DEBUG) console.log('[ce:chat-debug] 投递跳过:群钥未下发', gid)
@@ -800,12 +821,13 @@ export class ChatHub {
       if (!rec?.bot || !rec.cwd) throw new Error('找不到本地 BOT')
       if (!actorPhoneId) throw new Error('请通过已认证手机管理 BOT 权限')
       const canManage = await this.canAdoptBot(name, rec, actorPhoneId)
+      const fullAccess = !!rec.bot.id && this.runtime?.enabled(rec.bot.id) === true
       if (permissions !== undefined) {
         if (rec.bot.retirement) throw new Error('数字员工已停止或注销，不能修改权限')
         if (!canManage) throw new Error('只有 BOT 创建者可以修改权限')
-        const validated = validateBotPermissions(permissions)
+        const validated = fullAccess ? fullAccessPermissions(validateBotPermissions(permissions)) : validateBotPermissions(permissions)
         resolveBotDirectory(rec.cwd, validated)
-        if (validated.execute !== 'deny' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱，暂不能授予命令执行权限')
+        if (!fullAccess && validated.execute !== 'deny' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱，暂不能授予命令执行权限')
         if (rec.bot.policy && rec.bot.policy.ownerPhoneId !== actorPhoneId) throw new Error('BOT 已由其他创建者管理')
         rec.bot.policy = { permissions: validated, ownerPhoneId: actorPhoneId, revision: (rec.bot.policy?.revision ?? 0) + 1 }
         rec.bot.dmGroupId ??= Object.keys(rec.groups)[0]
@@ -813,7 +835,8 @@ export class ChatHub {
       }
       const policy = rec.bot.policy
       return { ok: true, data: {
-        permissions: policy?.permissions ?? botPermissionPreset('readonly'), ownerPhoneId: policy?.ownerPhoneId,
+        permissions: fullAccess ? fullAccessPermissions(policy?.permissions ?? botPermissionPreset('readonly')) : policy?.permissions ?? botPermissionPreset('readonly'), ownerPhoneId: policy?.ownerPhoneId,
+        ...(fullAccess ? { workerAccessMode: 'full-access' as const } : {}),
         revision: policy?.revision ?? 0, canManage,
         approvals: canManage ? [...[...this.botApprovals.values()].filter(p => p.name === name && p.approval.expiresAt > Date.now()).map(p => ({ ...p.approval })), ...(rec.bot.id && this.runtime ? this.runtime.approvals(rec.bot.id) : [])] : [],
         people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true,
@@ -840,7 +863,7 @@ export class ChatHub {
     return { ok: true }
   }
 
-  private async botToolAuthorization(context: BotToolContext, operation: BotOperation): Promise<{ directory: string; permissions: BotPermissions; revision: number }> {
+  private async botToolAuthorization(context: BotToolContext, operation: BotOperation, fullAccess = false): Promise<{ directory: string; permissions: BotPermissions; revision: number }> {
     const rec = this.state.agents[context.name]
     if (rec?.bot?.retirement) throw new Error('数字员工已停止或注销')
     if (!rec?.bot?.policy || !rec.cwd) throw new Error('BOT 尚未由创建者配置项目权限')
@@ -850,10 +873,10 @@ export class ChatHub {
     if (!member) throw new Error('无法确认消息发送者身份')
     if (!this.botCommander(rec, context.groupId, context.memberId)) throw new Error('该成员没有指挥 BOT 操作项目的权限')
     const policy = rec.bot.policy
-    const permissions = validateBotPermissions(policy.permissions)
+    const permissions = fullAccess ? fullAccessPermissions(validateBotPermissions(policy.permissions)) : validateBotPermissions(policy.permissions)
     if (!['read', 'create', 'edit', 'delete', 'execute'].includes(operation)) throw new Error('不支持的 BOT 操作')
     if (operationMode(permissions, operation) === 'deny') throw new Error('创建者已禁止此操作')
-    if (operation === 'execute' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱')
+    if (!fullAccess && operation === 'execute' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱')
     return { directory: resolveBotDirectory(rec.cwd, permissions), permissions, revision: policy.revision }
   }
 
@@ -1012,11 +1035,13 @@ export class ChatHub {
       const permissions = validateBotPermissions(p.permissions)
       if (permissions.directory !== '.' || permissions.commanders !== 'owner' || permissions.allowedPhoneIds.length) throw new Error('数字人必须以所选目录为工作根，且仅 owner 可以指挥')
       resolveBotDirectory(cwd, permissions)
-      if (permissions.execute !== 'deny' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱，不能授予命令执行权限')
       const platform = (p.platform ?? 'claude') as BotPlatform
       const fingerprint = createHash('sha256').update(JSON.stringify({ setup, cwd, platform, permissions, groupId: p.groupId })).digest('hex')
       let rec = this.state.agents[p.name]
-      if (rec && (rec.bot?.policy?.ownerPhoneId !== actor || rec.bot?.onboarding?.creationId !== setup.creationId || rec.bot.onboarding.fingerprint !== fingerprint)) throw new Error('该名称已有其他数字人或创建配置已改变，请使用原配置重试')
+      // 已入职联系人的有效权限会随宿主模式更新，恢复身份不能绑定这份可变配置。
+      const sameReadyIdentity = rec?.bot?.onboarding?.status === 'ready' && rec.cwd === cwd && rec.platform === platform && rec.bot.dmGroupId === p.groupId &&
+        JSON.stringify(validateDigitalPerson(rec.bot.onboarding)) === JSON.stringify(setup)
+      if (rec && (rec.bot?.policy?.ownerPhoneId !== actor || rec.bot?.onboarding?.creationId !== setup.creationId || (!sameReadyIdentity && rec.bot.onboarding.fingerprint !== fingerprint))) throw new Error('该名称已有其他数字人或创建配置已改变，请使用原配置重试')
       if (!rec && Object.values(this.state.agents).some(row => row.bot?.onboarding?.creationId === setup.creationId)) throw new Error('此创建请求已经用于另一位数字人')
       if (rec?.bot?.retirement) throw new Error('数字人已注销，不能重新初始化')
       const result = async () => ({ ok: true, data: { botProtocol: 1, botPolicyProtocol: 1, onboardingProtocol: 1, ready: true, cwd,
@@ -1156,6 +1181,7 @@ export class ChatHub {
     const key = this.keyOf(gid)
     if (!group || !key) return
     for (const msg of [...messages].sort((a, b) => a.seq - b.seq)) {
+      if (msg.revokedAt) this.revokeBotMessage(gid, msg.seq, msg.revokedAt)
       if (msg.seq <= (group.botHistorySeq ?? 0)) continue
       // 只恢复当前 BOT 的待办；不能把历史再次投给同房间的 legacy Agent。
       if (!msg.revokedAt && msg.from.memberId !== group.memberId && (msg.from.human || msg.mentions?.includes(name))) {
@@ -1532,6 +1558,7 @@ export class ChatHub {
     botOnboardingProtocol: 1
     people: Array<{ phoneId: string; name: string }>
     commandSandbox: boolean
+    workerAccessMode: 'full-access'
     agents: Array<{ name: string; platform?: string; cwd?: string; groups: string[] }>
     suspects: Array<{ platform: string; label: string; pid: number; cwd?: string; argv: string }>
     terminals: Array<{ id: string; source: 'jupyter' | 'agent'; status: 'connected' | 'suspect' | 'unconfirmed' | 'plain'; reason: string; cwd?: string }>
@@ -1569,7 +1596,7 @@ export class ChatHub {
       // ce 管辖的 agent 会话(cc-*):平台已知(claude),天然是「已接入候选」
       terminals.push({ id: s.sid, source: 'agent', status: 'connected', reason: 'ce 管辖的 agent 会话(已接入候选)', cwd: s.cwd })
     }
-    return { botProtocol: 1, botPolicyProtocol: 1, botOnboardingProtocol: 1, people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true, agents, suspects, terminals }
+    return { botProtocol: 1, botPolicyProtocol: 1, botOnboardingProtocol: 1, workerAccessMode: 'full-access', people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true, agents, suspects, terminals }
   }
 
   private keyOf(gid: string): Uint8Array | null {

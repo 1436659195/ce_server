@@ -26,6 +26,7 @@ export interface BotApproval {
   expiresAt: number
 }
 export interface BotPolicyInfo {
+  workerAccessMode?: 'full-access'
   permissions: BotPermissions
   ownerPhoneId?: string
   revision: number

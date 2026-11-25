@@ -18,14 +18,14 @@ function fixture() {
     sendEnvelope: env => { sent.push(env); queueMicrotask(() => chat.onEnvelope({ op: 'group-result', payload: {
       reqId: env.reqId, ok: true, data: env.op === 'group-join' ? { groupId: 'dm', snapshot: {
         meta: { name: '私聊' }, seq: 0, members: [{ ...(env.payload as { member: object }).member, memberId: 'bot' }, { memberId: 'owner', name: 'Owner', human: true, phoneId: 'owner' }],
-      } } : {} } })) },
+      } } : env.op === 'group-sync' ? { members: [{ memberId: 'owner', name: 'Owner', human: true, phoneId: 'owner' }] } : {} } })) },
   })
   chat.attachBotRuntime({ initializeBot: async (_id: string, _actor: string, profile: string) => {
     probes.push(profile)
     if (hold) await new Promise<void>(resolve => { release = resolve })
     if (fail) throw new Error('模型账号不可用')
     return { settings: { mode: 'router-worker' } }
-  }, enabled: () => true } as unknown as BotRuntimeService)
+  }, enabled: () => true, approvals: () => [] } as unknown as BotRuntimeService)
   const input = { code: 'invite', groupId: 'dm', name: '小林', platform: 'codex', botProtocol: 1, botPolicyProtocol: 1,
     permissions: botPermissionPreset('readonly'), onboarding: { version: 1, creationId: 'create_12345678', directory: '/project',
       identity: { gender: '女', age: 28, avatar: { kind: 'custom', text: '林', color: '#b56146' } },
@@ -46,6 +46,25 @@ test('独立入职不依赖来源会话；真实目录和身份持久化，初�
   expect(f.probes[0]).toContain('女')
   expect(f.state().agents['小林'].bot.onboarding.identity.age).toBe(28)
   expect((await f.chat.roster()).botOnboardingProtocol).toBe(1)
+})
+
+test('数字员工默认全权限，不依赖命令沙箱，但只有owner有权指挥', async () => {
+  const f = fixture()
+  const result = await f.chat.addAgent(f.input, 'owner')
+  expect(result).toMatchObject({ ok: true, data: { policy: { workerAccessMode: 'full-access', permissions: { execute: 'allow', delete: 'allow' } } } })
+  expect(f.chat.runtimeBot(f.input.name)).toMatchObject({ workerAccessMode: 'full-access', directory: join(f.dir, 'project') })
+  expect(await f.chat.checkRuntimeAccess(f.chat.runtimeBot(f.input.name).botId, 'owner', 'execute')).toMatchObject({ permissions: { execute: 'allow', delete: 'allow' } })
+  await expect(f.chat.checkRuntimeAccess(f.chat.runtimeBot(f.input.name).botId, 'stranger', 'execute')).rejects.toThrow()
+})
+
+test('旧联系人收到全权限有效配置后仍能恢复同一数字人，不把可变权限当作创建身份', async () => {
+  const f = fixture()
+  const first = await f.chat.addAgent(f.input, 'owner')
+  const permissions = (first.data as { policy: { permissions: unknown } }).policy.permissions
+  expect((await f.chat.addAgent({ ...f.input, permissions }, 'owner')).ok).toBe(true)
+  expect(f.probes).toHaveLength(1)
+  expect((await f.chat.addAgent({ ...f.input, permissions, platform: 'claude' }, 'owner')).ok).toBe(false)
+  expect((await f.chat.addAgent({ ...f.input, permissions, onboarding: { ...f.input.onboarding, guidance: { ...f.input.onboarding.guidance, role: 'changed-role' } } }, 'owner')).ok).toBe(false)
 })
 
 test('初始化失败保留失败记录；同请求重试不重复入群，成功后幂等不重建runtime', async () => {

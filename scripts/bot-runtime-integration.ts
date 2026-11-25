@@ -12,7 +12,7 @@ const root = mkdtempSync(join(tmpdir(), 'ce-bot-integration-'))
 const store = new BotRuntimeStore(join(root, 'runtime.sqlite'))
 writeFileSync(join(root, 'paper.txt'), '论文 A：通过复用语义缓存降低重复意图识别延迟。样本为三千条营销对话，缓存命中时减少一次模型调用。尚未评估长期语义漂移，错误缓存可能误判意图。实测延迟为示例数据，不能推断实际生产性能。')
 const bot: RuntimeBot = { botId: 'integration-bot', name: '验证助理', groupId: 'local-dm', ownerPhoneId: 'test-owner', sourceCwd: root, directory: root, policyRevision: 1, platform: 'codex', commandSandbox: true, permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'allow', execute: 'allow', commanders: 'owner', allowedPhoneIds: [] } }
-store.saveSettings({ botId: bot.botId, mode: 'router-worker', revision: 1, profile: '认真核对材料和真实能力，未知事实不作保证。对合理补充及时处理。', model: '', experiences: [] })
+store.saveSettings({ botId: bot.botId, mode: 'router-worker', revision: 1, profile: '认真核对材料和真实能力，未知事实不作保证。对合理补充及时处理。', model: '' })
 const tools = new BotToolService({ endpoint: () => '', authorize: async () => { throw new Error('必须通过运行时操作授权') } })
 const events: Array<Record<string, unknown>> = []
 const runtime = new BotRuntimeService({ store, rootDir: root, getBot: () => bot,

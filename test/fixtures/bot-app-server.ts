@@ -13,6 +13,8 @@ if (probeLog && (process.argv.includes('--version') || process.argv.includes('mc
 }
 recordProbe('app-server:start')
 let turn = ''
+let threadConfig: unknown
+let turnConfig: unknown
 const output = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\n')
 const toolRequest = (turnId = turn) => ({ id: 900, method: 'item/tool/call', params: { threadId: 'thread-test', turnId, callId: 'call-test', tool: 'report', arguments: { message: 'hello' } } })
 const done = (id: string, status = 'completed') => output({ method: 'turn/completed', params: { threadId: 'thread-test', turn: { id, status, items: [] } } })
@@ -23,9 +25,11 @@ createInterface({ input: process.stdin }).on('line', line => {
   const reply = (result: unknown) => output({ id: r.id, result })
   if (r.method === 'initialize') reply({ userAgent: 'fixture/1' })
   else if (r.method === 'thread/start' || r.method === 'thread/resume') {
-    if (r.params.environments?.length !== 0 || r.params.sandbox !== 'read-only') return output({ id: r.id, error: { code: -1, message: 'unsafe thread config' } })
+    threadConfig = r.params
+    if (r.params.sandbox !== 'danger-full-access' && (r.params.environments?.length !== 0 || r.params.sandbox !== 'read-only')) return output({ id: r.id, error: { code: -1, message: 'unsafe thread config' } })
     reply({ thread: { id: 'thread-test' } })
   } else if (r.method === 'turn/start') {
+    turnConfig = r.params
     if (r.params.input[0].text === 'failed-start') return reply({ turn: { id: 'failed-turn', status: 'failed', error: { message: 'fixture model unavailable' } } })
     turn = 'turn-test'
     output({ method: 'turn/started', params: { threadId: 'thread-test', turn: { id: turn, status: 'inProgress' } } })
@@ -33,6 +37,10 @@ createInterface({ input: process.stdin }).on('line', line => {
     if (r.params.input[0].text === 'fast') done(turn)
     if (r.params.input[0].text === 'early-tool') output(toolRequest())
     reply({ turn: { id: turn, status: 'inProgress' } })
+    if (r.params.input[0].text === 'native-shell') {
+      output({ method: 'item/started', params: { threadId: 'thread-test', turnId: turn, item: { type: 'commandExecution' } } })
+      done(turn)
+    }
     if (r.params.input[0].text === 'tool') output({ id: 900, method: 'item/tool/call', params: { threadId: 'thread-test', turnId: turn, callId: 'call-test', tool: 'report', arguments: { message: 'hello' } } })
     if (r.params.input[0].text === 'native') output({ method: 'item/started', params: { threadId: 'thread-test', turnId: turn, item: { type: 'collabAgentToolCall', tool: 'spawnAgent' } } })
     if (r.params.input[0].text === 'native-then-tool') process.stdout.write([
@@ -53,7 +61,8 @@ createInterface({ input: process.stdin }).on('line', line => {
     const bytes = Buffer.from(text)
     process.stdout.write(bytes.subarray(0, bytes.length - 4))
     setTimeout(() => process.stdout.write(bytes.subarray(bytes.length - 4)), 5)
-  } else if (r.method === 'test/never') { /* 用于超时测试 */ }
+  } else if (r.method === 'test/config') reply({ thread: threadConfig, turn: turnConfig })
+  else if (r.method === 'test/never') { /* 用于超时测试 */ }
   else if (r.method === 'test/tool') { output(toolRequest(r.params.turnId)); reply({ issued: true }) }
   else if (r.method === 'test/closing') {
     reply({ issued: true })

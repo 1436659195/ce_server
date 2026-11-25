@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { StringDecoder } from 'node:string_decoder'
+import type { WorkerAccessMode } from './worker-policy'
 
 /** 只保留本产品使用、经本机 0.170.0 协议核对的字段。 */
 export interface CodexToolSpec { name: string; description: string; inputSchema: Record<string, unknown> }
@@ -15,6 +16,7 @@ export class CodexToolOutput {
 interface ThreadOptions { instructions: string; tools: CodexToolSpec[]; ephemeral?: boolean }
 interface Options {
   cwd: string
+  accessMode?: WorkerAccessMode
   executable?: string
   model?: string
   effort?: 'low' | 'medium' | 'high'
@@ -30,7 +32,7 @@ type TurnWaiter = { promise: Promise<CodexTurn>; resolve: (turn: CodexTurn) => v
 const DISABLED_FEATURES = ['shell_tool', 'view_image', 'apps', 'plugins', 'hooks', 'browser_use', 'computer_use', 'image_generation', 'multi_agent', 'multi_agent_v2', 'memory_tool', 'skill_search', 'tool_suggest']
 const MAX_FRAME_BYTES = 8_000_000
 
-/** 独立子进程中的 app-server；模型只调用宿主显式登记的动态工具。 */
+/** Router 默认只使用动态工具；宿主可为 Worker 开启完整原生运行环境。 */
 export class CodexAppServer {
   private process?: ChildProcessWithoutNullStreams
   private nextId = 1
@@ -115,6 +117,7 @@ export class CodexAppServer {
       const version = await this.probe(executable, ['--version'], 5000)
       if (!/^codex-cli 0\.170\.0\s*$/.test(version.trim())) throw new Error()
     } catch { throw new Error('前后台模式需要已验证的 Codex 0.170.0；当前版本尚未通过兼容验证') }
+    if (this.options.accessMode === 'full-access') return [executable, 'app-server', '--stdio', '-c', 'sandbox_mode="danger-full-access"', '-c', 'approval_policy="never"', '-c', 'features.shell_tool=true']
     let servers: Array<{ name: string }>
     try {
       const listed = await this.probe(executable, ['mcp', 'list', '--json'], 10000)
@@ -147,6 +150,12 @@ export class CodexAppServer {
   }
 
   private threadConfig(instructions: string): Record<string, unknown> {
+    if (this.options.accessMode === 'full-access') return {
+      cwd: this.options.cwd, sandbox: 'danger-full-access', approvalPolicy: 'never',
+      developerInstructions: instructions,
+      ...(this.options.model ? { model: this.options.model } : {}),
+      config: { model_reasoning_effort: this.options.effort ?? 'low', sandbox_mode: 'danger-full-access', approval_policy: 'never' },
+    }
     return {
       cwd: this.options.cwd, runtimeWorkspaceRoots: [], environments: [], selectedCapabilityRoots: [],
       sandbox: 'read-only', approvalPolicy: 'never',
@@ -164,7 +173,7 @@ export class CodexAppServer {
     try {
       response = await this.call<{ turn: CodexTurn }>('turn/start', {
         threadId, input: [{ type: 'text', text, text_elements: [] }], clientUserMessageId: inputId,
-        environments: [], runtimeWorkspaceRoots: [], effort: this.options.effort ?? 'low',
+        ...(this.options.accessMode === 'full-access' ? {} : { environments: [], runtimeWorkspaceRoots: [] }), effort: this.options.effort ?? 'low',
       })
     } finally { this.startingThreads.delete(threadId) }
     if (!response.turn?.id) throw new Error('Codex 未返回轮次 ID')
@@ -224,7 +233,7 @@ export class CodexAppServer {
     }
     if (typeof message.method !== 'string' || !message.params || typeof message.params !== 'object') return
     const event = message as CodexNotification
-    if (['item/started', 'item/completed'].includes(event.method)) {
+    if (this.options.accessMode !== 'full-access' && ['item/started', 'item/completed'].includes(event.method)) {
       const item = event.params.item as { type?: string } | undefined
       // 0.170.0 会暴露部分原生工具名字。无 environment 是文件执行边界；
       // 若模型仍尝试原生执行/MCP/协作，则终止本运行，不允许隐式生成额外 Worker。

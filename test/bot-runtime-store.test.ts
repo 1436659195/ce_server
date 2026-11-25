@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -104,10 +105,35 @@ test('跨 Bot 关联、停止后追加和仍有工具运行时结案均拒绝', 
 
 test('回复按逻辑 ID 去重，网络确认不改变业务任务，长度按可见字符检查', () => {
   const { store } = fixture(); const { task, input } = accepted(store)
-  expect(() => store.reply({ botId: 'bot-a', groupId: 'dm', inputId: input.id, author: 'worker', purpose: 'answer', text: '👨‍👩‍👧‍👦'.repeat(101), key: 'too-long', policyRevision: 1 })).toThrow(/100/)
-  const first = store.reply({ botId: 'bot-a', groupId: 'dm', inputId: input.id, taskId: task.id, author: 'worker', purpose: 'answer', text: '回答。', key: 'answer-one', policyRevision: 1 })
+  expect(() => store.reply({ botId: 'bot-a', groupId: 'dm', inputId: input.id, author: 'router', purpose: 'answer', text: '👨‍👩‍👧‍👦'.repeat(101), key: 'too-long', policyRevision: 1 })).toThrow(/100/)
+  const first = store.reply({ botId: 'bot-a', groupId: 'dm', inputId: input.id, taskId: task.id, author: 'router', purpose: 'answer', text: '回答。', key: 'answer-one', policyRevision: 1 })
   expect(store.reply({ ...first, key: 'answer-one' }).id).toBe(first.id)
   store.markReplySent(first.id)
   expect(store.task(task.id)?.state).toBe('queued')
   expect(store.pendingReplies('bot-a')).toHaveLength(1)
+})
+
+
+test('升级迁移只执行一次，重启不把新Worker内部消息变成旧传输',()=>{
+  const {store,path}=fixture()
+  const source=store.reply({botId:'bot-a',groupId:'dm',author:'worker',purpose:'answer',text:'内部结果',key:'new-result',policyRevision:1})
+  store.markReplyAttempted(source.id);store.close()
+  const reopened=new BotRuntimeStore(path);stores.push(reopened)
+  expect(reopened.replies('bot-a')[0]).not.toHaveProperty('legacyDeliveryRecovery')
+  const db=new Database(path);expect(db.query('PRAGMA user_version').get()).toEqual({user_version:3});db.close()
+})
+
+test('旧设置里的手写经验一次性迁进经验表：免指纹、算常驻；迁移只跑一次',()=>{
+  const {store,path}=fixture()
+  store.saveSettings({ ...store.settings('bot-a'), experiences: [{ id: 'old-1', summary: '论文解读经验', detail: '先看方法部分', source: '手写', active: true }] } as any)
+  const db=new Database(path);db.exec('PRAGMA user_version=2');db.close()
+  store.close()
+  const reopened=new BotRuntimeStore(path);stores.push(reopened)
+  expect(reopened.experience('old-1')).toMatchObject({state:'active',goal:'论文解读经验',approach:'论文解读经验',detail:'先看方法部分',uses:3,toolFingerprint:'legacy',migrated:true})
+  expect(reopened.settings('bot-a')).not.toHaveProperty('experiences')
+  expect(reopened.experiences('bot-a')).toHaveLength(1)
+  reopened.close()
+  const again=new BotRuntimeStore(path);stores.push(again)
+  expect(again.experiences('bot-a')).toHaveLength(1)
+  const check=new Database(path);expect(check.query('PRAGMA user_version').get()).toEqual({user_version:3});check.close()
 })

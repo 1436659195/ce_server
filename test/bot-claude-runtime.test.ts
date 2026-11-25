@@ -20,9 +20,9 @@ class Queue<T> implements AsyncIterable<T> {
 const cleanups:Array<()=>Promise<void>>=[]
 afterEach(async()=>{for(const cleanup of cleanups.splice(0))await cleanup()})
 async function until(p:()=>boolean) { for(let i=0;i<100&&!p();i++)await Bun.sleep(2);expect(p()).toBe(true) }
-function fixture(handler: (call: { tool:string;arguments:Record<string,unknown> })=>Promise<unknown> = async()=>({ok:true})) {
+function fixture(handler: (call: { tool:string;arguments:Record<string,unknown> })=>Promise<unknown> = async()=>({ok:true}), accessMode?: 'full-access') {
   const dir=mkdtempSync(join(tmpdir(),'ce-claude-test-'));const events=new Queue<SDKMessage>();const inputs:SDKUserMessage[]=[];let options!:Options;let closes=0;let interrupts=0
-  const runtime=new ClaudeRuntime({cwd:dir,onToolCall:handler,probe:async()=> '2.1.220 (Claude Code)',query:({prompt,options:o})=>{
+  const runtime=new ClaudeRuntime({cwd:dir,accessMode,onToolCall:handler,probe:async()=> '2.1.220 (Claude Code)',query:({prompt,options:o})=>{
     options=o
     void(async()=>{for await(const input of prompt){inputs.push(input);events.push({...input,session_id:o.resume??o.sessionId!} as SDKMessage)}})()
     return Object.assign(events[Symbol.asyncIterator](),{[Symbol.asyncIterator](){return this},interrupt:async()=>{interrupts++},close:()=>{closes++;events.end()}}) as unknown as Query
@@ -32,6 +32,18 @@ function fixture(handler: (call: { tool:string;arguments:Record<string,unknown> 
 }
 const spec={name:'read_document',description:'Read a document',inputSchema:{type:'object',properties:{path:{type:'string'}},required:['path'],additionalProperties:false}}
 function result(id:string,subtype='success'):SDKMessage {return {type:'result',subtype,session_id:id,is_error:subtype!=='success',result:'READY',errors:['model unavailable']} as unknown as SDKMessage}
+
+test('全权限 CC 使用原生工具和默认系统提示，Shell 自动许可但结束后不能继续调用',async()=>{
+ const f=fixture(undefined,'full-access');const thread=await f.runtime.startThread({instructions:'不要更改工作目录之外的文件',tools:[spec]});const turn=await f.runtime.startTurn(thread,'work')
+ expect(f.options.tools).toEqual({type:'preset',preset:'claude_code'})
+ expect(f.options.systemPrompt).toEqual({type:'preset',preset:'claude_code',append:'不要更改工作目录之外的文件'})
+ expect(f.options.settingSources).toEqual(['user','project','local'])
+ const context={signal:new AbortController().signal,toolUseID:'shell',requestId:'request'}
+ expect(await f.options.canUseTool!('Bash',{command:'pwd'},context)).toMatchObject({behavior:'allow'})
+ f.events.push({type:'system',subtype:'init',session_id:thread,tools:['Bash','Read','Edit','mcp__ce_runtime__read_document']} as unknown as SDKMessage)
+ await until(()=>f.inputs.length===1);f.events.push(result(thread));expect((await turn.done).status).toBe('completed')
+ expect(await f.options.canUseTool!('Bash',{command:'pwd'},context)).toMatchObject({behavior:'deny'})
+})
 
 test('CC starts with only explicit host tools and no inherited settings, MCP, hooks or skills',async()=>{
  const f=fixture();const thread=await f.runtime.startThread({instructions:'Only host tools',tools:[spec]});const turn=await f.runtime.startTurn(thread,'hello')

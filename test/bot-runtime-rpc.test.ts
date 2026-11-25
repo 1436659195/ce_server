@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ChatHub } from '../src/cli/chat'
 import { BotRuntimeService } from '../src/cli/bot-runtime/service'
+import { silentMemoryClient } from './helpers/model-client'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
 import { seal, open } from '../src/shared/crypto'
 import { createHash } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import type { GroupEnvelope } from '../src/shared/group'
+import type { RuntimeMemory } from '../src/cli/bot-runtime/types'
 
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => { for (const f of cleanups.splice(0)) await f() })
@@ -29,7 +31,7 @@ async function fixture() {
   await chat.addAgent({ code: 'dm', name: 'Test', groupId: 'dm', platform: 'codex', sourceSessionId: 'term-source', botProtocol: 1, botPolicyProtocol: 1, permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'allow', execute: 'allow', commanders: 'members', allowedPhoneIds: [] } }, 'owner')
   await chat.addAgent({ code: 'team', name: 'Test', groupId: 'team', platform: 'codex', sourceSessionId: 'term-source', botProtocol: 1 }, 'owner')
   const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
-  const runtime = new BotRuntimeService({ routerQuietMs: 0, store, rootDir: dir, getBot: name => chat.runtimeBot(name), sendReply: reply => chat.sendRuntimeReply(reply), checkAccess: (bot, memberId, op) => chat.checkRuntimeAccess(bot.botId, memberId, op), openTools: () => { throw new Error('not used') }, createClient: () => ({ initialize: async () => {}, startThread: async () => { throw new Error('model disabled in RPC test') }, resumeThread: async () => 'x', startTurn: async () => { throw new Error('not used') }, steer: async () => 'x', interrupt: async () => {}, close: async () => {} }) })
+  const runtime = new BotRuntimeService({ routerQuietMs: 0, store, rootDir: dir, getBot: name => chat.runtimeBot(name), sendReply: reply => chat.sendRuntimeReply(reply), checkAccess: (bot, memberId, op) => chat.checkRuntimeAccess(bot.botId, memberId, op), openTools: () => { throw new Error('not used') }, createClient: role => role === 'memory' ? silentMemoryClient() : ({ initialize: async () => {}, startThread: async () => { throw new Error('model disabled in RPC test') }, resumeThread: async () => 'x', startTurn: async () => { throw new Error('not used') }, steer: async () => 'x', interrupt: async () => {}, close: async () => {} }) })
   chat.attachBotRuntime(runtime)
   cleanups.push(async () => { await runtime.close(); store.close(); rmSync(dir, { recursive: true, force: true }) })
   const message = (seq: number, groupId = 'dm', memberId = 'owner-member', body: object = { text: '你好' }) => chat.onEnvelope({ op: 'group-msg', groupId, payload: { seq, ts: Date.now(), from: { memberId, name: 'Owner', human: true }, ct: Buffer.from(seal(key, new TextEncoder().encode(JSON.stringify({ kind: 'text', ...body })))).toString('base64') } })
@@ -64,7 +66,7 @@ test('附件 RPC 校验连接 owner；无文字的附件消息也持久进入 Ru
   expect(f.chat.botAttachment('Test', 'owner', { id: upload.id, kind: 'upload' }, 0, 10)).toMatchObject({ ok: true, data: { data: Buffer.from('hello').toString('base64') } })
 })
 
-test('Worker 回复的成果引用与正文一起加密发送，不把本地路径或文件字节放进群消息', async () => {
+test('Router 整理后的成果引用与正文一起加密发送，不把本地路径或文件字节放进群消息', async () => {
   const f = await fixture()
   await f.chat.botRuntimeUpdate('Test', 'owner', 0, { mode: 'router-worker' })
   const bot = f.chat.runtimeBot('Test')
@@ -75,8 +77,40 @@ test('Worker 回复的成果引用与正文一起加密发送，不把本地路�
   const path = join(f.dir, 'report.html'); const content = '<h1>完整报告</h1>'; writeFileSync(path, content)
   f.store.saveArtifact({ id: 'artifact-report', botId: bot.botId, caseId: task.caseId, taskId: task.id, path, title: '报告', name: 'report.html', mime: 'text/html', size: Buffer.byteLength(content), hash: createHash('sha256').update(content).digest('hex'), revision: 1, createdAt: Date.now() })
   f.store.finishTask(task.id, 1, '报告在附件中。', ['artifact-report'])
+  const source = f.store.pendingReplies(bot.botId)[0]
+  await expect(f.chat.sendRuntimeReply(source)).rejects.toThrow()
+  f.store.presentWorkerReply(bot.botId, source.id, ['报告在附件中。'], '')
   await f.chat.sendRuntimeReply(f.store.pendingReplies(bot.botId)[0])
   expect(f.posted[0]).toMatchObject({ text: '报告在附件中。', attachments: [{ id: 'artifact-report', kind: 'artifact', name: 'report.html' }] })
   expect(JSON.stringify(f.posted)).not.toContain(path)
   expect(JSON.stringify(f.posted)).not.toContain(content)
+})
+
+const memory = (p: { id: string; botId: string; prompt: string; source: { inboxId: string; quote: string } }): RuntimeMemory =>
+  ({ channel: 'dm', senderId: 'owner', tier: 'long', status: 'active', triggers: { count: 1 }, createdAt: 1, updatedAt: 1, id: p.id, botId: p.botId, prompt: p.prompt, source: { ...p.source, context: '', sentAt: 1 } })
+
+test('记忆管理只允许 owner；压下后不再进上下文，流水可见', async () => {
+  const f = await fixture()
+  await f.chat.botRuntimeUpdate('Test', 'owner', 0, { mode: 'router-worker' })
+  const bot = f.chat.runtimeBot('Test')
+  f.store.saveMemory(memory({ id: 'rule', botId: bot.botId, prompt: '回复保持简短', source: { inboxId: 'msg-rule', quote: '以后都简短点' } }))
+  expect((await f.chat.botMemoryControl('Test', 'other', { requestId: 'r1', action: 'suppress', id: 'rule' })).ok).toBe(false)
+  expect(f.store.memory('rule')?.status).toBe('active')
+  expect((await f.chat.botMemoryControl('Test', 'owner', { requestId: 'r1', action: 'suppress', id: 'rule' })).data?.memory.log.map(l => l.action)).toEqual(['suppress'])
+  expect(f.store.memory('rule')?.status).toBe('suppressed')
+  expect((await f.chat.botRuntime('Test', 'owner')).data?.memory.active).toEqual([])
+})
+
+test('撤回消息重播到本机：以它为原话的规矩作废，本地原文清空', async () => {
+  const f = await fixture()
+  await f.chat.botRuntimeUpdate('Test', 'owner', 0, { mode: 'router-worker' })
+  const bot = f.chat.runtimeBot('Test')
+  f.message(1, 'dm', 'owner-member', { text: '以后都简短点' })
+  await Bun.sleep(50)
+  const stored = f.store.messages(bot.botId)[0]
+  f.store.saveMemory(memory({ id: 'rule', botId: bot.botId, prompt: '回复保持简短', source: { inboxId: stored.id, quote: '以后都简短点' } }))
+  f.chat.onEnvelope({ op: 'group-msg', groupId: 'dm', payload: { seq: 1, ts: Date.now(), revokedAt: Date.now(), from: { memberId: 'owner-member', name: 'Owner', human: true }, ct: '' } })
+  expect(f.store.memory('rule')?.status).toBe('revoked')
+  expect(f.store.inbox(stored.id)).toMatchObject({ text: '', revokedAt: expect.any(Number) })
+  expect(f.store.inbox(stored.id)?.attachments).toBeUndefined()
 })

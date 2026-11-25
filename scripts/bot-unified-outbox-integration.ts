@@ -28,13 +28,13 @@ async function verify(platform: 'codex' | 'claude') {
   const readGate = new Promise<void>(r => { unblock = r })
   let blocked = false; let workerClients = 0
   const runtime = new BotRuntimeService({ store, rootDir: dir, getBot: () => bot,
-    sendReply: async reply => { replies.push(reply); record({ platform, kind: 'reply', author: reply.author, purpose: reply.purpose, text: reply.text, attachmentCount: reply.artifactIds?.length ?? 0 }) },
+    sendReply: async reply => { replies.push(reply); record({ platform, kind: 'reply', author: reply.author, purpose: reply.purpose, text: reply.text, sourceReplyId: reply.sourceReplyId, attachmentCount: reply.artifactIds?.length ?? 0 }) },
     checkAccess: async () => ({ directory: dir, permissions: bot.permissions, revision: 1 }),
     createClient: (role, options) => {
       if (role === 'worker') workerClients++
       record({ platform, kind: 'client_created', role })
       const traced = { ...options, onToolCall: async (call: Parameters<typeof options.onToolCall>[0]) => {
-        record({ platform, kind: 'tool_call', role, tool: call.tool, ...(call.tool === 'router_decide' ? { action: call.arguments.action, allowedOps: call.arguments.allowedOps, sourceInputIds: call.arguments.sourceInputIds } : {}) })
+        record({ platform, kind: 'tool_call', role, tool: call.tool, ...(call.tool === 'router_decide' ? { decision: call.arguments.decision, replies: call.arguments.replies, basis: call.arguments.basis } : {}) })
         try { return await options.onToolCall(call) }
         catch (error) { record({ platform, kind: 'tool_rejected', role, tool: call.tool, error: error instanceof Error ? error.message : 'tool failed' }); throw error }
       } }
@@ -67,17 +67,23 @@ async function verify(platform: 'codex' | 'claude') {
     await until(() => blocked)
     const task = store.tasks(platform)[0]; const run = store.runs(platform)[0]
     const progress = send(2, '现在做到哪了？请先告诉我已经完成了什么、正在等什么，再继续原来的报告。')
-    await until(() => replies.some(r => r.author === 'worker' && r.purpose === 'answer' && r.inputId === progress.id), 90_000)
+    await until(() => store.replies(platform).some(r => r.author === 'worker' && r.purpose === 'answer' && r.inputId === progress.id && r.state === 'routed'), 90_000)
+    const source = store.replies(platform).find(r => r.author === 'worker' && r.purpose === 'answer' && r.inputId === progress.id)!
+    const answer = replies.find(r => r.sourceReplyId === source.id)
+    // 前台已依据可见工具状态准确回答时，可以有依据地省略重复答案。
+    if (!answer && (!source.routingBasis || !replies.some(r => r.inputId === progress.id))) throw new Error(`${platform}: 专业追问无回复也无去重依据`)
+    record({ platform, kind: 'progress_presented', text: answer?.text, omittedBecause: answer ? undefined : source.routingBasis, internalText: source.text })
     const addition = store.inputs(task.id).find(i => i.inboxId === progress.id)
     if (addition?.kind !== 'ask_worker' || workerClients !== 1 || store.tasks(platform).length !== 1) throw new Error(`${platform}: 追问没有进入原 Worker`)
     if (!store.operations(task.id).some(o => o.tool === 'read_file' && o.state === 'running')) throw new Error(`${platform}: 没有在工具运行时回答`)
     if (store.task(task.id)?.state !== 'running' || store.runs(platform)[0].id !== run.id) throw new Error(`${platform}: 追问中断了原任务`)
     record({ platform, kind: 'progress_while_working_verified', taskId: task.id, workerClients })
     unblock()
-    await until(() => store.task(task.id)?.state === 'completed')
+    await until(() => store.task(task.id)?.state === 'completed' && replies.some(r => r.purpose === 'result'))
     await runtime.flush(platform)
     const result = replies.find(r => r.purpose === 'result')
     if (!result?.artifactIds?.length) throw new Error(`${platform}: 没有交付附件`)
+    if (replies.some(r => r.author !== 'router') || !result.sourceReplyId) throw new Error(`${platform}: Worker绕过Router发送`)
     const artifact = store.artifact(result.artifactIds[0])!
     const body = readFileSync(artifact.path, 'utf8')
     if (!/语义|缓存/.test(body) || !/<(?:html|!doctype)/i.test(body)) throw new Error(`${platform}: 交付文件内容不符合要求`)

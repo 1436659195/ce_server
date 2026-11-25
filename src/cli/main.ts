@@ -50,7 +50,7 @@ import { ChatHub } from './chat'
 import { BotToolService, runBotToolBridge } from './bot-tools'
 import { BotRuntimeStore } from './bot-runtime/store'
 import { BotRuntimeService, type RuntimeControl } from './bot-runtime/service'
-import type { RuntimeAttachment, RuntimeSettings, RuntimeUploadRequest } from './bot-runtime/types'
+import type { RuntimeAttachment, RuntimeMemoryControl, RuntimeSettings, RuntimeUploadRequest } from './bot-runtime/types'
 import { commandSandboxAvailable } from './bot-command-sandbox'
 import type { BotPermissions } from './bot-permissions'
 import { runChatCli } from './chat-cli'
@@ -1536,6 +1536,9 @@ async function main(): Promise<void> {
           } else if (req.op === 'chat.botWorkControl') {
             const q = req as { name?: string; botId?: string; control?: RuntimeControl }
             resp = q.control ? await chatHub.botWorkControl(q.botId ?? q.name ?? '', srcPhone, q.control) : { ok: false, error: '缺少任务控制参数' }
+          } else if (req.op === 'chat.botMemoryControl') {
+            const q = req as { name?: string; botId?: string; control?: RuntimeMemoryControl }
+            resp = q.control ? await chatHub.botMemoryControl(q.botId ?? q.name ?? '', srcPhone, q.control) : { ok: false, error: '缺少记忆管理参数' }
           } else if (req.op === 'chat.botUpload') {
             const q = req as { name?: string; botId?: string; request?: RuntimeUploadRequest }
             resp = q.request ? chatHub.botUpload(q.botId ?? q.name ?? '', srcPhone, q.request) : { ok: false, error: '缺少附件上传参数' }

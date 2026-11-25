@@ -1,10 +1,12 @@
+import { routerCall } from './helpers/router-decision'
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { BotRuntimeService, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
+import { isControlUtterance, parseRouterDecision } from '../src/cli/bot-runtime/router'
+import { BotRuntimeService, ROUTER_MAX_WAIT_MS, ROUTER_QUIET_MS, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
+import { silentMemoryClient } from './helpers/model-client'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
-import { parseRouterDecision } from '../src/cli/bot-runtime/router'
 import type { CodexTurn } from '../src/cli/bot-runtime/codex'
 import type { RuntimeBot, RuntimeReply } from '../src/cli/bot-runtime/types'
 
@@ -14,24 +16,26 @@ async function until(check: () => boolean) {
   for (let i = 0; i < 300 && !check(); i++) await Bun.sleep(5)
   expect(check()).toBe(true)
 }
-function fixture() {
+/** 不传参数用测试节奏；传 'defaults' 则不覆盖，走生产默认的安静期与封顶。 */
+function fixture(timing: { routerQuietMs?: number; routerMaxWaitMs?: number } | 'defaults' = { routerQuietMs: 40, routerMaxWaitMs: 100 }) {
   const dir = mkdtempSync(join(tmpdir(), 'ce-chat-rhythm-'))
   const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
   const bot: RuntimeBot = { botId: 'b', name: '小林', groupId: 'dm', ownerPhoneId: 'owner', sourceCwd: dir, directory: dir, platform: 'codex', policyRevision: 1, commandSandbox: false,
     permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'deny', execute: 'deny', commanders: 'owner', allowedPhoneIds: [] } }
   const turns: Array<{ context: any; decide: (args: Record<string, unknown>) => Promise<any>; finish: () => void }> = []
   const sent: RuntimeReply[] = []
-  const service = new BotRuntimeService({ store, rootDir: dir, routerQuietMs: 40, routerMaxWaitMs: 100, bubbleGapMs: 100,
+  const service = new BotRuntimeService({ store, rootDir: dir, ...(timing === 'defaults' ? {} : timing), bubbleGapMs: 100,
     getBot: () => bot, sendReply: async reply => { sent.push(reply) }, checkAccess: async () => { throw new Error('no worker') }, openTools: () => { throw new Error('no worker') },
     createClient: (role, options: RuntimeClientOptions) => {
       if (role === 'worker') throw new Error('test leaves tasks queued')
+      if (role === 'memory') return silentMemoryClient()
       let resolve: ((turn: CodexTurn) => void) | undefined
       return { initialize: async () => {}, startThread: async () => 'thread', resumeThread: async id => id,
         startTurn: async (threadId, text) => {
           const turnId = `turn-${turns.length}`
           const done = new Promise<CodexTurn>(r => { resolve = r })
           const complete = resolve!
-          turns.push({ context: JSON.parse(text), decide: args => options.onToolCall({ threadId, turnId, callId: turnId, tool: 'router_decide', arguments: { feasibility: 'can', policyRevision: 1, ...args } }), finish: () => complete({ id: turnId, status: 'completed' }) })
+          turns.push({ context: JSON.parse(text), decide: args => options.onToolCall({ threadId, turnId, callId: turnId, tool: 'router_decide', arguments: routerCall({ feasibility: 'can', ...args }) }), finish: () => complete({ id: turnId, status: 'completed' }) })
           return { threadId, turnId, done }
         }, steer: async () => '', interrupt: async () => {}, close: async () => { resolve?.({ id: 'closed', status: 'interrupted' }) } }
     } })
@@ -156,4 +160,43 @@ test('模型判断期间旧气泡已被Worker淘汰，重复取消仍可提交�
   await f.turns[0].decide({ action: 'reply', replies: ['你说。'], cancelReplyIds: [old.id] }); f.turns[0].finish()
   await until(() => f.sent.length === 1)
   expect(f.store.inbox(next.id)?.state).toBe('routed'); expect(f.sent[0].text).toBe('你说。')
+})
+
+test('默认安静期是 3 秒，最长等 12 秒', async () => {
+  expect(ROUTER_QUIET_MS).toBe(3_000); expect(ROUTER_MAX_WAIT_MS).toBe(12_000)
+  const f = fixture('defaults'); f.send('在吗')
+  await Bun.sleep(2_300); expect(f.turns).toHaveLength(0)
+  await until(() => f.turns.length === 1)
+  await f.turns[0].decide({ action: 'reply', replies: ['在。'] }); f.turns[0].finish()
+})
+
+test('停止类整句不等安静期，立即开轮', async () => {
+  const f = fixture({ routerQuietMs: 900, routerMaxWaitMs: 3_000 })
+  const a = f.send('开始写报告'); await Bun.sleep(20)
+  const started = Date.now(); const b = f.send('停止')
+  await until(() => f.turns.length === 1)
+  expect(Date.now() - started).toBeLessThan(600)
+  expect(f.turns[0].context.currentMessages.map((m: any) => m.id)).toEqual([a.id, b.id])
+  await f.turns[0].decide({ action: 'reply', replies: ['好的，先不做。'] }); f.turns[0].finish()
+  await until(() => f.sent.length === 1)
+})
+
+test('控制语只认整句：句末标点可省，夹在长句里的不算', () => {
+  for (const text of ['停', '停。', '别搞了！', '继续', '算了～', '不用了?']) expect(isControlUtterance(text)).toBe(true)
+  for (const text of ['停止一下', '继续补充说明', '你别搞了呀', '不停的报错', '算了一下', '在吗', '']) expect(isControlUtterance(text)).toBe(false)
+})
+
+test('确认卡里打字的回答和控制纠正不等安静期', async () => {
+  const f = fixture({ routerQuietMs: 900, routerMaxWaitMs: 3_000 })
+  const origin = f.store.receive({ botId: 'b', groupId: 'dm', seq: 1, senderId: 'owner', memberId: 'om', text: '排查', createdAt: Date.now() })
+  const task = f.store.acceptWork({ inputId: origin.id, newCase: { title: '排查', object: '系统', goal: '定位' }, goal: '定位', acceptance: [], replies: [], mandate: { ownerPhoneId: 'owner', policyRevision: 1, directory: f.bot.directory, allowedOps: ['read'], exclusions: [], mode: 'execute' } })
+  // 不启动 Worker，只检查控制面文字进入前台的时机。
+  f.store.updateTask(task.id, { state: 'running' })
+  const started = Date.now()
+  await f.service.control('b', 'owner', { action: 'correct', taskId: task.id, expectedRevision: 1, requestId: 'button-correction-timing', text: '只读检查，不要改文件' })
+  await until(() => f.turns.length === 1)
+  expect(Date.now() - started).toBeLessThan(600)
+  expect(f.turns[0].context.currentMessages.map((m: any) => m.text)).toEqual(['只读检查，不要改文件'])
+  await f.turns[0].decide({ action: 'reply', replies: ['收到，只读检查。'] }); f.turns[0].finish()
+  await until(() => f.sent.length === 1)
 })

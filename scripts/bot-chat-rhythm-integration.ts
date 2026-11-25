@@ -56,10 +56,13 @@ async function verify(platform: 'codex' | 'claude') {
     }
   }
   try {
-    hold = gate(); const a = send('在吗'); await Bun.sleep(4476); const b = send('你当前工作是什么'); hold.release(); hold = undefined
+    hold = gate(); const quietFrom = Date.now(); const a = send('在吗'); await Bun.sleep(4476); const b = send('你当前工作是什么'); hold.release(); hold = undefined
     await until(() => store.inbox(a.id)?.state === 'routed' && store.inbox(b.id)?.state === 'routed' && running === 0)
     await until(() => store.pendingReplies(platform).length === 0)
     if (!sent.length || sent.some(r => r.inputId === a.id) || new Set(sent.map(r => r.replyGroupId)).size !== 1) throw new Error('未合并首组对话')
+    // 默认安静期 3 秒：第一轮不能在 2.8 秒内开（线程启动耗时只会更晚）。
+    const firstTurn = (trace as Array<{ kind: string; at: number }>).find(i => i.kind === 'turn' && i.at >= quietFrom)
+    if (!firstTurn || firstTurn.at - quietFrom < 2800) throw new Error(`安静期不足 3 秒：${firstTurn ? firstTurn.at - quietFrom : 'no turn'}`)
     const before = sent.length
     hold = gate(); const c = send('好'); await Bun.sleep(2773); const d = send('不用确认了'); hold.release(); hold = undefined
     await until(() => store.inbox(c.id)?.state === 'routed' && store.inbox(d.id)?.state === 'routed' && running === 0)
@@ -70,7 +73,22 @@ async function verify(platform: 'codex' | 'claude') {
     await Bun.sleep(1000)
     if (sent.length !== before + 1 || store.pendingReplies(platform).length) throw new Error('插话后仍发送过时气泡')
     if (!store.replies(platform).some(r => r.state === 'cancelled')) throw new Error('没有验证到取消后续气泡')
-    record({ platform, kind: 'pass', clients, messages: store.messages(platform).length, replies: sent.length, tasks: store.tasks(platform).length })
+    // 停止类整句不等安静期：会话已存在，应在 2 秒内开轮（正常要等 3 秒）。
+    await until(() => store.pendingReplies(platform).length === 0)
+    send('我想问问'); await Bun.sleep(400); const stopFrom = Date.now(); const stop = send('算了')
+    await until(() => store.inbox(stop.id)?.state === 'routed' && running === 0)
+    await until(() => store.pendingReplies(platform).length === 0)
+    const stopTurn = (trace as Array<{ kind: string; at: number }>).find(i => i.kind === 'turn' && i.at >= stopFrom)
+    if (!stopTurn || stopTurn.at - stopFrom > 2000) throw new Error(`停止语没有立即开轮：${stopTurn ? stopTurn.at - stopFrom : 'no turn'}`)
+    // 连着发个不停：安静期永远到不了，12 秒封顶必须开轮。
+    const capFrom = Date.now()
+    for (let i = 0; i < 6; i++) { send(`闲聊一句 ${i}`); await Bun.sleep(2500) }
+    await until(() => !store.pendingInbox(platform).length && running === 0)
+    await until(() => store.pendingReplies(platform).length === 0)
+    const capTurn = (trace as Array<{ kind: string; at: number }>).find(i => i.kind === 'turn' && i.at >= capFrom)
+    const capWait = capTurn ? capTurn.at - capFrom : -1
+    if (capWait < 11000 || capWait > 16000) throw new Error(`封顶等待不符：${capWait}`)
+    record({ platform, kind: 'pass', clients, messages: store.messages(platform).length, replies: sent.length, tasks: store.tasks(platform).length, quietWaitMs: firstTurn.at - quietFrom, stopWaitMs: stopTurn.at - stopFrom, capWaitMs: capWait })
   } finally { hold?.release(); await service.close(); store.close() }
 }
 const chosen = process.argv.find(a => a.startsWith('--platform='))?.split('=')[1]

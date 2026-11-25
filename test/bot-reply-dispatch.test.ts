@@ -1,8 +1,10 @@
+import { routerCall } from './helpers/router-decision'
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { BotRuntimeService } from '../src/cli/bot-runtime/service'
+import { silentMemoryClient } from './helpers/model-client'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
 import type { RuntimeBot, RuntimeReply } from '../src/cli/bot-runtime/types'
 
@@ -20,14 +22,15 @@ function fixture(send?: (reply: RuntimeReply) => Promise<void>, inspectHistory?:
   const runtime = new BotRuntimeService({ routerQuietMs: 0, store, rootDir: root, getBot: () => bot,
     sendReply: async r => { await send?.(r); sent.push(r) },
     checkAccess: async () => { throw new Error('unexpected project access') }, openTools: () => { throw new Error('unexpected project access') },
-    createClient: (_role, options) => {
+    createClient: (role, options) => {
+      if (role === 'memory') return silentMemoryClient()
       modelCalls++
       if (!inspectHistory) throw new Error('dispatch must not invoke a model')
       return { initialize: async () => {}, startThread: async () => 'router-thread', resumeThread: async id => id,
         startTurn: async (threadId, text) => ({ threadId, turnId: 'router-turn', done: Promise.resolve().then(async () => {
           const call = (tool: string, args: Record<string, unknown>) => options.onToolCall({ threadId, turnId: 'router-turn', callId: tool, tool, arguments: args })
           inspectHistory(JSON.parse(text), await call('chat_recent', { limit: 20 }))
-          await call('router_decide', { action: 'reply', feasibility: 'can', policyRevision: 1, replyText: '刚才的聊天我看到了。' })
+          await call('router_decide', routerCall({ action: 'reply', replyText: '刚才的聊天我看到了。' }))
           return { id: 'router-turn', status: 'completed' }
         }) }), steer: async () => '', interrupt: async () => {}, close: async () => {},
       }
@@ -42,7 +45,13 @@ function fixture(send?: (reply: RuntimeReply) => Promise<void>, inspectHistory?:
     store.updateTask(t.id, { state: 'running' })
     return { task: store.task(t.id)!, input }
   }
-  const enqueue = (text: string, extra: Partial<RuntimeReply> = {}) => store.reply({ botId: bot.botId, groupId: bot.groupId, author: 'router', purpose: 'chat', text, policyRevision: 1, key: text, ...extra })
+  // 本文件验证发送调度；Worker输入先模拟已通过Router整理。模型入口另有独立集成测试。
+  const enqueue = (text: string, extra: Partial<RuntimeReply> = {}) => {
+    const reply = store.reply({ botId: bot.botId, groupId: bot.groupId, author: 'router', purpose: 'chat', text, policyRevision: 1, key: text, ...extra, ...(extra.purpose === 'question' ? { questionId: extra.questionId ?? extra.key } : {}) })
+    if (reply.author === 'router') return reply
+    store.presentWorkerReply(bot.botId, reply.id, [text], '')
+    return store.replies(bot.botId).find(r => r.sourceReplyId === reply.id)!
+  }
   cleanups.push(async () => { await runtime.close(); store.close(); rmSync(root, { recursive: true, force: true }) })
   return { runtime, store, bot, root, sent, receive, task, enqueue, modelCalls: () => modelCalls }
 }
@@ -58,13 +67,13 @@ test('Worker 已有最终结果时，取消同任务尚未发送的受理话并�
   expect(f.modelCalls()).toBe(0)
 })
 
-test('新输入暂停前台时，Worker结果仍即时发出且淘汰旧受理话，不事后补发', async () => {
+test('新输入暂停前台整理的结果，处理新输入后续发且不复活旧受理话', async () => {
   const f = fixture(); const { task, input } = f.task()
   const ack = f.store.pendingReplies('bot')[0]
   const next = f.receive('哈哈')
   f.enqueue('报告已完成。', { author: 'worker', purpose: 'result', taskId: task.id, inputId: input.id, taskRevision: 1 })
   await f.runtime.flush('bot')
-  expect(f.sent.map(r => r.text)).toEqual(['报告已完成。'])
+  expect(f.sent).toEqual([])
   f.store.markInput(next.id, 'routed', { action: 'reply', replies: [] })
   await f.runtime.flush('bot')
   expect(f.sent.map(r => r.text)).toEqual(['报告已完成。'])

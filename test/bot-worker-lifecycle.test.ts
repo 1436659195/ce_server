@@ -1,9 +1,11 @@
+import { routerCall } from './helpers/router-decision'
 import { afterEach, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { BotRuntimeService, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
+import { silentMemoryClient } from './helpers/model-client'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
 import type { RuntimeBot, RuntimeTask } from '../src/cli/bot-runtime/types'
 import type { BotOperation } from '../src/cli/bot-permissions'
@@ -18,24 +20,31 @@ function gate() {
   return { promise, release }
 }
 interface FixtureOptions {
+  fullAccess?: boolean
   accessDelayMs?: number
   accessGate?: ReturnType<typeof gate>
   firstWorkerCloseGate?: ReturnType<typeof gate>
   seed?: (store: BotRuntimeStore, bot: RuntimeBot) => void
   runTool?: (tool: string, args: Record<string, unknown>, dir: string) => Promise<string>
   routerReads?: (call: (tool: string, args?: Record<string, unknown>) => Promise<unknown>) => Promise<void>
+  resumeIntentMs?: number
+  tickMs?: number
+  followupQuietMs?: number
 }
 function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: FixtureOptions | number = {}) {
   const options = typeof optionsOrDelay === 'number' ? { accessDelayMs: optionsOrDelay } : optionsOrDelay
   const dir = mkdtempSync(join(tmpdir(), 'ce-worker-life-'))
   const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
   const bot: RuntimeBot = { botId: 'bot-a', name: '助理', groupId: 'dm', ownerPhoneId: 'owner', sourceCwd: dir, directory: dir, platform: 'codex', commandSandbox: true, policyRevision: 1, permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'ask', execute: 'ask', commanders: 'members', allowedPhoneIds: [] } }
-  store.saveSettings({ botId: bot.botId, mode: 'router-worker', revision: 1, profile: '', model: '', experiences: [] })
+  if (options.fullAccess) { bot.workerAccessMode = 'full-access'; bot.commandSandbox = false }
+  store.saveSettings({ botId: bot.botId, mode: 'router-worker', revision: 1, profile: '', model: '' })
   options.seed?.(store, bot)
-  const sent: string[] = []; const actions: string[] = []; const steers: string[] = []; const workerPayloads: string[] = []
+  const sent: string[] = []; const actions: string[] = []; const steers: string[] = []; const workerPayloads: string[] = []; const workerThreads: Array<{ method: string; instructions: string; tools?: Array<{ name: string }> }> = []
   let workerOptions: RuntimeClientOptions | undefined; let workerDone: ((v: CodexTurn) => void) | undefined; let started = 0; let calls = 0
   let workerClients = 0; let workerCloses = 0
   const service = new BotRuntimeService({ routerQuietMs: 0, store, rootDir: dir, getBot: () => bot, sendReply: async reply => { sent.push(reply.text) },
+    ...(options.tickMs !== undefined ? { tickMs: options.tickMs } : {}), ...(options.resumeIntentMs !== undefined ? { resumeIntentMs: options.resumeIntentMs } : {}),
+    ...(options.followupQuietMs !== undefined ? { followupQuietMs: options.followupQuietMs } : {}),
     checkAccess: async () => {
       if (options.accessDelayMs) await Bun.sleep(options.accessDelayMs)
       if (options.accessGate) await options.accessGate.promise
@@ -48,19 +57,21 @@ function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: Fixt
       return options.runTool ? options.runTool(tool, args, dir) : '文件内容'
     } }),
     createClient: (role, opts) => {
+      if (role === 'memory') return silentMemoryClient()
       if (role === 'worker') workerOptions = opts
       const workerNumber = role === 'worker' ? ++workerClients : 0
       let clientDone: ((v: CodexTurn) => void) | undefined
       const threadId = `thread-${role}`
       return {
-        initialize: async () => {}, startThread: async () => threadId, resumeThread: async () => threadId,
+        initialize: async () => {}, startThread: async options => { if (role === 'worker') workerThreads.push({ method: 'start', ...options }); return threadId }, resumeThread: async (_id, options) => { if (role === 'worker') workerThreads.push({ method: 'resume', ...options }); return threadId },
         startTurn: async (_threadId, text) => {
           if (role === 'router') {
-            const decision = decisions.shift()
+            const context = JSON.parse(text)
+            const decision = context.currentMessages.length ? decisions.shift() : { action: 'reply', replies: [context.workerMessage.text] }
             const call = (tool: string, args: Record<string, unknown> = {}) => opts.onToolCall({ threadId, turnId: 'turn-router', callId: `router-${++calls}`, tool, arguments: args })
             const done = Promise.resolve().then(async () => {
-              await options.routerReads?.(call)
-              if (decision) await call('router_decide', { policyRevision: 1, feasibility: 'can', ...decision })
+              if (context.currentMessages.length) await options.routerReads?.(call)
+              if (decision) await call('router_decide', routerCall({ feasibility: 'can', ...decision, ...(context.workerMessage ? { workerReplyId: context.workerMessage.id, ...(context.currentMessages.length ? { workerReplyIndexes: decision.action === 'answer' ? [] : [0] } : {}) } : {}) }))
               return { id: 'turn-router', status: 'completed' }
             })
             return { threadId, turnId: 'turn-router', done }
@@ -88,9 +99,48 @@ function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: Fixt
   })
   const send = (seq: number, text: string, senderId = 'owner') => service.receive(bot.botId, { groupId: 'dm', seq, text, senderId, memberId: 'member-owner', createdAt: Date.now() })
   const workerCall = (tool: string, args: Record<string, unknown> = {}) => workerOptions!.onToolCall({ threadId: 'thread-worker', turnId: 'turn-worker', callId: `worker-${++calls}`, tool, arguments: args } satisfies CodexToolCall)
-  return { store, service, bot, dir, send, sent, steers, actions, workerPayloads, workerCall, started: () => started, workerCloses: () => workerCloses, complete: () => workerDone?.({ id: 'turn-worker', status: 'completed' }) }
+  return { store, service, bot, dir, send, sent, steers, actions, workerPayloads, workerThreads, workerCall, get workerOptions() { return workerOptions }, started: () => started, workerCloses: () => workerCloses, complete: () => workerDone?.({ id: 'turn-worker', status: 'completed' }) }
 }
 const start = { action: 'start', delivery: 'chat', replyText: '我先看现有材料。', newCase: { title: '论文 A', object: '论文 A', goal: '解读' }, goal: '写报告', acceptance: ['交付报告'], allowedOps: ['read', 'create', 'edit', 'delete'], exclusions: [] }
+
+test('全权限工单持久化软隔离约束，在原目录启动，追加和续接均重申约束', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { fullAccess: true })
+  f.send(1, '检查项目'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks(f.bot.botId)[0]
+  expect(f.workerOptions).toMatchObject({ cwd: f.dir, accessMode: 'full-access' })
+  expect(task.mandate).toMatchObject({ executionMode: 'full-access', directoryIsolation: 'soft', directory: f.dir })
+  expect(task.mandate.safetyInstructions).toContain('不要更改工作目录之外的任何文件')
+  expect(task.mandate.safetyInstructions).toContain('不得破坏系统')
+  expect(task.mandate.allowedOps).toContain('execute')
+  expect(f.workerThreads[0].instructions).toContain(f.dir)
+  expect(f.workerThreads[0].tools?.map(t => t.name)).not.toContain('project_read_file')
+  decisions.push({ action: 'append', taskId: task.id, replyText: '可以一起处理。' })
+  f.send(2, '补充一份说明'); await waitFor(() => f.steers.length === 1)
+  expect(JSON.parse(f.steers[0]).executionPolicy.instructions).toContain('不要更改工作目录之外的任何文件')
+  const input = f.store.inputs(task.id)[0]
+  await f.workerCall('work_consume_input', { inputId: input.id })
+  await f.workerCall('work_report', { summary: '已检查', resolutions: [{ inputId: input.id, resolution: '已补充' }] })
+  await f.workerCall('work_finish', { revision: f.store.task(task.id)!.revision, text: '检查完成', artifactIds: [], checks: ['本地核对'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  decisions.push({ ...start, newCase: undefined, caseId: task.caseId })
+  f.send(3, '继续补充说明'); await waitFor(() => f.started() === 2)
+  expect(f.workerThreads[1].method).toBe('resume')
+  expect(f.workerThreads[1].instructions).toContain('不要更改工作目录之外的任何文件')
+})
+
+test('全权限 Worker 获得已接收二进制附件的只读本地路径，可交给原生解析工具', async () => {
+  const f = fixture([start], { fullAccess: true })
+  const bytes = Buffer.concat([Buffer.from('PK\x03\x04'), Buffer.alloc(240000)])
+  const begun = f.service.upload(f.bot.botId, 'owner', { action: 'begin', requestId: 'binary-input', name: 'sample.docx', size: bytes.length, mime: '' }) as { id: string }
+  f.service.upload(f.bot.botId, 'owner', { action: 'chunk', uploadId: begun.id, offset: 0, data: bytes.toString('base64') })
+  const attachment = f.service.upload(f.bot.botId, 'owner', { action: 'finish', uploadId: begun.id, hash: createHash('sha256').update(bytes).digest('hex') }) as any
+  f.service.receive(f.bot.botId, { groupId: 'dm', seq: 1, senderId: 'owner', memberId: 'member-owner', text: '读取文档', attachments: [attachment], createdAt: Date.now() })
+  await waitFor(() => f.started() === 1)
+  const result = await f.workerCall('work_read_attachment', { attachmentId: attachment.id }) as { localPath: string; instruction: string }
+  expect(readFileSync(result.localPath)).toEqual(bytes)
+  expect(result.instruction).toContain('只读')
+})
 
 test('上传材料进入 Worker 原消息与活动补充，读取图片返回多模态内容而非 base64 文本', async () => {
   const decisions: Array<Record<string, unknown>> = [start]
@@ -181,7 +231,7 @@ test('闲聊无工单；原消息重放不再次运行 Router 或发回复', asy
   expect(f.store.tasks()).toHaveLength(0)
   expect(f.started()).toBe(0)
 })
-test('活动 Worker 中追加原话立即 steer；前台不等待完成，专业回答直接发出', async () => {
+test('活动 Worker 中追加原话立即 steer；前台不等待完成，专业回答经前台发出', async () => {
   const decisions: Array<Record<string, unknown>> = [start]
   const f = fixture(decisions)
   f.send(1, '写论文 A 报告'); await waitFor(() => f.started() === 1)
@@ -233,7 +283,7 @@ test('长工具执行中追问进度进入原 Worker，答案从统一出口发�
     await f.workerCall('work_finish', { revision: 2, text: '材料已核对完成。', artifactIds: [], checks: ['已确认读取结果'] })
     f.complete(); await waitFor(() => f.sent.includes('材料已核对完成。'))
     expect(f.store.task(task.id)?.state).toBe('completed')
-    expect(f.store.replies('bot-a').filter(r => r.purpose === 'answer')).toHaveLength(1)
+    expect(f.store.replies('bot-a').filter(r => r.author === 'router' && r.purpose === 'answer')).toHaveLength(1)
     expect(f.started()).toBe(1)
   } finally { toolGate.release() }
 })
@@ -294,7 +344,7 @@ test('同一追问的输入 ID 和原消息 ID 共用一条回复，不能分条
   await f.workerCall('work_reply', { replyToInputId: input.id, text: '第一部分：方法。' })
   await f.workerCall('work_reply', { replyToInputId: input.inboxId, text: '第二部分：局限。' })
   await waitFor(() => f.sent.includes('第一部分：方法。'))
-  const replies = f.store.replies('bot-a').filter(r => r.purpose === 'answer')
+  const replies = f.store.replies('bot-a').filter(r => r.author === 'router' && r.purpose === 'answer')
   expect(replies).toHaveLength(1)
   expect(replies[0].inputId).toBe(input.inboxId)
   expect(f.sent).not.toContain('第二部分：局限。')
@@ -474,10 +524,11 @@ test('Router 查工单只披露有限未处理输入，不把已处理长历史�
 test('Router 渐进式经验查询既限制单次内容，也限制本轮累计内容', async () => {
   const results: unknown[] = []; const errors: string[] = []
   const f = fixture([{ action: 'reply', replyText: '我会根据已读取的经验判断。' }], {
-    seed: (store, bot) => store.saveSettings({ ...store.settings(bot.botId), experiences: [
-      { id: 'small', summary: '摘要', detail: '验'.repeat(2900), source: '本地测试', active: true },
-      { id: 'large', summary: '摘要', detail: '验'.repeat(5000), source: '本地测试', active: true },
-    ] }),
+    seed: (store, bot) => {
+      const base = { botId: bot.botId, state: 'active' as const, object: '经验', goal: '摘要', approach: '摘要', checks: [], verified: false, sourceTaskId: '', sourceCaseId: '', uses: 3, platform: '', toolFingerprint: 'legacy', migrated: true as const, createdAt: 1, updatedAt: 1 }
+      store.saveExperience({ ...base, id: 'small', detail: '验'.repeat(2900) })
+      store.saveExperience({ ...base, id: 'large', detail: '验'.repeat(5000) })
+    },
     routerReads: async call => {
       for (const experienceId of ['large', 'small', 'small', 'small']) {
         try { results.push(await call('experience_read', { experienceId })) }
@@ -490,4 +541,130 @@ test('Router 渐进式经验查询既限制单次内容，也限制本轮累计�
   expect(errors).toHaveLength(2)
   expect(errors.every(error => error.includes('内容预算'))).toBe(true)
   expect(results.reduce<number>((sum, value) => sum + JSON.stringify(value).length, 0)).toBeLessThanOrEqual(8000)
+})
+
+test('聊天里说继续：恢复最近停下的任务并重开 Worker，原话有处理记录', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  decisions.push({ action: 'stop', taskId: task.id, replyText: '好的，先停下。' })
+  f.send(2, '别搞了'); await waitFor(() => f.store.task(task.id)?.state === 'stopped')
+  expect(f.sent).toContain('好的，先停下。')
+  decisions.push({ action: 'resume', taskId: task.id, replyText: '好，接着做。' })
+  f.send(3, '继续'); await waitFor(() => f.started() === 2)
+  expect(f.store.task(task.id)?.state).toBe('running')
+  expect(f.store.task(task.id)?.error).toBeUndefined()
+  expect(f.store.runs().filter(r => r.taskId === task.id)).toHaveLength(2)
+  expect(f.sent).toContain('好，接着做。')
+  expect(f.store.failedInputs(f.bot.botId)).toHaveLength(0)
+})
+
+test('停止尚未完成时说继续：不报错，登记意图，真正停下后自动恢复', async () => {
+  const closing = gate(); const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { firstWorkerCloseGate: closing }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  let stopped = false
+  const stopping = f.service.control('bot-a', 'owner', { action: 'stop', taskId: task.id, expectedRevision: 1, requestId: 'stop-in-progress' }).then(() => { stopped = true })
+  await waitFor(() => f.store.task(task.id)?.state === 'stopping' && f.workerCloses() > 0)
+  expect(stopped).toBe(false)
+  decisions.push({ action: 'resume', taskId: task.id, replyText: '好，停下后我接着做。' })
+  const resumed = f.send(2, '继续')
+  await waitFor(() => f.store.task(task.id)?.resumeIntent !== undefined && f.store.inbox(resumed.id)?.state === 'routed')
+  expect(f.store.task(task.id)?.state).toBe('stopping')
+  expect(f.store.failedInputs(f.bot.botId)).toHaveLength(0)
+  expect(f.sent).toContain('好，停下后我接着做。')
+  closing.release(); await stopping
+  await waitFor(() => f.started() === 2)
+  expect(f.store.task(task.id)?.state).toBe('running')
+  expect(f.store.task(task.id)?.resumeIntent).toBeUndefined()
+  expect(f.store.task(task.id)?.error).toBeUndefined()
+})
+
+test('等待停止超时：恢复意图作废并留下说明，停下后不自动恢复', async () => {
+  const closing = gate(); const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { firstWorkerCloseGate: closing, resumeIntentMs: 50, tickMs: 20 }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  let stopped = false
+  const stopping = f.service.control('bot-a', 'owner', { action: 'stop', taskId: task.id, expectedRevision: 1, requestId: 'stop-slow' }).then(() => { stopped = true })
+  await waitFor(() => f.store.task(task.id)?.state === 'stopping' && f.workerCloses() > 0)
+  decisions.push({ action: 'resume', taskId: task.id })
+  f.send(2, '继续')
+  await waitFor(() => f.store.task(task.id)?.error?.includes('超时') === true)
+  expect(stopped).toBe(false)
+  closing.release(); await stopping
+  await waitFor(() => f.store.task(task.id)?.state === 'stopped')
+  expect(f.store.task(task.id)?.resumeIntent).toBeUndefined()
+  expect(f.store.task(task.id)?.error).toContain('超时')
+  await Bun.sleep(80)
+  expect(f.started()).toBe(1)
+})
+
+test('有未知执行时说继续被拒：任务不动，原话留下可重试的失败记录', async () => {
+  let task!: RuntimeTask
+  const decisions: Array<Record<string, unknown>> = [{ action: 'resume' }]
+  const f = fixture(decisions, { seed: (store, bot) => {
+    task = seedTask(store, bot)
+    store.saveRun({ id: 'orphan-run', botId: bot.botId, taskId: task.id, state: 'unknown', createdAt: Date.now(), updatedAt: Date.now() })
+    store.updateTask(task.id, { state: 'recovering', latestRunId: 'orphan-run' })
+  } })
+  decisions[0].taskId = task.id
+  f.send(2, '继续')
+  await waitFor(() => f.store.failedInputs(f.bot.botId).length === 1)
+  expect(f.store.failedInputs(f.bot.botId)[0].error).toContain('核对')
+  expect(f.store.task(task.id)?.state).toBe('recovering')
+  expect(f.store.task(task.id)?.resumeIntent).toBeUndefined()
+  expect(f.started()).toBe(0)
+})
+
+test('非阻塞提问经前台发出，任务不停下，Worker 继续干活', async () => {
+  const f = fixture([start], { tickMs: 3_600_000 }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  const asked = await f.workerCall('work_ask_user', { text: '报告面向谁？', blocks: false }) as { questionId: string }
+  expect(f.store.task(task.id)?.state).toBe('running')
+  expect(f.store.task(task.id)?.question).toBeUndefined()
+  expect(f.store.task(task.id)?.followup).toMatchObject({ questionId: asked.questionId, askCount: 1 })
+  await waitFor(() => f.sent.includes('报告面向谁？'))
+  await expect(f.workerCall('project_read_file', { path: 'paper.txt' })).resolves.toHaveProperty('operationId')
+  expect(f.store.task(task.id)?.state).toBe('running')
+})
+
+test('主人任何回复到达即清零跟进；再提醒允许前台0泡，普通必要问题仍不能丢', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { tickMs: 3_600_000 }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  await f.workerCall('work_ask_user', { text: '报告面向谁？', blocks: false })
+  await waitFor(() => f.sent.includes('报告面向谁？'))
+  decisions.push({ action: 'reply', replyText: '好的，不用回答也行。' })
+  f.send(2, '不用了')
+  await waitFor(() => f.store.task(task.id)?.followup === undefined)
+  expect(f.store.task(task.id)?.state).toBe('running')
+  const reminder = f.store.reply({ botId: 'bot-a', groupId: 'dm', author: 'worker', purpose: 'question', text: '再问一次？', policyRevision: 1, key: 'nudge-x', followupReminder: true })
+  f.store.presentWorkerReply('bot-a', reminder.id, [], '主人未答，且不必再提')
+  expect(f.store.replies('bot-a').find(r => r.id === reminder.id)?.state).toBe('routed')
+  const plain = f.store.reply({ botId: 'bot-a', groupId: 'dm', author: 'worker', purpose: 'question', text: '给谁看？', policyRevision: 1, key: 'q-plain' })
+  expect(() => f.store.presentWorkerReply('bot-a', plain.id, [], 'x')).toThrow(/必要问题/)
+})
+
+test('主人安静超过阈值只再提一次，之后不再提', async () => {
+  const f = fixture([start], { tickMs: 20, followupQuietMs: 30 }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  await f.workerCall('work_ask_user', { text: '报告面向谁？', blocks: false })
+  await waitFor(() => f.sent.filter(t => t === '报告面向谁？').length === 2)
+  expect(f.store.task(task.id)?.followup?.askCount).toBe(2)
+  await Bun.sleep(200)
+  expect(f.sent.filter(t => t === '报告面向谁？')).toHaveLength(2)
+  expect(f.store.task(task.id)?.state).toBe('running')
+})
+
+test('任务完成后不再提醒', async () => {
+  const f = fixture([start], { tickMs: 20, followupQuietMs: 30 }); f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  await f.workerCall('work_ask_user', { text: '报告面向谁？', blocks: false })
+  await waitFor(() => f.sent.includes('报告面向谁？'))
+  await f.workerCall('work_finish', { revision: 1, text: '报告完成。', artifactIds: [], checks: ['检查通过'] })
+  expect(f.store.task(task.id)?.state).toBe('completed')
+  expect(f.store.task(task.id)?.followup).toBeUndefined()
+  f.complete()
+  await Bun.sleep(200)
+  expect(f.sent.filter(t => t === '报告面向谁？')).toHaveLength(1)
 })

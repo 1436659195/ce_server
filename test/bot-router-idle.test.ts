@@ -1,8 +1,10 @@
+import { routerCall } from './helpers/router-decision'
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BotRuntimeService, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
+import { silentMemoryClient } from './helpers/model-client'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
 import type { CodexToolCall, CodexTurn } from '../src/cli/bot-runtime/codex'
 import type { RuntimeBot } from '../src/cli/bot-runtime/types'
@@ -24,6 +26,7 @@ function fixture(idleMs?: number) {
   const service = new BotRuntimeService({ routerQuietMs: 0, store, rootDir: dir, routerIdleMs: idleMs, getBot: id => ({ ...bot, botId: id }), sendReply: async () => {},
     checkAccess: async () => { throw new Error('no worker') }, openTools: () => { throw new Error('no worker') },
     createClient: (role, options) => {
+      if (role === 'memory') return silentMemoryClient()
       expect(role).toBe('router')
       let resolve: ((turn: CodexTurn) => void) | undefined
       const c = { options, closed: 0, threads: 0, inputs: [] as any[], calls: [] as CodexToolCall[], finish: async (_status = 'completed') => {} }
@@ -33,7 +36,7 @@ function fixture(idleMs?: number) {
         startTurn: async (threadId, text) => {
           const context = JSON.parse(text); c.inputs.push(context)
           const turnId = `turn-${c.inputs.length}`
-          const call: CodexToolCall = { threadId, turnId, callId: turnId, tool: 'router_decide', arguments: { action: 'reply', feasibility: 'can', policyRevision: 1, replyText: `回复：${context.currentMessage.seq}` } }
+          const call: CodexToolCall = { threadId, turnId, callId: turnId, tool: 'router_decide', arguments: routerCall({ action: 'reply', replyText: `回复：${context.currentMessage.seq}` }) }
           c.calls.push(call)
           const done = new Promise<CodexTurn>(r => { resolve = r })
           c.finish = async (status = 'completed') => {

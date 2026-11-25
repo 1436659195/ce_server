@@ -12,7 +12,7 @@ if (!process.argv.includes('--live')) throw new Error('请显式传入 --live �
 const root = mkdtempSync(join(tmpdir(), 'ce-attachment-live-'))
 const store = new BotRuntimeStore(join(root, 'runtime.sqlite'))
 const bot: RuntimeBot = { botId: 'attachment-live-bot', name: '附件验证助理', groupId: 'local-dm', ownerPhoneId: 'test-owner', sourceCwd: root, directory: root, policyRevision: 1, platform: 'codex', commandSandbox: true, permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'deny', execute: 'deny', commanders: 'owner', allowedPhoneIds: [] } }
-store.saveSettings({ botId: bot.botId, mode: 'router-worker', revision: 1, profile: '根据用户提供的真实附件完成工作，文件通过聊天交付。', model: '', experiences: [] })
+store.saveSettings({ botId: bot.botId, mode: 'router-worker', revision: 1, profile: '根据用户提供的真实附件完成工作，文件通过聊天交付。', model: '' })
 const toolService = new BotToolService({ endpoint: () => '', authorize: async () => { throw new Error('需要运行时授权') } })
 const deliveries: RuntimeAttachment[] = []
 const runtime = new BotRuntimeService({ store, rootDir: root, getBot: () => bot,

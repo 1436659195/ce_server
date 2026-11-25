@@ -1,8 +1,10 @@
+import { routerCall } from './helpers/router-decision'
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BotRuntimeService, type RuntimeClient, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
+import { silentMemoryClient } from './helpers/model-client'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
 import type { RuntimeBot, RuntimeInbox } from '../src/cli/bot-runtime/types'
 import type { CodexTurn } from '../src/cli/bot-runtime/codex'
@@ -18,7 +20,7 @@ async function waitFor(predicate: () => boolean) {
   for (let attempt = 0; attempt < 100 && !predicate(); attempt++) await Bun.sleep(5)
   expect(predicate()).toBe(true)
 }
-function fixture(createClient?: (role: 'router' | 'worker', options: RuntimeClientOptions) => RuntimeClient) {
+function fixture(createClient?: (role: 'router' | 'worker' | 'memory', options: RuntimeClientOptions) => RuntimeClient) {
   const dir = mkdtempSync(join(tmpdir(), 'ce-runtime-settings-'))
   const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
   const probe = gate()
@@ -32,12 +34,12 @@ function fixture(createClient?: (role: 'router' | 'worker', options: RuntimeClie
     store, rootDir: dir, getBot: () => ({ ...bot }), sendReply: async () => {},
     checkAccess: async () => ({ directory: dir, permissions: bot.permissions, revision: bot.policyRevision }),
     openTools: () => { throw new Error('settings test does not execute project tools') },
-    createClient: createClient ?? (() => ({
+    createClient: (role, options) => role === 'memory' ? silentMemoryClient() : (createClient ?? (() => ({
       initialize: async () => { await probe.promise; if (probeError) throw probeError },
       startThread: async () => { throw new Error('unexpected thread') }, resumeThread: async id => id,
       startTurn: async () => { throw new Error('unexpected turn') },
       steer: async () => '', interrupt: async () => {}, close: async () => {},
-    })),
+    })))(role, options),
   })
   cleanups.push(async () => { probe.release(); await service.close(); await Promise.resolve(); store.close(); rmSync(dir, { recursive: true, force: true }) })
   return { service, store, bot, probe, failProbe: () => { probeError = new Error('probe unavailable') } }
@@ -96,10 +98,10 @@ test('切换期新消息显式失败，启用后只能由 owner 按原消息重�
           const context = JSON.parse(text)
           routedInputs.push(context.currentMessage.id)
           return { threadId, turnId: 'router-turn', done: Promise.resolve().then(async () => {
-            await options.onToolCall({ threadId, turnId: 'router-turn', callId: 'decision', tool: 'router_decide', arguments: {
+            await options.onToolCall({ threadId, turnId: 'router-turn', callId: 'decision', tool: 'router_decide', arguments: routerCall({
               action: 'start', delivery: 'chat', feasibility: 'can', policyRevision: 1, replyText: '可以，我先看看。',
               newCase: { title: context.currentMessage.text, object: '当前项目', goal: '调查功能' }, goal: '调查功能', allowedOps: ['read'],
-            } })
+            }) })
             return { id: 'router-turn', status: 'completed' }
           }) }
         }
