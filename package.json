@@ -1,6 +1,6 @@
 {
   "name": "ce-server",
-  "version": "0.1.0",
+  "version": "0.1.0-directory-approval",
   "private": true,
   "type": "module",
   "description": "Coding Everywhere 中继 + ce CLI(TS,Bun 构建)",

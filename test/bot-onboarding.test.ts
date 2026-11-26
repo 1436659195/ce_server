@@ -48,6 +48,24 @@ test('目录保存等待旧运行上下文关闭，成功后才能立即接收�
   expect(await result).toMatchObject({ ok: true, data: { workDirectory: { path: '/other' } } })
 })
 
+test('运行时批准的绝对目录在设备范围内校验并持久化，不递归停止确认中的 Router', async () => {
+  const f = fixture(); await f.chat.addAgent(f.input, 'owner')
+  const next = join(f.dir, 'approved'); mkdirSync(next)
+  try {
+    expect(() => f.chat.resolveRuntimeDirectory('/etc')).toThrow(/范围|根目录/)
+    expect(() => f.chat.resolveRuntimeDirectory('approved')).toThrow(/绝对/)
+    symlinkSync('/etc', join(f.dir, 'escape-approved'))
+    expect(() => f.chat.resolveRuntimeDirectory(join(f.dir, 'escape-approved'))).toThrow(/根目录/)
+    expect(() => f.chat.commitRuntimeDirectory('小林', 'stranger', 1, next)).toThrow(/owner|创建者/)
+    expect(() => f.chat.commitRuntimeDirectory('小林', 'owner', 0, next)).toThrow(/版本/)
+    const identity = f.chat.runtimeBot('小林').botId
+    f.chat.commitRuntimeDirectory('小林', 'owner', 1, next)
+    expect(f.chat.runtimeBot('小林')).toMatchObject({ botId: identity, directory: next, policyRevision: 2 })
+    expect(f.state().agents['小林'].cwd).toBe(next)
+    expect(f.invalidations()).toBe(0)
+  } finally { rmSync(f.dir, { recursive: true, force: true }) }
+})
+
 test('owner 可切到另一项目，保存实际目录与版本，保留身份和创建配置', async () => {
   const f = fixture(); await f.chat.addAgent(f.input, 'owner'); mkdirSync(join(f.dir, 'other'))
   const before = f.state().agents['小林']
@@ -111,7 +129,6 @@ test('独立入职不依赖来源会话；真实目录和身份持久化，初�
   expect(f.probes[0]).toContain('女')
   expect(f.state().agents['小林'].bot.onboarding.identity.age).toBe(28)
   expect((await f.chat.roster()).botOnboardingProtocol).toBe(1)
-  expect((await f.chat.roster()).remoteGrantProtocol).toBe(1) // 其他电脑连接:手机据此判断这台机器的 ce 支持开远程授权
 })
 
 test('数字员工默认全权限，不依赖命令沙箱，但只有owner有权指挥', async () => {

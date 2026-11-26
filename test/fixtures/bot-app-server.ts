@@ -1,8 +1,30 @@
 // app-server 协议测试对端：只模拟 RPC 生命周期，不模拟模型判断。
 import { createInterface } from 'node:readline'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+const compatPath = process.argv.find(arg => arg.startsWith('--fixture-compat='))?.slice('--fixture-compat='.length)
+const compat = compatPath ? JSON.parse(readFileSync(compatPath, 'utf8')) : undefined
 const probeLog = process.argv.find(arg => arg.startsWith('--fixture-probe-log='))?.slice('--fixture-probe-log='.length)
 const recordProbe = (event: string) => { if (probeLog) appendFileSync(probeLog, JSON.stringify({ event, at: Date.now() }) + '\n') }
+if (compat && process.argv.includes('--version')) { recordProbe('version'); console.log(compat.version); process.exit(0) }
+if (process.argv.includes('--help')) { recordProbe('help'); console.log('Usage: codex app-server --stdio --listen <URL> generate-json-schema'); process.exit(0) }
+if (process.argv.includes('generate-json-schema')) {
+  recordProbe('schema')
+  const out = process.argv[process.argv.indexOf('--out') + 1]
+  const schemas = JSON.parse(readFileSync(join(import.meta.dir, 'codex-compat-schema.json'), 'utf8'))
+  if (compat?.removeField) { const [file, field] = compat.removeField; delete schemas[file].properties[field] }
+  if (compat?.removeMethod) schemas['ClientRequest.json'].oneOf = schemas['ClientRequest.json'].oneOf.filter((x: any) => !x.properties.method.enum.includes(compat.removeMethod))
+  if (compat?.badEnvironments) schemas['v2/ThreadStartParams.json'].properties.environments = { type: 'string' }
+  if (compat?.badDynamicTools) schemas['v2/ThreadStartParams.json'].properties.dynamicTools = { type: 'string' }
+  if (compat?.newToolRequirement) {
+    const tool = schemas['v2/ThreadStartParams.json'].definitions.DynamicToolSpec.oneOf[0]
+    tool.properties.newRequiredField = { type: 'string' }; tool.required.push('newRequiredField')
+  }
+  if (compat?.badTurnId) schemas['v2/TurnSteerParams.json'].properties.expectedTurnId = { type: 'integer' }
+  if (compat?.requiresModel) schemas['v2/ThreadStartParams.json'].required = ['model']
+  for (const [file, schema] of Object.entries(schemas)) { mkdirSync(dirname(join(out, file)), { recursive: true }); writeFileSync(join(out, file), JSON.stringify(schema)) }
+  process.exit(0)
+}
 if (probeLog && (process.argv.includes('--version') || process.argv.includes('mcp'))) {
   const probe = process.argv.includes('--version') ? 'version' : 'mcp'
   recordProbe(probe + ':start')
@@ -13,6 +35,7 @@ if (probeLog && (process.argv.includes('--version') || process.argv.includes('mc
 }
 recordProbe('app-server:start')
 let turn = ''
+let turnCount = 0
 let threadConfig: unknown
 let turnConfig: unknown
 const output = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\n')
@@ -27,11 +50,11 @@ createInterface({ input: process.stdin }).on('line', line => {
   else if (r.method === 'thread/start' || r.method === 'thread/resume') {
     threadConfig = r.params
     if (r.params.sandbox !== 'danger-full-access' && (r.params.environments?.length !== 0 || r.params.sandbox !== 'read-only')) return output({ id: r.id, error: { code: -1, message: 'unsafe thread config' } })
-    reply({ thread: { id: 'thread-test' } })
+    reply({ thread: { id: 'thread-test' }, sandbox: { type: compat?.unsafeSandbox ? 'dangerFullAccess' : r.params.sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'readOnly' }, approvalPolicy: 'never' })
   } else if (r.method === 'turn/start') {
     turnConfig = r.params
     if (r.params.input[0].text === 'failed-start') return reply({ turn: { id: 'failed-turn', status: 'failed', error: { message: 'fixture model unavailable' } } })
-    turn = 'turn-test'
+    turn = ++turnCount === 1 ? 'turn-test' : `turn-test-${turnCount}`
     output({ method: 'turn/started', params: { threadId: 'thread-test', turn: { id: turn, status: 'inProgress' } } })
     // 快速完成事件故意先于 start 响应，验证客户端不会丢掉结束通知。
     if (r.params.input[0].text === 'fast') done(turn)
@@ -62,6 +85,8 @@ createInterface({ input: process.stdin }).on('line', line => {
     process.stdout.write(bytes.subarray(0, bytes.length - 4))
     setTimeout(() => process.stdout.write(bytes.subarray(bytes.length - 4)), 5)
   } else if (r.method === 'test/config') reply({ thread: threadConfig, turn: turnConfig })
+  else if (r.method === 'test/auth-error') output({ id:r.id,error:{code:401,message:'Unauthorized api_key=private-test-key'} })
+  else if (r.method === 'test/method-error') output({ id:r.id,error:{code:-32601,message:'unknown method private-test-key'} })
   else if (r.method === 'test/never') { /* 用于超时测试 */ }
   else if (r.method === 'test/tool') { output(toolRequest(r.params.turnId)); reply({ issued: true }) }
   else if (r.method === 'test/closing') {

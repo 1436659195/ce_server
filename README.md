@@ -61,12 +61,19 @@ bun run src/cli/main.ts --relay=wss://ce.coding-everywhere.xyz --jupyter=http://
 
 ## 编译分发二进制
 
+当前数字人版本位于 `feat/bot-runtime` 分支，版本为 `v0.1.0-directory-approval`，包含卷宗接续、目录变更后继续、口头/卡片目录确认及 Agent 能力检测。请在中继机器的本仓库目录拉取这个分支后构建：
+
 ```sh
+git switch feat/bot-runtime
+git pull --ff-only origin feat/bot-runtime
+bun install --frozen-lockfile
 bash scripts/build-binaries.sh
 # → dist/ce-{linux,darwin,windows}-{x64,arm64}[.exe](单文件,无运行时依赖)
 ```
 
-把 `dist/` 上传到中继的下载目录,被控机就能 `curl|sh` 拉到最新版。
+脚本同时生成 `dist/sha256.txt`。中继从本项目 `dist/` 动态读取下载文件，无须重启中继；另行构建时须将二进制与校验清单一起同步。安装入口仍为上面的一行命令。已有被控机推荐在 CE 控制台按 `u` 更新，保留配置后自动重启；Linux/macOS 安装脚本遇到正在运行的 CE 会跳过安装。
+
+Codex / CC 不再要求精确版本号，按实际协议、工具及权限能力检查；登录和 CLI 仍需在被控机配置。[运行条件、兼容性策略与验收](docs/agent-runtime-compatibility.md)。[目录确认与任务接续](docs/directory-approval.md)。
 
 ## 中继上补齐 `dist/`(让 `curl|sh` 能装 ce)
 

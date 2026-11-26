@@ -2,13 +2,13 @@ import { Database } from 'bun:sqlite'
 import { randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload, RuntimeRemoteOp } from './types'
+import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload } from './types'
 import { EXPERIENCE_ESTABLISHED_USES } from './experience'
 import { selectCases } from './cases'
 import type { RuntimeCaseUpdate, RuntimeCaseDecision } from './types'
 
-type Table = 'settings' | 'inbox' | 'cases' | 'tasks' | 'task_inputs' | 'runs' | 'tool_operations' | 'outbox' | 'artifacts' | 'controls' | 'uploads' | 'memories' | 'memory_log' | 'experiences' | 'remote_ops'
-const tables: Table[] = ['settings', 'inbox', 'cases', 'tasks', 'task_inputs', 'runs', 'tool_operations', 'outbox', 'artifacts', 'controls', 'uploads', 'memories', 'memory_log', 'experiences', 'remote_ops']
+type Table = 'settings' | 'inbox' | 'cases' | 'tasks' | 'task_inputs' | 'runs' | 'tool_operations' | 'outbox' | 'artifacts' | 'controls' | 'uploads' | 'memories' | 'memory_log' | 'experiences'
+const tables: Table[] = ['settings', 'inbox', 'cases', 'tasks', 'task_inputs', 'runs', 'tool_operations', 'outbox', 'artifacts', 'controls', 'uploads', 'memories', 'memory_log', 'experiences']
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const segments = new Intl.Segmenter('zh', { granularity: 'grapheme' })
 export function validateChatText(value: unknown): string {
@@ -146,7 +146,7 @@ export class BotRuntimeStore {
   }
   tasks(botId?: string): RuntimeTask[] { return this.all('tasks', botId) }
   task(taskId: string): RuntimeTask | undefined { return this.get('tasks', taskId) }
-  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason'>>): RuntimeTask {
+  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason' | 'revision' | 'directoryContinuation'>>): RuntimeTask {
     const task = this.task(taskId); if (!task) throw new Error('工单不存在')
     const now = Date.now()
     const next = { ...task, ...patch, ...(patch.summary !== undefined ? { summaryUpdatedAt: now } : {}), updatedAt: now }
@@ -221,6 +221,15 @@ export class BotRuntimeStore {
     })
   }
   inputs(taskId: string): RuntimeTaskInput[] { return this.all<RuntimeTaskInput>('task_inputs').filter(i => i.taskId === taskId) }
+  /** 目录确认本身也是当前需求补充；不提前消费聊天批次，待 Router 正常提交。 */
+  recordDirectoryConfirmation(task: RuntimeTask, inputIds: string[]): void {
+    if (!inputIds.length) return
+    const batch = inputIds.map(id => this.requireInbox(id))
+    if (batch.some(m => m.botId !== task.botId || m.groupId !== task.groupId || m.senderId !== task.mandate.ownerPhoneId || m.revokedAt)) throw new Error('目录确认原话归属已失效')
+    const inboxId = batch.at(-1)!.id
+    if (this.inputs(task.id).some(i => i.inboxId === inboxId)) return
+    this.put('task_inputs', { id: id('input'), botId: task.botId, taskId: task.id, inboxId, inboxIds: inputIds, kind: 'correction', text: batch.map(m => m.text).join('\n'), attachments: batch.flatMap(m => m.attachments ?? []), revision: task.revision, delivery: 'pending', createdAt: Date.now() } satisfies RuntimeTaskInput)
+  }
   input(inputId: string): RuntimeTaskInput | undefined { return this.get('task_inputs', inputId) }
   delivered(inputId: string, delivery: RuntimeTaskInput['delivery']): void {
     const input = this.input(inputId); if (!input) throw new Error('补充不存在'); this.put('task_inputs', { ...input, delivery })
@@ -334,19 +343,6 @@ export class BotRuntimeStore {
     const rows = this.db.query('SELECT body FROM memory_log WHERE bot_id=? ORDER BY rowid DESC LIMIT ?').all(botId, Math.max(1, Math.floor(limit))) as Array<{ body: string }>
     return rows.reverse().map(row => JSON.parse(row.body) as RuntimeMemoryLog)
   }
-  saveRemoteOp(op: RuntimeRemoteOp): void { this.put('remote_ops', op) }
-  remoteOps(botId: string, limit = 40): RuntimeRemoteOp[] {
-    const rows = this.db.query('SELECT body FROM remote_ops WHERE bot_id=? ORDER BY rowid DESC LIMIT ?').all(botId, Math.max(1, Math.floor(limit))) as Array<{ body: string }>
-    return rows.map(r => JSON.parse(r.body) as RuntimeRemoteOp).reverse()
-  }
-  /** 启动恢复:进行中的远程命令结果未知。 */
-  markRemoteOpsUnknown(botId: string, note: string): void {
-    for (const op of this.db.query("SELECT body FROM remote_ops WHERE bot_id=? AND json_extract(body,'$.state')='running'").all(botId) as Array<{ body: string }>) {
-      const op0 = JSON.parse(op.body) as RuntimeRemoteOp
-      this.put('remote_ops', { ...op0, state: 'unknown', error: note, finishedAt: Date.now() })
-    }
-  }
-
   experiences(botId: string): RuntimeExperience[] { return this.all('experiences', botId) }
   experience(experienceId: string): RuntimeExperience | undefined { return this.get('experiences', experienceId) }
   saveExperience(experience: RuntimeExperience): void { this.put('experiences', experience) }

@@ -37,7 +37,6 @@ import type { BotRuntimeService, RuntimeControl } from './bot-runtime/service'
 import type { RuntimeAttachment, RuntimeBot, RuntimeMemoryControl, RuntimeReply, RuntimeSettings, RuntimeUploadRequest, RuntimeView } from './bot-runtime/types'
 import { fullAccessPermissions } from './bot-runtime/worker-policy'
 import { digitalPersonDirectory, digitalPersonProfile, validateDigitalPerson, type DigitalPersonState } from './bot-onboarding'
-import type { RemoteTicket } from './remote-peer'
 
 type BotMemberIdentity = Pick<GroupMember, 'memberId' | 'name' | 'phoneId' | 'human' | 'guest'>
 type BotPolicyResult = { ok: boolean; data?: BotPolicyInfo; error?: string }
@@ -62,26 +61,9 @@ interface AgentGroupRec {
   botQueue?: Array<{ seq: number; text: string; attachments?: RuntimeAttachment[]; fromName: string; fromHuman: boolean; fromMemberId?: string; reply?: { text: string; system: boolean; offset: number } }>
 }
 
-/** 一台「其他电脑」的完整票据:密钥留在本机 chat-state(0600),永不进运行时上下文或聊天。 */
-interface StoredRemoteComputer {
-  /** 凭证编号(对端生成),同台电脑重复添加按它覆盖。 */
-  id: string
-  peerId: string
-  label: string
-  directory: string
-  directoryAbs: string
-  key: string
-  relayUrl: string
-  sid: string
-  cliPub: string
-  token: string
-  platform?: string
-  addedAt: number
-}
-
 interface AgentRec {
   /** 新 BOT 与来源 Agent 的运行上下文分离；legacy join 不设置此标记。 */
-  bot?: { id?: string; sourceSessionId: string; computers?: StoredRemoteComputer[]; dmGroupId?: string; policy?: StoredBotPolicy; onboarding?: DigitalPersonState; retirement?: { ownerPhoneId: string; requestedAt: number; completedAt?: number } }
+  bot?: { id?: string; sourceSessionId: string; dmGroupId?: string; policy?: StoredBotPolicy; onboarding?: DigitalPersonState; retirement?: { ownerPhoneId: string; requestedAt: number; completedAt?: number } }
   platform?: string
   cwd?: string
   joinedAt: number
@@ -225,19 +207,13 @@ export class ChatHub {
   attachBotRuntime(runtime: BotRuntimeService): void { this.runtime = runtime }
 
   /** 本机权威 Bot 信息；显示名仅用于首次定位，持久 ID 不随名字改变。 */
-  private resolveBotName(nameOrId: string): string {
+  runtimeBot(nameOrId: string): RuntimeBot {
     const entry = Object.entries(this.state.agents).find(([name, r]) => name === nameOrId || r.bot?.id === nameOrId)
     if (!entry) throw new Error('找不到本地 Bot')
-    return entry[0]
-  }
-
-  runtimeBot(nameOrId: string): RuntimeBot {
-    const name = this.resolveBotName(nameOrId)
-    const rec = this.state.agents[name]!
-    const policy = rec.bot?.policy
+    const [name, rec] = entry; const policy = rec.bot?.policy
     if (!rec.bot || rec.bot.retirement || !policy || !rec.cwd) throw new Error('Bot 未配置 owner 权限或已注销')
     if (!rec.bot.id) { rec.bot.id = randomUUID(); this.save(true) }
-    return { botId: rec.bot.id, name, groupId: rec.bot.dmGroupId ?? Object.keys(rec.groups)[0], ownerPhoneId: policy.ownerPhoneId, sourceCwd: rec.cwd, directory: resolveBotDirectory(rec.cwd, policy.permissions), permissions: fullAccessPermissions(policy.permissions), policyRevision: policy.revision, commandSandbox: false, workerAccessMode: 'full-access', platform: rec.platform ?? 'claude', ...(rec.bot.computers?.length ? { computers: rec.bot.computers.map(c => ({ id: c.id, label: c.label, directory: c.directory, directoryAbs: c.directoryAbs, ...(c.platform ? { platform: c.platform } : {}) })) } : {}) }
+    return { botId: rec.bot.id, name, groupId: rec.bot.dmGroupId ?? Object.keys(rec.groups)[0], ownerPhoneId: policy.ownerPhoneId, sourceCwd: rec.cwd, directory: resolveBotDirectory(rec.cwd, policy.permissions), permissions: fullAccessPermissions(policy.permissions), policyRevision: policy.revision, commandSandbox: false, workerAccessMode: 'full-access', platform: rec.platform ?? 'claude' }
   }
 
   async botRuntime(nameOrId: string, actor: string): Promise<{ ok: boolean; data?: RuntimeView; error?: string }> {
@@ -825,8 +801,8 @@ export class ChatHub {
       group.botMembers?.some(member => member.phoneId === actorPhoneId && member.human === true && !member.guest) === true
   }
 
-  private invalidateBotPolicy(name: string, rec: AgentRec): Promise<void> {
-    const stopped = rec.bot?.id ? this.runtime?.policyChanged(rec.bot.id) : undefined
+  private invalidateBotPolicy(name: string, rec: AgentRec, runtimeAlreadyStopped = false): Promise<void> {
+    const stopped = !runtimeAlreadyStopped && rec.bot?.id ? this.runtime?.policyChanged(rec.bot.id) : undefined
     for (const group of Object.values(rec.groups)) {
       delete group.botSessionId; delete group.botSessions
       for (const pending of group.botQueue ?? []) if (pending.reply && !pending.reply.system) pending.reply = { text: 'BOT 权限已更新，旧回复已作废，请重新发送消息。', system: true, offset: 0 }
@@ -871,6 +847,30 @@ export class ChatHub {
     } catch (error) { return { ok: false, error: (error as Error).message } }
   }
 
+  resolveRuntimeDirectory(directory: string): string {
+    if (!this.opts.rootDir) throw new Error('无法确认设备文件根目录')
+    if (!isAbsolute(directory) || /[\r\n\0]/.test(directory) || directory.length > 2000) throw new Error('请提供有效的目标目录绝对路径')
+    const root = realpathSync(this.opts.rootDir)
+    const rel = relative(root, resolve(directory))
+    if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('目标目录超出设备文件根目录')
+    return digitalPersonDirectory(root, '/' + rel.split(sep).join('/'))
+  }
+
+  /** 仅供运行时确认路径调用：调用方已停妥旧 Worker，不能再次关闭正在提交确认的 Router。 */
+  commitRuntimeDirectory(nameOrId: string, actor: string, expectedRevision: number, directory: string): void {
+    const current = this.runtimeBot(nameOrId); const rec = this.state.agents[current.name]; const bot = rec.bot!
+    if (!actor || actor !== bot.policy?.ownerPhoneId) throw new Error('只有 owner 创建者可以确认工作目录')
+    if (bot.onboarding?.status !== 'ready' || !this.runtime?.enabled(current.botId)) throw new Error('数字人尚未就绪')
+    if (bot.policy.revision !== expectedRevision) throw new Error('目录或权限版本已变化，请刷新')
+    const cwd = this.resolveRuntimeDirectory(directory)
+    if (cwd !== directory) throw new Error('目标目录实际位置已变化，请重新申请')
+    const previousCwd = rec.cwd; const previousPolicy = bot.policy
+    rec.cwd = cwd
+    bot.policy = { ...previousPolicy, permissions: { ...previousPolicy.permissions, directory: '.' }, revision: previousPolicy.revision + 1 }
+    try { this.save(true) } catch (error) { rec.cwd = previousCwd; bot.policy = previousPolicy; throw error }
+    void this.invalidateBotPolicy(current.name, rec, true)
+  }
+
   async botDirectory(name: string, actor: string, expectedRevision: number, directory: unknown): Promise<BotPolicyResult> {
     try {
       const rec = this.state.agents[name]; const bot = rec?.bot
@@ -893,72 +893,7 @@ export class ChatHub {
     } catch (error) { return { ok: false, error: (error as Error).message } }
   }
 
-  /** 数字人的「其他电脑」清单(给人看,不带密钥)。 */
-  botComputers(nameOrId: string, actorPhoneId: string): { ok: boolean; data?: Array<{ id: string; label: string; directory: string; directoryAbs: string; platform?: string; addedAt: number }>; error?: string } {
-    try {
-      const rec = this.state.agents[this.resolveBotName(nameOrId)]
-      if (!rec?.bot || rec.bot.retirement) throw new Error('找不到这位数字员工')
-      if (rec.bot.policy?.ownerPhoneId !== actorPhoneId) throw new Error('只有创建者可以管理其他电脑')
-      return { ok: true, data: (rec.bot.computers ?? []).map(({ key: _key, peerId: _peer, sid: _s, cliPub: _c, token: _t, ...rest }) => rest) }
-    } catch (error) { return { ok: false, error: (error as Error).message } }
-  }
-
-  /** 给数字人加一台「其他电脑」:票据来自对端 ce 开的远程授权,这里严格校验后保存(覆盖同 id)。 */
-  botComputerAdd(nameOrId: string, actorPhoneId: string, computer: unknown): { ok: boolean; error?: string } {
-    try {
-      const rec = this.state.agents[this.resolveBotName(nameOrId)]
-      if (!rec?.bot || rec.bot.retirement) throw new Error('找不到这位数字员工')
-      if (rec.bot.policy?.ownerPhoneId !== actorPhoneId) throw new Error('只有创建者可以管理其他电脑')
-      if (rec.bot.policy.ownerPhoneId !== actorPhoneId) throw new Error('只有创建者可以管理其他电脑')
-      const t = computer && typeof computer === 'object' ? computer as Record<string, unknown> : {}
-      const str = (k: string) => typeof t[k] === 'string' && t[k].length > 0 && t[k].length < 512 ? t[k] as string : undefined
-      const id = str('grantId'); const peerId = str('peerId'); const key = str('key'); const label = str('label')
-      const directory = str('directory'); const directoryAbs = str('directoryAbs'); const relayUrl = str('relayUrl')
-      const sid = str('sid'); const cliPub = str('cliPub'); const token = str('token'); const platform = str('platform')
-      if (!id || !/^grant_[a-f0-9]{6,32}$/.test(id)) throw new Error('票据的凭证编号无效')
-      if (!peerId || !peerId.startsWith('grant-')) throw new Error('票据的对端编号无效')
-      if (!key || !Buffer.from(key, 'base64') || Buffer.from(key, 'base64').length !== 32) throw new Error('票据的密钥无效')
-      if (!label || label.length > 60) throw new Error('标签无效')
-      if (!directory || !directory.startsWith('/') || directory.length > 400) throw new Error('目录无效')
-      if (!directoryAbs) throw new Error('缺少对端目录的绝对路径')
-      if (!relayUrl || !/^wss?:\/\//.test(relayUrl)) throw new Error('中继地址无效')
-      if (!sid || !token || !cliPub) throw new Error('票据缺少连接信息')
-      const computers = (rec.bot.computers ??= [])
-      if (!computers.some(c => c.id === id) && computers.length >= 8) throw new Error('一台数字员工最多挂 8 台电脑')
-      const existing = computers.find(c => c.id === id)
-      const entry: StoredRemoteComputer = { id, peerId, label, directory, directoryAbs, key, relayUrl, sid, cliPub, token, ...(platform ? { platform } : {}), addedAt: existing?.addedAt ?? Date.now() }
-      if (existing) computers.splice(computers.indexOf(existing), 1, entry)
-      else computers.push(entry)
-      this.save(true)
-      return { ok: true }
-    } catch (error) { return { ok: false, error: (error as Error).message } }
-  }
-
-  /** 移除一台「其他电脑」:清登记,并让运行时关掉它的远程会话(对端授权要另行撤销)。 */
-  async botComputerRemove(nameOrId: string, actorPhoneId: string, computerId: unknown): Promise<{ ok: boolean; error?: string }> {
-    try {
-      const rec = this.state.agents[this.resolveBotName(nameOrId)]
-      if (!rec?.bot || rec.bot.retirement) throw new Error('找不到这位数字员工')
-      if (rec.bot.policy?.ownerPhoneId !== actorPhoneId) throw new Error('只有创建者可以管理其他电脑')
-      const id = typeof computerId === 'string' ? computerId : ''
-      const computers = rec.bot.computers ?? []
-      const existing = computers.find(c => c.id === id)
-      if (!existing) throw new Error('这台电脑不在登记里')
-      rec.bot.computers = computers.filter(c => c.id !== id)
-      this.save(true)
-      if (this.runtime && rec.bot.id) await this.runtime.dropComputer(rec.bot.id, id)
-      return { ok: true }
-    } catch (error) { return { ok: false, error: (error as Error).message } }
-  }
-
-  /** 运行时取某台电脑的连接票据;找不到返回 undefined,工具会如实告诉模型。 */
-  remoteTicket(botIdOrName: string, computerId: string): RemoteTicket | undefined {
-    const entry = Object.entries(this.state.agents).find(([name, r]) => name === botIdOrName || r.bot?.id === botIdOrName)
-    const c = entry?.[1].bot?.computers?.find(x => x.id === computerId)
-    return c ? { grantId: c.id, peerId: c.peerId, label: c.label, directory: c.directory, directoryAbs: c.directoryAbs, key: c.key, relayUrl: c.relayUrl, sid: c.sid, cliPub: c.cliPub, token: c.token, ...(c.platform ? { platform: c.platform } : {}) } : undefined
-  }
-
-    async botApprove(name: string, actorPhoneId: string, approvalId: string, allow: boolean): Promise<{ ok: boolean; error?: string }> {
+  async botApprove(name: string, actorPhoneId: string, approvalId: string, allow: boolean): Promise<{ ok: boolean; error?: string }> {
     const rec = this.state.agents[name]
     if (!actorPhoneId || !rec?.bot?.policy || rec.bot.retirement || rec.bot.policy.ownerPhoneId !== actorPhoneId) return { ok: false, error: '只有有效 BOT 的创建者可以确认操作' }
     if (approvalId.startsWith('operation_') && rec.bot.id && this.runtime) {
@@ -1672,10 +1607,6 @@ export class ChatHub {
     botProtocol: 1
     botPolicyProtocol: 1
     botOnboardingProtocol: 1
-    /** 其他电脑连接:本机 ce 支持开远程授权(手机据此显示「其他电脑」入口)。 */
-    remoteGrantProtocol: 1
-    /** 其他电脑连接:数字人可挂其他电脑(手机据此允许编辑页添加)。 */
-    botComputerProtocol: 1
     people: Array<{ phoneId: string; name: string }>
     commandSandbox: boolean
     workerAccessMode: 'full-access'
@@ -1716,7 +1647,7 @@ export class ChatHub {
       // ce 管辖的 agent 会话(cc-*):平台已知(claude),天然是「已接入候选」
       terminals.push({ id: s.sid, source: 'agent', status: 'connected', reason: 'ce 管辖的 agent 会话(已接入候选)', cwd: s.cwd })
     }
-    return { botProtocol: 1, botPolicyProtocol: 1, botOnboardingProtocol: 1, remoteGrantProtocol: 1, botComputerProtocol: 1, workerAccessMode: 'full-access', people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true, agents, suspects, terminals }
+    return { botProtocol: 1, botPolicyProtocol: 1, botOnboardingProtocol: 1, workerAccessMode: 'full-access', people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true, agents, suspects, terminals }
   }
 
   private keyOf(gid: string): Uint8Array | null {

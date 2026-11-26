@@ -5,6 +5,7 @@ import { createSdkMcpServer, query, tool, type Options as SDKOptions, type Query
 import { z } from 'zod/v4'
 import { CodexToolOutput, type CodexActiveTurn, type CodexToolCall, type CodexToolSpec, type CodexTurn } from './codex'
 import type { WorkerAccessMode } from './worker-policy'
+import { cliVersion, compatibilityKey, rememberCompatible, requireCliOptions, RuntimeCompatibilityError, runtimeFailure, wasCompatible } from './compatibility'
 
 interface Options {
   cwd: string; model?: string; effort?: 'low' | 'medium' | 'high'; executable?: string
@@ -12,7 +13,7 @@ interface Options {
   onToolCall(call: CodexToolCall): Promise<unknown>
   /** Host-only test seams; never populated from chat or remote RPC. */
   query?: (params: { prompt: AsyncIterable<SDKUserMessage>; options: SDKOptions }) => Query
-  probe?: () => Promise<string>
+  probe?: (args: string[]) => Promise<string>
 }
 interface Thread { id: string; instructions: string; tools: CodexToolSpec[]; resume: boolean; ephemeral: boolean }
 interface Turn { id: string; promise: Promise<CodexTurn>; resolve(value: CodexTurn): void; reject(error: Error): void; pendingInputs: Set<string>; interrupted: boolean }
@@ -43,6 +44,9 @@ export class ClaudeRuntime {
   private closing = false
   private failure?: Error
   private executable: string
+  private version = 'unknown'
+  private initVerified = false
+  private initTimer?: ReturnType<typeof setTimeout>
   private pendingWrites = new Map<string, Promise<unknown>>()
   private interruptedWrites = new Map<string, Promise<unknown>>()
   constructor(private readonly options: Options) { this.executable = options.executable ?? Bun.which('claude') ?? 'claude' }
@@ -51,16 +55,23 @@ export class ClaudeRuntime {
     if (this.closing) return Promise.reject(this.failure ?? new Error('CC runtime 已关闭'))
     return this.initialization ??= (async () => {
       mkdirSync(this.options.cwd, { recursive: true, mode: 0o700 })
-      let version: string
       try {
-        version = await (this.options.probe?.() ?? new Promise<string>((resolve, reject) => {
-          execFile(this.executable, ['--version'], { cwd: this.options.cwd, timeout: 5000, maxBuffer: 100000, signal: this.abort.signal, killSignal: 'SIGKILL' }, (error, stdout) => error ? reject(error) : resolve(stdout))
-        }))
-      } catch { throw new Error('无法启动 Claude Code，请检查工作设备上的 CC 安装') }
-      // This version exposes immediate-input priority and SDK isolation switches.
-      if (!/^2\.1\.220 \(Claude Code\)\s*$/.test(version.trim())) throw new Error('CC 前后台模式需要已验证的 Claude Code 2.1.220；当前版本未通过兼容验证')
+        this.version = cliVersion(await this.probe(['--version']), 'claude')
+      } catch (error) { throw error instanceof RuntimeCompatibilityError ? error : new Error('无法启动 Claude Code，请检查工作设备上的 CC 安装') }
       if (this.closing) throw new Error('CC runtime 已关闭')
+      const key = this.options.probe ? undefined : compatibilityKey('claude', this.executable, this.version, this.options.accessMode ?? 'controlled')
+      if (!key || !wasCompatible(key)) {
+        const help = await this.probe(['--help']).catch(error => { throw runtimeFailure('Claude Code', error, '无法检查 Claude Code CLI 参数，请核对安装') })
+        requireCliOptions(help, ['--print', '--input-format', '--output-format', '--replay-user-messages', '--include-partial-messages', '--tools', '--allowedTools', '--setting-sources', '--settings', '--strict-mcp-config', '--mcp-config', '--system-prompt', '--append-system-prompt', '--agents', '--disable-slash-commands', '--resume', '--session-id', '--no-session-persistence', '--permission-mode'], `Claude Code ${this.version}`)
+        if (this.closing) throw new Error('CC runtime 已关闭')
+        if (key) rememberCompatible(key)
+      }
     })()
+  }
+  private probe(args: string[]): Promise<string> {
+    return this.options.probe?.(args) ?? new Promise<string>((resolve, reject) => {
+      execFile(this.executable, args, { cwd: this.options.cwd, timeout: 5000, maxBuffer: 100000, signal: this.abort.signal, killSignal: 'SIGKILL', windowsHide: true }, (error, stdout) => error ? reject(error) : resolve(stdout))
+    })
   }
   async startThread(options: { instructions: string; tools: CodexToolSpec[]; ephemeral?: boolean }): Promise<string> {
     await this.initialize()
@@ -127,6 +138,7 @@ export class ClaudeRuntime {
       if (!schema.shape) throw new Error('CC 工具参数必须是对象')
       return tool(spec.name, spec.description, schema.shape, async args => {
         try {
+          if (!this.initVerified) throw new RuntimeCompatibilityError('CC 初始化信息尚未验证，禁止执行工具')
           const turn = this.active
           if (!turn) throw new Error('CC 无活动轮次，工具调用已失效')
           this.assertTurn(thread.id, turn.id)
@@ -160,7 +172,7 @@ export class ClaudeRuntime {
       ...(fullAccess ? { tools: { type: 'preset' as const, preset: 'claude_code' as const }, settingSources: ['user', 'project', 'local'] as SDKOptions['settingSources'], sandbox: { enabled: false } }
         : { tools: [], allowedTools: [], settingSources: [], strictMcpConfig: true, skills: [], agents: {}, plugins: [], settings: { disableAllHooks: true, autoMemoryEnabled: false, enabledPlugins: {} } }),
       mcpServers: { ce_runtime: createSdkMcpServer({ name: 'ce_runtime', version: '1', tools }) },
-      canUseTool: async (name, input) => (fullAccess || allowed.has(name)) && !!this.active && !this.closing && !this.active.interrupted
+      canUseTool: async (name, input) => this.initVerified && (fullAccess || allowed.has(name)) && !!this.active && !this.closing && !this.active.interrupted
         ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: '数字人只能使用当前宿主明确授权的工具' },
       permissionMode: 'default',
       systemPrompt: fullAccess ? { type: 'preset', preset: 'claude_code', append: thread.instructions } : thread.instructions, ...(thread.resume ? { resume: thread.id } : { sessionId: thread.id }),
@@ -169,6 +181,8 @@ export class ClaudeRuntime {
       env: { ...process.env, CLAUDECODE: undefined, CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false' },
       stderr: () => { /* SDK stderr may contain auth configuration; do not forward it. */ },
     } })
+    this.initTimer = setTimeout(() => this.fail(new RuntimeCompatibilityError(`Claude Code ${this.version} 未及时提供可验证的初始化信息，请检查 CLI 与 SDK 兼容性`)), 30_000)
+    this.initTimer.unref?.()
     this.reading = this.read(this.conversation, thread, allowed)
   }
   private async read(conversation: Query, thread: Thread, allowed: Set<string>): Promise<void> {
@@ -176,13 +190,23 @@ export class ClaudeRuntime {
       for await (const message of conversation) {
         if (this.closing) break
         if (message.type === 'system' && message.subtype === 'init') {
-          if (message.session_id !== thread.id || (this.options.accessMode !== 'full-access' && message.tools.some(name => !allowed.has(name)))) throw new Error('CC 运行环境包含未授权工具或会话不匹配')
+          if (message.session_id !== thread.id || !Array.isArray(message.tools) || (this.options.accessMode !== 'full-access' && message.tools.some(name => !allowed.has(name)))) throw new RuntimeCompatibilityError('CC 运行环境包含未授权工具或会话不匹配')
+          if ([...allowed].some(name => !message.tools.includes(name))) throw new RuntimeCompatibilityError(`Claude Code ${this.version} 未提供必要宿主工具，不能开始数字人工作`)
+          if (message.permissionMode !== 'default') throw new RuntimeCompatibilityError(`Claude Code ${this.version} 实际权限模式与 CE 要求不符`)
+          this.initVerified = true
+          clearTimeout(this.initTimer)
         }
         if (message.type === 'user' && message.uuid) this.active?.pendingInputs.delete(message.uuid)
-        if (message.type === 'result') this.finishResult(message)
+        if (message.type === 'result') {
+          if (!this.initVerified) {
+            if (message.subtype !== 'success' || message.is_error) throw runtimeFailure('Claude Code', 'errors' in message ? message.errors.join('\n') : '')
+            throw new RuntimeCompatibilityError(`Claude Code ${this.version} 缺少经过验证的初始化信息，未接受本轮结果`)
+          }
+          this.finishResult(message)
+        }
       }
       if (!this.closing) this.fail(new Error('CC 会话意外结束'))
-    } catch { if (!this.closing) this.fail(new Error('CC 运行中断，请检查工作设备的模型连接并重试')) }
+    } catch (error) { if (!this.closing) this.fail(runtimeFailure('Claude Code', error, 'CC 运行中断，请检查工作设备的模型连接并重试')) }
   }
   private finishResult(message: Extract<SDKMessage, { type: 'result' }>): void {
     const turn = this.active
@@ -193,10 +217,10 @@ export class ClaudeRuntime {
     if (!failed && !turn.interrupted && turn.pendingInputs.size) return
     this.active = undefined
     turn.resolve({ id: turn.id, status: turn.interrupted ? 'interrupted' : failed ? 'failed' : 'completed',
-      ...(failed ? { error: { message: 'Claude Code 模型请求失败，请检查登录、模型与网络后重试' } } : {}),
+      ...(failed ? { error: { message: runtimeFailure('Claude Code', 'errors' in message ? message.errors.join('\n') : '').message } } : {}),
       ...(message.subtype === 'success' ? { items: [{ type: 'agentMessage', text: message.result }] } : {}) })
   }
-  private fail(error: Error): void { this.failure ??= error; const turn = this.active; this.active = undefined; turn?.reject(error); this.inputs.end(); this.conversation?.close() }
+  private fail(error: Error): void { clearTimeout(this.initTimer); this.initVerified = false; this.failure ??= error; const turn = this.active; this.active = undefined; turn?.reject(error); this.inputs.end(); this.conversation?.close() }
   async close(): Promise<void> {
     if (this.closing) return
     this.closing = true; this.fail(new Error('CC runtime 已关闭')); this.abort.abort()
