@@ -997,3 +997,50 @@ test('任务完成后不再提醒', async () => {
   await Bun.sleep(200)
   expect(f.sent.filter(t => t === '报告面向谁？')).toHaveLength(1)
 })
+
+test('case_search可按成果ID找旧卷宗并翻页，仍受整轮4次读取预算约束', async () => {
+  const results: any[] = []; const errors: string[] = []
+  let oldId = ''
+  const f = fixture([{ action: 'reply', replyText: '已找到旧报告。' }], {
+    seed: (store, bot) => {
+      const task = seedTask(store, bot)
+      oldId = task.caseId
+      for (const reply of store.pendingReplies(bot.botId)) store.markReplySent(reply.id)
+      store.updateTask(task.id, { state: 'completed' })
+      store.saveArtifact({ id: 'retrieval-report', botId: bot.botId, caseId: task.caseId, taskId: task.id, title: '旧报告', name: 'report.md', path: '/unused', mime: 'text/plain', size: 1, hash: '', revision: 1, createdAt: 1 })
+      store.saveCase({ ...store.case(task.caseId)!, title: '同名事项', goal: '', object: '', summary: '', createdAt: 0, updatedAt: 0 })
+      for (let i = 0; i < 6; i++) store.saveCase({ id: `new-retrieval-${i}`, botId: bot.botId, title: '同名事项', object: '', goal: '', summary: '', createdAt: Date.now() + i + 1, updatedAt: Date.now() + i + 1 })
+    },
+    routerReads: async call => {
+      for (const args of [{ artifactId: 'retrieval-report' }, { query: '同名事项' }, { query: '同名事项', offset: 5 }, { query: '同名事项' }, { query: '同名事项' }]) {
+        try { results.push(await call('case_search', args)) } catch (error) { errors.push((error as Error).message) }
+      }
+    },
+  })
+  f.send(10, '找一下旧报告'); await waitFor(() => f.sent.length === 1)
+  expect(results).toHaveLength(4)
+  expect(results[0]).toMatchObject([{ id: oldId }])
+  expect(results[1].some((c: any) => c.id === oldId)).toBe(false)
+  expect(results[2].some((c: any) => c.id === oldId)).toBe(true)
+  expect(errors).toHaveLength(1)
+  expect(errors[0]).toContain('读取预算')
+})
+
+
+test('case_search长摘要裁页后按实际返回条数继续，不跳过候选', async () => {
+  const ids: string[] = []
+  const f = fixture([{ action: 'reply', replyText: '已核对候选。' }], {
+    seed: (store, bot) => {
+      for (let i = 0; i < 7; i++) store.saveCase({ id: `long-case-${i}`, botId: bot.botId, title: '同名长卷宗', object: '', goal: '长'.repeat(700), summary: '', createdAt: i, updatedAt: i })
+    },
+    routerReads: async call => {
+      for (let page = 0; page < 4 && ids.length < 7; page++) {
+        const found = await call('case_search', { query: '同名长卷宗', offset: ids.length }) as Array<{ id: string }>
+        ids.push(...found.map(c => c.id))
+      }
+    },
+  })
+  f.send(1, '找旧卷宗'); await waitFor(() => f.sent.length === 1)
+  expect(ids).toHaveLength(7)
+  expect(new Set(ids).size).toBe(7)
+})

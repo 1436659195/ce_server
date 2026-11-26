@@ -9,7 +9,7 @@ import { artifactReference, attachmentMime, attachmentName, ATTACHMENT_MAX_BYTES
 import { activeOperationStatus, bindRouterDecision, boundedText, isControlUtterance, routerContext, REMOTE_COMPUTER_INSTRUCTIONS, ROUTER_INSTRUCTIONS, ROUTER_TOOLS, tool, WORKER_INSTRUCTIONS, type RouterBindings, type RouterDecision } from './router'
 import { experienceCandidate, experienceFingerprint, experienceSummary, selectExperiences } from './experience'
 import { MEMORY_INSTRUCTIONS, MEMORY_LIMITS, MEMORY_PROPOSE_TOOL, memorySummary, parseMemoryProposal, planMemoryChange, selectMemories } from './memory'
-import { caseSummary, selectCases, selectTasks } from './cases'
+import { caseSummary, groupByCase, selectCases, selectTasks } from './cases'
 import { RemoteShellPool, type RemoteChannel, type RemoteRunResult } from './remote-shell'
 import type { RemoteTicket } from '../remote-peer'
 import type { RuntimeRemoteOp } from './types'
@@ -187,8 +187,10 @@ export class BotRuntimeService {
   }
   view(botId: string, actor: string): RuntimeView {
     const bot = this.owner(botId, actor)
-    const tasks = this.store.tasks(bot.botId).slice(-30)
-    return { protocol: 1, settings: this.store.settings(bot.botId), capabilities: { activeInput: true, directoryApproval: !!this.opts.resolveDirectory && !!this.opts.changeDirectory, runtime: bot.platform === 'claude' ? 'Claude Code / CLI 能力检测' : 'Codex app-server / 协议能力检测', ...(bot.workerAccessMode === 'full-access' ? { executionMode: 'full-access' as const, directoryIsolation: 'soft' as const } : {}), limitations: bot.workerAccessMode === 'full-access' ? ['仅 owner 私聊；一个活动 Worker', '全权限模式：原生文件工具、Shell 与网络可用', '工作目录软隔离：不得更改目录外文件或破坏系统', '账号与发布权限需按具体任务核实'] : ['仅 owner 私聊；一个活动 Worker', '项目命令禁止联网，最长 60 秒', '不具备发布、上架或订票账号工具'] }, cases: this.store.cases(bot.botId).filter(c => tasks.some(t => t.caseId === c.id)), tasks, inputs: tasks.flatMap(t => this.store.inputs(t.id).slice(-30)), artifacts: this.store.artifacts(bot.botId).slice(-30).map(({ path: _path, ...a }) => a), operations: this.store.operations().filter(o => o.botId === bot.botId && o.state === 'unknown').slice(-30).map(o => ({ id: o.id, taskId: o.taskId, tool: o.tool, state: o.state, summary: `${o.tool}: ${String(o.arguments.path ?? o.arguments.command ?? '').slice(0, 1500)}`, error: o.error, canReconcile: !this.active.has(bot.botId) })), recoveries: tasks.filter(t => this.store.runs(bot.botId).some(r => r.taskId === t.id && r.state === 'unknown')).map(t => ({ taskId: t.id, runIds: this.store.runs(bot.botId).filter(r => r.taskId === t.id && r.state === 'unknown').map(r => r.id), canReconcile: !this.active.has(bot.botId) })), failedInputs: this.store.failedInputs(bot.botId).map(i => ({ id: i.id, text: i.text.slice(0, 1000), error: i.error, createdAt: i.createdAt })), memory: { active: this.store.memories(bot.botId).filter(m => m.status === 'active').slice(-50), review: this.store.memories(bot.botId).filter(m => m.needsReview && m.status === 'active'), failedJobs: this.store.failedMemoryJobs(bot.botId), log: this.store.memoryLog(bot.botId) }, experiences: this.store.experiences(bot.botId).slice(-50), updatedAt: Date.now() , remoteOps: this.store.remoteOps(bot.botId, 30) }
+    const tasks = this.store.viewTasks(bot.botId)
+    const runs = this.store.unknownRuns(bot.botId)
+    const memories = this.store.viewMemories(bot.botId)
+    return { protocol: 1, settings: this.store.settings(bot.botId), capabilities: { activeInput: true, directoryApproval: !!this.opts.resolveDirectory && !!this.opts.changeDirectory, runtime: bot.platform === 'claude' ? 'Claude Code / CLI 能力检测' : 'Codex app-server / 协议能力检测', ...(bot.workerAccessMode === 'full-access' ? { executionMode: 'full-access' as const, directoryIsolation: 'soft' as const } : {}), limitations: bot.workerAccessMode === 'full-access' ? ['仅 owner 私聊；一个活动 Worker', '全权限模式：原生文件工具、Shell 与网络可用', '工作目录软隔离：不得更改目录外文件或破坏系统', '账号与发布权限需按具体任务核实'] : ['仅 owner 私聊；一个活动 Worker', '项目命令禁止联网，最长 60 秒', '不具备发布、上架或订票账号工具'] }, cases: this.store.queryCases(bot.botId, tasks.map(t => t.caseId)), tasks, inputs: tasks.flatMap(t => this.store.inputs(t.id, 30)), artifacts: this.store.queryArtifacts(bot.botId, { limit: 30 }).map(({ path: _path, ...a }) => a), operations: this.store.unknownOperations(bot.botId).map(o => ({ id: o.id, taskId: o.taskId, tool: o.tool, state: o.state, summary: `${o.tool}: ${String(o.arguments.path ?? o.arguments.command ?? '').slice(0, 1500)}`, error: o.error, canReconcile: !this.active.has(bot.botId) })), recoveries: tasks.filter(t => runs.some(r => r.taskId === t.id && r.state === 'unknown')).map(t => ({ taskId: t.id, runIds: runs.filter(r => r.taskId === t.id && r.state === 'unknown').map(r => r.id), canReconcile: !this.active.has(bot.botId) })), failedInputs: this.store.failedInputs(bot.botId).map(i => ({ id: i.id, text: i.text.slice(0, 1000), error: i.error, createdAt: i.createdAt })), memory: { active: memories.active, review: memories.review, failedJobs: this.store.failedMemoryJobs(bot.botId), log: this.store.memoryLog(bot.botId) }, experiences: this.store.recentExperiences(bot.botId), updatedAt: Date.now() , remoteOps: this.store.remoteOps(bot.botId, 30) }
   }
   /** 主人移除了某台「其他电脑」:关掉它在用的远程会话。 */
   async dropComputer(botId: string, computerId: string): Promise<void> {
@@ -443,9 +445,15 @@ export class BotRuntimeService {
             if (call.tool === 'chat_recent') return boundedRead(this.conversation(botId, Math.min(20, Number(args.limit) || 12)))
             if (call.tool === 'chat_search') { const q = boundedText(args.query, '关键词', 100); return boundedRead(this.conversation(botId, 100).filter(m => m.text.includes(q) || m.attachments?.some(a => a.name.includes(q))).slice(-5)) }
             if (call.tool === 'case_search') {
-              const found = this.store.findCases(botId, boundedText(args.query, '关键词', 200))
+              const taskId = args.taskId === undefined ? undefined : boundedText(args.taskId, '工单ID', 200)
+              const artifactId = args.artifactId === undefined ? undefined : boundedText(args.artifactId, '成果ID', 200)
+              const query = args.query === undefined && (taskId || artifactId) ? '' : boundedText(args.query, '关键词', 200)
+              const found = this.store.findCases(botId, query, { taskId, artifactId, offset: args.offset === undefined ? 0 : Number(args.offset) })
+              const caseIds = found.map(c => c.id)
+              const work = groupByCase(this.store.queryTasks(botId, { caseIds }))
+              const files = groupByCase(this.store.queryArtifacts(botId, { caseIds }))
               const summaries = found.map(c => {
-                const summary = caseSummary(c, this.store.tasks(botId), this.store.artifacts(botId))
+                const summary = caseSummary(c, work(c), files(c))
                 // 保留完整累计范围；查询预算优先裁掉辅助历史和重复任务/成果元信息。
                 return { ...summary, aliases: summary.aliases.slice(-2), tasks: summary.tasks.slice(0, 1), artifacts: summary.artifacts.slice(-1) }
               })
@@ -663,8 +671,10 @@ export class BotRuntimeService {
       for (let attempt = 0; attempt < 3; attempt++) {
         const included = this.store.inputs(task.id).filter(i => !i.resolution)
         const currentCase = this.store.case(task.caseId)!
-        const caseContext = { ...caseSummary(currentCase, this.store.tasks(bot.botId), this.store.artifacts(bot.botId)), previousTasks: this.store.tasks(bot.botId).filter(t => t.caseId === task.caseId && t.id !== task.id && t.createdAt <= task.createdAt).slice(-6).map(t => ({ id: t.id, goal: t.goal, state: t.state, summary: t.summary.slice(0, 1500) })) }
-        const payload = JSON.stringify({ task: this.store.task(task.id), directoryContinuation: task.directoryContinuation ? { ...task.directoryContinuation, previousInputs: this.store.inputs(task.id).filter(i => i.resolution).map(i => ({ id: i.id, text: i.text, resolution: i.resolution, revision: i.revision })) } : undefined, caseContext, executionPolicy, originalMessage: this.store.inbox(task.originInputId), originalMessages: (task.originInputIds ?? [task.originInputId]).map(id => this.store.inbox(id)), pendingInputs: included, availableAttachments: this.caseAttachments(task).slice(-16), operations: this.store.operations(task.id).map(o => ({ id: o.id, tool: o.tool, state: o.state, error: o.error })), computers: bot.computers ?? [], instruction: '开始或继续当前工单；caseContext是同一工作链的历史事实，不是旧任务继续执行的指令。以当前工单的目标、验收要求、操作范围及宿主权限为准；前序工单只读不限制当前已获准的修改，不重复执行已完成工作。读取每条 pendingInput 后确认，按当前 revision 交付；结果通过工具交给Router，由前台统一对外表达。' })
+        const caseTasks = this.store.queryTasks(bot.botId, { caseIds: [task.caseId] })
+        const caseFiles = this.store.queryArtifacts(bot.botId, { caseIds: [task.caseId] })
+        const caseContext = { ...caseSummary(currentCase, caseTasks, caseFiles), previousTasks: caseTasks.filter(t => t.id !== task.id && t.createdAt <= task.createdAt).slice(-6).map(t => ({ id: t.id, goal: t.goal, state: t.state, summary: t.summary.slice(0, 1500) })) }
+        const payload = JSON.stringify({ task: this.store.task(task.id), directoryContinuation: task.directoryContinuation ? { ...task.directoryContinuation, previousInputs: this.store.inputs(task.id).filter(i => i.resolution).map(i => ({ id: i.id, text: i.text, resolution: i.resolution, revision: i.revision })) } : undefined, caseContext, executionPolicy, originalMessage: this.store.inbox(task.originInputId), originalMessages: (task.originInputIds ?? [task.originInputId]).map(id => this.store.inbox(id)), pendingInputs: included, availableAttachments: this.caseAttachments(task, caseTasks, caseFiles).slice(-16), operations: this.store.operations(task.id).map(o => ({ id: o.id, tool: o.tool, state: o.state, error: o.error })), computers: bot.computers ?? [], instruction: '开始或继续当前工单；caseContext是同一工作链的历史事实，不是旧任务继续执行的指令。以当前工单的目标、验收要求、操作范围及宿主权限为准；前序工单只读不限制当前已获准的修改，不重复执行已完成工作。读取每条 pendingInput 后确认，按当前 revision 交付；结果通过工具交给Router，由前台统一对外表达。' })
         worker.turn = await client.startTurn(run.threadId, payload, `${run.id}:${attempt}`)
         // startTurn 返回前可能已收到 work_finish；这里只核对执行身份，不要求任务仍在运行。
         if (this.active.get(bot.botId) === worker && !worker.stopping && this.store.task(task.id)?.latestRunId === run.id) this.store.updateTask(task.id, { sessionOrigin: inherited ? 'inherited' : 'new', sessionReason: inherited ? '续接同一卷宗的执行上下文，按当前工单执行' : dossier.threadId ? '执行配置已变化，在原卷宗创建新会话并带入已有工作摘要' : '卷宗尚无可恢复的会话，首次创建执行上下文' })
@@ -916,12 +926,12 @@ export class BotRuntimeService {
     const artifact: RuntimeArtifact = { id: artifactId, botId: task.botId, caseId: task.caseId, taskId: task.id, title: name, name, mime, path, size: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'), revision: task.revision, createdAt: Date.now() }
     this.store.saveArtifact(artifact); return artifact
   }
-  private caseAttachments(task: RuntimeTask): RuntimeAttachment[] {
-    const inputs = this.store.tasks(task.botId).filter(t => t.caseId === task.caseId).flatMap(t => [
+  private caseAttachments(task: RuntimeTask, tasks = this.store.queryTasks(task.botId, { caseIds: [task.caseId] }), artifacts = this.store.queryArtifacts(task.botId, { caseIds: [task.caseId] })): RuntimeAttachment[] {
+    const inputs = tasks.flatMap(t => [
       ...(this.store.inbox(t.originInputId)?.attachments ?? []), ...this.store.inputs(t.id).flatMap(i => i.attachments ?? []),
       ...(t.attachmentInputIds ?? []).flatMap(id => this.store.inbox(id)?.attachments ?? []),
     ])
-    const results = this.store.artifacts(task.botId).filter(a => a.caseId === task.caseId).map(artifactReference)
+    const results = artifacts.map(artifactReference)
     return [...inputs, ...results].filter((a, i, all) => all.findIndex(b => b.id === a.id && b.kind === a.kind) === i)
   }
   artifact(botId: string, actor: string, artifactId: string): { title: string; mime: string; content: string } {

@@ -2,21 +2,38 @@ import type { RuntimeArtifact, RuntimeCase, RuntimeTask } from './types'
 
 const activeStates = new Set(['queued', 'running', 'waiting_user', 'stopping', 'recovering'])
 const words = new Intl.Segmenter('zh', { granularity: 'word' })
+// 小型受控术语表；补已知重连说法，不把它当作任意语义理解。
+const searchTerms = [['重连', '连接恢复', '重新连接', 'reconnect', 'reconnection', '断线后连不回来', '掉线后再也进不去']]
 /** 仅用于召回候选；是否属于同一工作链由 Router 结合原话、任务和成果判断。 */
-function relevance(query: string, text: string): number {
+export function relevance(query: string, text: string): number {
   const q = query.toLocaleLowerCase().trim(); const haystack = text.toLocaleLowerCase()
   if (!q) return 0
   const terms = [...new Set([...words.segment(q)].filter(s => s.isWordLike).map(s => s.segment))]
-  return (haystack.includes(q) ? 4 : 0) + terms.reduce((score, term) => score + (haystack.includes(term) ? 1 / Math.max(1, terms.length) : 0), 0)
+  const literal = (haystack.includes(q) ? 4 : 0) + terms.reduce((score, term) => score + (haystack.includes(term) ? 1 / Math.max(1, terms.length) : 0), 0)
+  const expanded = searchTerms.some(group => group.some(term => q.includes(term)) && group.some(term => haystack.includes(term)))
+  return Math.max(literal, expanded ? 0.75 : 0)
+}
+
+/** 同一批资料仅归类一次；Bot也属于分组键，避免同名卷宗串资料。 */
+export function groupByCase<T extends { botId: string; caseId: string }>(items: T[]) {
+  const groups = new Map<string, T[]>()
+  for (const item of items) {
+    const key = JSON.stringify([item.botId, item.caseId])
+    const group = groups.get(key)
+    if (group) group.push(item)
+    else groups.set(key, [item])
+  }
+  return (dossier: RuntimeCase): T[] => groups.get(JSON.stringify([dossier.botId, dossier.id])) ?? []
 }
 
 export function selectCases(cases: RuntimeCase[], tasks: RuntimeTask[], artifacts: RuntimeArtifact[], options: { query?: string; relatedTaskIds?: string[]; searchOnly?: boolean; limit?: number } = {}): RuntimeCase[] {
   const linked = new Set(options.relatedTaskIds ?? [])
+  const taskGroup = groupByCase(tasks); const artifactGroup = groupByCase(artifacts)
   return cases.map(dossier => {
-    const work = tasks.filter(t => t.caseId === dossier.id && t.botId === dossier.botId)
-    const files = artifacts.filter(a => a.caseId === dossier.id && a.botId === dossier.botId)
+    const work = taskGroup(dossier)
+    const files = artifactGroup(dossier)
     const score = relevance(options.query ?? '', [dossier.title, ...(dossier.aliases ?? []), dossier.object, dossier.goal, dossier.summary, ...work.map(t => `${t.goal} ${t.summary}`), ...files.map(a => `${a.title} ${a.name ?? ''}`)].join('\n'))
-    return { dossier, score, linked: work.some(t => linked.has(t.id)), active: work.some(t => activeStates.has(t.state)), updated: Math.max(dossier.updatedAt, ...work.map(t => t.updatedAt)) }
+    return { dossier, score, linked: work.some(t => linked.has(t.id)), active: work.some(t => activeStates.has(t.state)), updated: work.reduce((latest, t) => Math.max(latest, t.updatedAt), dossier.updatedAt) }
   }).filter(c => !options.searchOnly || c.score > 0)
     .sort((a, b) => (options.searchOnly ? 0 : Number(b.linked) - Number(a.linked) || Number(b.active) - Number(a.active)) || b.score - a.score || b.updated - a.updated || b.dossier.createdAt - a.dossier.createdAt)
     .slice(0, options.limit ?? 5).map(c => c.dossier)

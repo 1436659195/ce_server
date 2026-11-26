@@ -1,0 +1,179 @@
+[
+  {
+    "cases": 100,
+    "tasks": 300,
+    "artifacts": 100,
+    "view": {
+      "beforeParsed": 500,
+      "afterParsed": 70,
+      "beforeMs": 2.03,
+      "afterMs": 1.39,
+      "beforeSql": 72,
+      "afterSql": 52,
+      "beforeRows": 500,
+      "afterRows": 70
+    },
+    "search": {
+      "beforeParsed": 2500,
+      "afterParsed": 25,
+      "beforeMs": 5.48,
+      "afterMs": 2.81,
+      "beforeSql": 13,
+      "afterSql": 8,
+      "beforeRows": 2500,
+      "afterRows": 125
+    },
+    "plans": {
+      "recent": [
+        {
+          "id": 5,
+          "parent": 0,
+          "notused": 62,
+          "detail": "SEARCH tasks USING INDEX tasks_bot (bot_id=?)"
+        }
+      ],
+      "active": [
+        {
+          "id": 4,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH tasks USING INDEX tasks_state (bot_id=? AND <expr>=?)"
+        }
+      ],
+      "case": [
+        {
+          "id": 4,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH artifacts USING INDEX artifacts_case (bot_id=? AND <expr>=?)"
+        }
+      ],
+      "inputs": [
+        {
+          "id": 5,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH task_inputs USING INDEX inputs_task (<expr>=?)"
+        }
+      ]
+    }
+  },
+  {
+    "cases": 1000,
+    "tasks": 3000,
+    "artifacts": 1000,
+    "view": {
+      "beforeParsed": 5000,
+      "afterParsed": 70,
+      "beforeMs": 5.87,
+      "afterMs": 2.04,
+      "beforeSql": 72,
+      "afterSql": 52,
+      "beforeRows": 5000,
+      "afterRows": 70
+    },
+    "search": {
+      "beforeParsed": 25000,
+      "afterParsed": 25,
+      "beforeMs": 48.9,
+      "afterMs": 17.97,
+      "beforeSql": 13,
+      "afterSql": 8,
+      "beforeRows": 25000,
+      "afterRows": 1025
+    },
+    "plans": {
+      "recent": [
+        {
+          "id": 5,
+          "parent": 0,
+          "notused": 62,
+          "detail": "SEARCH tasks USING INDEX tasks_bot (bot_id=?)"
+        }
+      ],
+      "active": [
+        {
+          "id": 4,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH tasks USING INDEX tasks_state (bot_id=? AND <expr>=?)"
+        }
+      ],
+      "case": [
+        {
+          "id": 4,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH artifacts USING INDEX artifacts_case (bot_id=? AND <expr>=?)"
+        }
+      ],
+      "inputs": [
+        {
+          "id": 5,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH task_inputs USING INDEX inputs_task (<expr>=?)"
+        }
+      ]
+    }
+  },
+  {
+    "cases": 10000,
+    "tasks": 30000,
+    "artifacts": 10000,
+    "view": {
+      "beforeParsed": 50000,
+      "afterParsed": 70,
+      "beforeMs": 52.8,
+      "afterMs": 14.64,
+      "beforeSql": 72,
+      "afterSql": 52,
+      "beforeRows": 50000,
+      "afterRows": 70
+    },
+    "search": {
+      "beforeParsed": 250000,
+      "afterParsed": 25,
+      "beforeMs": 2410.45,
+      "afterMs": 162.92,
+      "beforeSql": 13,
+      "afterSql": 8,
+      "beforeRows": 250000,
+      "afterRows": 10025
+    },
+    "plans": {
+      "recent": [
+        {
+          "id": 5,
+          "parent": 0,
+          "notused": 62,
+          "detail": "SEARCH tasks USING INDEX tasks_bot (bot_id=?)"
+        }
+      ],
+      "active": [
+        {
+          "id": 4,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH tasks USING INDEX tasks_state (bot_id=? AND <expr>=?)"
+        }
+      ],
+      "case": [
+        {
+          "id": 4,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH artifacts USING INDEX artifacts_case (bot_id=? AND <expr>=?)"
+        }
+      ],
+      "inputs": [
+        {
+          "id": 5,
+          "parent": 0,
+          "notused": 61,
+          "detail": "SEARCH task_inputs USING INDEX inputs_task (<expr>=?)"
+        }
+      ]
+    }
+  }
+]

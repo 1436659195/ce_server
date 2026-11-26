@@ -6,7 +6,7 @@ import type { MemorySummary } from './memory'
 import type { ExperienceSummary } from './experience'
 import type { RuntimeBot, RuntimeCase, RuntimeInbox, RuntimeOperation, RuntimeReply, RuntimeTask } from './types'
 import { fullAccessPermissions, workerExecutionPolicy } from './worker-policy'
-import { caseSummary, selectCases, selectTasks } from './cases'
+import { caseSummary, groupByCase, selectCases, selectTasks } from './cases'
 import type { RuntimeArtifact, RuntimeCaseUpdate, RuntimeCaseDecision } from './types'
 
 export const ROUTER_INSTRUCTIONS = `你是这个数字员工唯一对外说话的前台 Agent，负责长期自然对话、工作管理和把工作结果讲给用户。
@@ -103,7 +103,7 @@ const routerCallSchema = z.strictObject({
 export const ROUTER_TOOLS: CodexToolSpec[] = [
   tool('chat_recent', '按需读取当前私聊最近消息；含你自己此前的回复。', { limit: num('最多 20 条') }),
   tool('chat_search', '在当前私聊本地记录里搜索关键词。', { query: str('要查询的关键词') }, ['query']),
-  tool('case_search', '按对象、当前或历史名称、累计范围、任务和成果查卷宗；支持多个关键词，返回真实任务与成果归属。', { query: str('对象、成果文件名或多个关键词') }, ['query']),
+  tool('case_search', '优先用已知任务/成果ID定位所属卷宗；否则按旧名、对象、任务、成果关键词搜索。每页最多5份、内部最多30份，offset为0至29整数，按实际返回条数递增，避免长摘要裁页漏读；读满30份或空页停止。无结果可换核心词，拥挤可翻页；至多追加2次，仍共用整轮4次读取预算。未找到不等于不存在，不能猜ID或强制归卷。', { query: str('无明确ID时必填：对象、成果文件名或核心词'), taskId: str('已知真实工单ID'), artifactId: str('已知真实成果ID'), offset: num('默认0；下次加实际收到的条数，最大29，仅关键词搜索翻页') }),
   tool('task_inspect', '核对指定工单的状态与未处理输入，宿主同时记录本轮已披露的版本。', { taskId: str('工单 ID') }, ['taskId']),
   tool('experience_read', '按经验摘要 ID 获取详细经过与来源。', { experienceId: str('经验 ID') }, ['experienceId']),
   { name: 'router_decide', description: '提交自然回复及一个类型明确的动作。宿主绑定本轮已披露的版本、问题和内部来源，并验权保存。', inputSchema: z.toJSONSchema(routerCallSchema) as Record<string, unknown> },
@@ -243,6 +243,7 @@ export function activeOperationStatus(operations: RuntimeOperation[]) {
     .map(o => ({ id: o.id, taskId: o.taskId, tool: o.tool, state: o.state, createdAt: o.createdAt }))
 }
 export function routerContext(p: { bot: RuntimeBot; input?: RuntimeInbox; inputs?: RuntimeInbox[]; workerMessage?: RuntimeReply; workerRequest?: string; workerArtifacts?: Array<{ id: string; name: string; mime: string; size: number }>; pendingReplies?: Array<{ id: string; text: string }>; profile: string; messages: RuntimeInbox[]; cases: RuntimeCase[]; tasks: RuntimeTask[]; artifacts?: RuntimeArtifact[]; relatedTaskIds?: string[]; experienceSummaries: ExperienceSummary[]; operations?: RuntimeOperation[]; previousReplies?: Array<{ text: string; createdAt: number; taskId?: string; caseId?: string }>; toolsLocked?: boolean; memories?: { long: MemorySummary[]; mid: MemorySummary[]; overflow: number } }): string {
+  const work = groupByCase(p.tasks); const files = groupByCase(p.artifacts ?? [])
   const relatedTaskIds = p.relatedTaskIds ?? [...(p.inputs ?? (p.input ? [p.input] : [])).flatMap(m => m.targetTaskId ? [m.targetTaskId] : []), ...(p.workerMessage?.taskId ? [p.workerMessage.taskId] : [])]
   return JSON.stringify({
     observedAt: Date.now(),
@@ -263,7 +264,7 @@ export function routerContext(p: { bot: RuntimeBot; input?: RuntimeInbox; inputs
       return { id: m.id, text: m.text.slice(0, 600), attachments: m.attachments, createdAt: m.createdAt, ...(task ? { taskId: task.id, caseId: task.caseId } : {}) }
     }),
     previousReplies: p.previousReplies?.slice(-8),
-    cases: selectCases(p.cases, p.tasks, p.artifacts ?? [], { query: (p.inputs ?? (p.input ? [p.input] : [])).map(m => m.text).join('\n'), relatedTaskIds }).map(c => caseSummary(c, p.tasks, p.artifacts ?? [])),
+    cases: selectCases(p.cases, p.tasks, p.artifacts ?? [], { query: (p.inputs ?? (p.input ? [p.input] : [])).map(m => m.text).join('\n'), relatedTaskIds }).map(c => caseSummary(c, work(c), files(c))),
     tasks: selectTasks(p.tasks, relatedTaskIds).map(t => ({ id: t.id, caseId: t.caseId, goal: t.goal, state: t.state, revision: t.revision, summary: t.summary.slice(0, 500), summaryUpdatedAt: t.summaryUpdatedAt ?? null, question: t.question, followup: t.followup, directory: t.mandate.directory, policyRevision: t.mandate.policyRevision, directoryChanged: t.mandate.directory !== p.bot.directory, allowedOps: t.mandate.allowedOps, exclusions: t.mandate.exclusions, updatedAt: t.updatedAt })),
     activeOperations: activeOperationStatus((p.operations ?? []).filter(o => o.botId === p.bot.botId && p.tasks.some(t => t.id === o.taskId))),
     experienceSummaries: p.experienceSummaries,

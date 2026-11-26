@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload, RuntimeRemoteOp } from './types'
 import { EXPERIENCE_ESTABLISHED_USES } from './experience'
-import { selectCases } from './cases'
+import { relevance } from './cases'
 import type { RuntimeCaseUpdate, RuntimeCaseDecision } from './types'
 
 type Table = 'settings' | 'inbox' | 'cases' | 'tasks' | 'task_inputs' | 'runs' | 'tool_operations' | 'outbox' | 'artifacts' | 'controls' | 'uploads' | 'memories' | 'memory_log' | 'experiences' | 'remote_ops'
@@ -40,6 +40,12 @@ export class BotRuntimeStore {
       CREATE UNIQUE INDEX IF NOT EXISTS outbox_key ON outbox(bot_id,json_extract(body,'$.key'));
       CREATE UNIQUE INDEX IF NOT EXISTS operation_call ON tool_operations(json_extract(body,'$.runId'),json_extract(body,'$.callId'));
     `)
+    // 与按卷宗/状态读取配套；旧数据库启动时幂等建立，不改JSON正文。
+    for (const table of ['tasks', 'artifacts']) this.db.exec(`CREATE INDEX IF NOT EXISTS ${table}_case ON ${table}(bot_id,json_extract(body,'$.caseId'));`)
+    for (const table of ['tasks', 'runs', 'tool_operations']) this.db.exec(`CREATE INDEX IF NOT EXISTS ${table}_state ON ${table}(bot_id,json_extract(body,'$.state'));`)
+    this.db.exec(`CREATE INDEX IF NOT EXISTS inputs_task ON task_inputs(json_extract(body,'$.taskId'));
+      CREATE INDEX IF NOT EXISTS inbox_memory_state ON inbox(bot_id,json_extract(body,'$.memoryJob.state'));
+      CREATE INDEX IF NOT EXISTS memories_status ON memories(bot_id,json_extract(body,'$.status'),json_extract(body,'$.needsReview'));`)
     this.transaction(() => {
       const version = (this.db.query('PRAGMA user_version').get() as { user_version: number }).user_version
       if (version < 2) {
@@ -70,6 +76,33 @@ export class BotRuntimeStore {
     const rows = (botId ? this.db.query(`SELECT body FROM ${table} WHERE bot_id=? ORDER BY rowid`).all(botId) : this.db.query(`SELECT body FROM ${table} ORDER BY rowid`).all()) as Array<{ body: string }>
     return rows.map(row => JSON.parse(row.body) as T)
   }
+  /** 条件和限量在SQLite执行；返回仍按插入顺序，兼容既有列表语义。 */
+  private queryRows<T>(table: Table, botId: string | undefined, options: { caseIds?: string[]; taskId?: string; state?: string; limit?: number; offset?: number } = {}): T[] {
+    if (options.caseIds?.length === 0) return []
+    const clauses: string[] = []; const args: (string | number)[] = []
+    if (botId !== undefined) { clauses.push('bot_id=?'); args.push(botId) }
+    if (options.caseIds) { clauses.push(`json_extract(body,'$.caseId') IN (${options.caseIds.map(() => '?').join(',')})`); args.push(...options.caseIds) }
+    if (options.taskId !== undefined) { clauses.push("json_extract(body,'$.taskId')=?"); args.push(options.taskId) }
+    if (options.state !== undefined) { clauses.push("json_extract(body,'$.state')=?"); args.push(options.state) }
+    const limit = options.limit === undefined ? -1 : Math.max(0, Math.floor(options.limit))
+    const rows = this.db.query(`SELECT body FROM ${table}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY rowid DESC LIMIT ? OFFSET ?`).all(...args, limit, Math.max(0, Math.floor(options.offset ?? 0))) as { body: string }[]
+    return rows.reverse().map(row => JSON.parse(row.body))
+  }
+  queryTasks(botId: string, options: { caseIds?: string[]; state?: string; limit?: number; offset?: number } = {}): RuntimeTask[] { return this.queryRows('tasks', botId, options) }
+  viewTasks(botId: string): RuntimeTask[] {
+    const rows = this.db.query(`SELECT body FROM tasks WHERE rowid IN (
+      SELECT rowid FROM (SELECT rowid FROM tasks WHERE bot_id=? ORDER BY rowid DESC LIMIT 30)
+      UNION SELECT rowid FROM tasks WHERE bot_id=? AND json_extract(body,'$.state') IN ('queued','running','waiting_user','stopping','recovering')
+    ) ORDER BY rowid`).all(botId, botId) as { body: string }[]
+    return rows.map(row => JSON.parse(row.body))
+  }
+
+  queryArtifacts(botId: string, options: { caseIds?: string[]; limit?: number; offset?: number } = {}): RuntimeArtifact[] { return this.queryRows('artifacts', botId, options) }
+  queryCases(botId: string, ids: string[]): RuntimeCase[] {
+    return [...new Set(ids)].flatMap(id => { const c = this.case(id); return c?.botId === botId ? [c] : [] })
+  }
+  unknownRuns(botId: string): RuntimeRun[] { return this.queryRows('runs', botId, { state: 'unknown' }) }
+  unknownOperations(botId: string): RuntimeOperation[] { return this.queryRows('tool_operations', botId, { state: 'unknown', limit: 30 }) }
   private put<T extends { id: string; botId: string }>(table: Table, value: T): void {
     this.db.query(`INSERT INTO ${table}(id,bot_id,body) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body WHERE bot_id=excluded.bot_id`).run(value.id, value.botId, JSON.stringify(value))
   }
@@ -113,7 +146,8 @@ export class BotRuntimeStore {
   pendingMemoryJobs(botId: string): RuntimeInbox[] { return this.all<RuntimeInbox>('inbox', botId).filter(i => i.memoryJob?.state === 'queued') }
   runningMemoryJobs(): RuntimeInbox[] { return this.all<RuntimeInbox>('inbox').filter(i => i.memoryJob?.state === 'running') }
   failedMemoryJobs(botId: string): Array<{ id: string; text: string; error?: string }> {
-    return this.all<RuntimeInbox>('inbox', botId).filter(i => i.memoryJob?.state === 'failed').slice(-10).map(i => ({ id: i.id, text: i.text.slice(0, 200), error: i.memoryJob?.error }))
+    const rows = this.db.query("SELECT body FROM inbox WHERE bot_id=? AND json_extract(body,'$.memoryJob.state')='failed' ORDER BY rowid DESC LIMIT 10").all(botId) as { body: string }[]
+    return rows.reverse().map(row => JSON.parse(row.body) as RuntimeInbox).map(i => ({ id: i.id, text: i.text.slice(0, 200), error: i.memoryJob?.error }))
   }
   markInput(inputId: string, state: RuntimeInbox['state'], decision?: unknown, error?: string): void {
     const input = this.requireInbox(inputId); this.put('inbox', { ...input, state, decision, error })
@@ -127,7 +161,39 @@ export class BotRuntimeStore {
   cases(botId: string): RuntimeCase[] { return this.all('cases', botId) }
   case(caseId: string): RuntimeCase | undefined { return this.get('cases', caseId) }
   saveCase(value: RuntimeCase): void { this.put('cases', value) }
-  findCases(botId: string, query: string): RuntimeCase[] { return selectCases(this.cases(botId), this.tasks(botId), this.artifacts(botId), { query, searchOnly: true }) }
+  /** 显式历史搜索：数据库投影可搜索字段，保留原Unicode分词排序，仅解析最终候选的JSON。
+   * 包含匹配仍会扫描本Bot历史；不把它误称全文索引或有界搜索。
+   */
+  findCases(botId: string, query: string, options: { taskId?: string; artifactId?: string; offset?: number } = {}): RuntimeCase[] {
+    const offset = options.offset ?? 0
+    if (!Number.isInteger(offset) || offset < 0 || offset > 29) throw new Error('卷宗搜索 offset 必须为0至29的整数')
+    // ID只认账本归属；不能借关键词回退把无权/失效的引用伪装成有效关联。
+    if (options.taskId || options.artifactId) {
+      const refs = [...(options.taskId ? [this.task(options.taskId)] : []), ...(options.artifactId ? [this.artifact(options.artifactId)] : [])]
+      if (refs.some(ref => !ref || ref.botId !== botId) || new Set(refs.map(ref => ref!.caseId)).size !== 1) return []
+      const dossier = this.case(refs[0]!.caseId)
+      return dossier?.botId === botId && offset === 0 ? [dossier] : []
+    }
+    // 显式TEXT亲和性使聚合关联可使用自动覆盖索引，避免逐卷扫描全部分组。
+    const rows = this.db.query(`WITH
+      work AS (SELECT CAST(json_extract(body,'$.caseId') AS TEXT) AS cid,
+        group_concat(coalesce(json_extract(body,'$.goal'),'') || ' ' || coalesce(json_extract(body,'$.summary'),''), char(10)) AS text,
+        max(json_extract(body,'$.updatedAt')) AS updated FROM (SELECT body FROM tasks WHERE bot_id=? ORDER BY rowid) GROUP BY cid),
+      files AS (SELECT CAST(json_extract(body,'$.caseId') AS TEXT) AS cid,
+        group_concat(coalesce(json_extract(body,'$.title'),'') || ' ' || coalesce(json_extract(body,'$.name'),''), char(10)) AS text
+        FROM (SELECT body FROM artifacts WHERE bot_id=? ORDER BY rowid) GROUP BY cid),
+      ranked AS (SELECT c.id, c.rowid AS ordinal, json_extract(c.body,'$.createdAt') AS created,
+        max(json_extract(c.body,'$.updatedAt'), coalesce(work.updated, json_extract(c.body,'$.updatedAt'))) AS updated,
+        coalesce(json_extract(c.body,'$.title'),'') || char(10) ||
+          coalesce((SELECT group_concat(value,char(10)) || char(10) FROM json_each(c.body,'$.aliases')),'') ||
+          coalesce(json_extract(c.body,'$.object'),'') || char(10) || coalesce(json_extract(c.body,'$.goal'),'') || char(10) ||
+          coalesce(json_extract(c.body,'$.summary'),'') || coalesce(char(10) || work.text,'') || coalesce(char(10) || files.text,'') AS text
+      FROM cases c LEFT JOIN work ON work.cid=c.id LEFT JOIN files ON files.cid=c.id WHERE c.bot_id=?)
+      SELECT id, text, updated, created, ordinal FROM ranked`).all(botId, botId, botId) as { id: string; text: string; updated: number; created: number; ordinal: number }[]
+    return rows.map(row => ({ ...row, score: relevance(query, row.text) })).filter(row => row.score > 0)
+      .sort((a, b) => b.score - a.score || b.updated - a.updated || b.created - a.created || a.ordinal - b.ordinal)
+      .slice(0, 30).slice(offset, offset + 5).flatMap(row => { const c = this.case(row.id); return c?.botId === botId ? [c] : [] })
+  }
   updateCase(botId: string, caseId: string, patch?: RuntimeCaseUpdate): RuntimeCase {
     const dossier = this.case(caseId)
     if (!dossier || dossier.botId !== botId) throw new Error('卷宗归属不匹配')
@@ -220,7 +286,7 @@ export class BotRuntimeStore {
       return addition
     })
   }
-  inputs(taskId: string): RuntimeTaskInput[] { return this.all<RuntimeTaskInput>('task_inputs').filter(i => i.taskId === taskId) }
+  inputs(taskId: string, limit?: number): RuntimeTaskInput[] { return this.queryRows('task_inputs', undefined, { taskId, limit }) }
   /** 目录确认本身也是当前需求补充；不提前消费聊天批次，待 Router 正常提交。 */
   recordDirectoryConfirmation(task: RuntimeTask, inputIds: string[]): void {
     if (!inputIds.length) return
@@ -328,6 +394,12 @@ export class BotRuntimeStore {
   saveUpload(upload: RuntimeUpload): void { this.put('uploads', upload) }
   upload(uploadId: string): RuntimeUpload | undefined { return this.get('uploads', uploadId) }
   uploads(botId: string): RuntimeUpload[] { return this.all('uploads', botId) }
+  viewMemories(botId: string): { active: RuntimeMemory[]; review: RuntimeMemory[] } {
+    const active = this.db.query("SELECT body FROM memories WHERE bot_id=? AND json_extract(body,'$.status')='active' ORDER BY rowid DESC LIMIT 50").all(botId) as { body: string }[]
+    const review = this.db.query("SELECT body FROM memories WHERE bot_id=? AND json_extract(body,'$.status')='active' AND json_extract(body,'$.needsReview')=1 ORDER BY rowid").all(botId) as { body: string }[]
+    return { active: active.reverse().map(row => JSON.parse(row.body)), review: review.map(row => JSON.parse(row.body)) }
+  }
+  recentExperiences(botId: string): RuntimeExperience[] { return this.queryRows('experiences', botId, { limit: 50 }) }
   memories(botId: string): RuntimeMemory[] { return this.all('memories', botId) }
   memory(memoryId: string): RuntimeMemory | undefined { return this.get('memories', memoryId) }
   saveMemory(memory: RuntimeMemory): void { this.put('memories', memory) }
