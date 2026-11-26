@@ -25,12 +25,88 @@ function probingClient() {
   clients.push(instance)
   return { instance, log }
 }
+function compatibleClient(settings: Record<string, unknown> = {}, reuse?: { cwd: string; executable: string; log: string; config: string }, accessMode?: 'full-access') {
+  const cwd = reuse?.cwd ?? mkdtempSync(join(tmpdir(), 'ce-compat-test-'))
+  if (!reuse) dirs.push(cwd)
+  const executable = reuse?.executable ?? join(cwd, 'codex')
+  const log = reuse?.log ?? join(cwd, 'probes.jsonl')
+  const config = reuse?.config ?? join(cwd, 'compat.json')
+  writeFileSync(config, JSON.stringify({ version: 'codex-cli 0.999.0', ...settings }))
+  if (!reuse) {
+    const q = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'"
+    writeFileSync(executable, `#!/bin/sh\nexec ${q(process.execPath)} ${q(join(import.meta.dir, 'fixtures/bot-app-server.ts'))} ${q('--fixture-probe-log=' + log)} ${q('--fixture-compat=' + config)} "$@"\n`)
+    chmodSync(executable, 0o700)
+  }
+  const instance = new CodexAppServer({ cwd, executable, accessMode, onToolCall: async () => ({}), requestTimeoutMs: 200 })
+  clients.push(instance)
+  return { instance, cwd, executable, log, config }
+}
 afterEach(async () => {
   await Promise.all(clients.splice(0).map(c => c.close()))
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true })
 })
 
 describe('Codex app-server transport', () => {
+  test('兼容新版 Codex 可完成派工、活动输入、原会话恢复与停止，不按版本号拒绝', async () => {
+    const { instance: c } = compatibleClient()
+    const tid = await c.startThread({ instructions: 'host', tools: [], ephemeral: true })
+    const first = await c.startTurn(tid, 'working')
+    await c.steer(tid, first.turnId, 'supplement')
+    expect((await first.done).status).toBe('completed')
+    expect(await c.resumeThread(tid, { instructions: 'host' })).toBe(tid)
+    const second = await c.startTurn(tid, 'working')
+    await c.interrupt(tid, second.turnId)
+    expect((await second.done).status).toBe('interrupted')
+  })
+  test.each([
+    [{ removeMethod: 'turn/interrupt' }, 'turn/interrupt'],
+    [{ removeMethod: 'thread/resume' }, 'thread/resume'],
+    [{ removeField: ['v2/ThreadStartParams.json', 'dynamicTools'] }, 'dynamicTools'],
+    [{ removeField: ['DynamicToolCallParams.json', 'turnId'] }, 'turnId'],
+    [{ badEnvironments: true }, 'environments'],
+    [{ badDynamicTools: true }, 'dynamicTools'],
+    [{ newToolRequirement: true }, 'dynamicTools'],
+    [{ badTurnId: true }, 'expectedTurnId'],
+    [{ requiresModel: true }, 'model'],
+  ])('缺失必要协议能力时在启动模型前拒绝 %j', async (settings, missing) => {
+    const f = compatibleClient(settings as Record<string, unknown>)
+    await expect(f.instance.initialize()).rejects.toThrow(String(missing))
+    expect(readFileSync(f.log, 'utf8')).not.toContain('app-server:start')
+  })
+  test('成功探测按 CLI 版本缓存；失败不缓存，升级后重新检查', async () => {
+    const first = compatibleClient()
+    await first.instance.initialize(); await first.instance.close()
+    const second = compatibleClient({}, first)
+    await second.instance.initialize(); await second.instance.close()
+    expect(readFileSync(first.log, 'utf8').match(/"event":"schema"/g)).toHaveLength(1)
+    const changed = compatibleClient({ version: 'codex-cli 1.0.0', removeMethod: 'turn/steer' }, first)
+    await expect(changed.instance.initialize()).rejects.toThrow('turn/steer'); await changed.instance.close()
+    const fixed = compatibleClient({ version: 'codex-cli 1.0.0' }, first)
+    await fixed.instance.initialize()
+    expect(readFileSync(first.log, 'utf8').match(/"event":"schema"/g)).toHaveLength(3)
+  })
+  test('线程实际沙箱与前台要求不符时，不开始模型轮次', async () => {
+    const f = compatibleClient({ unsafeSandbox: true })
+    await expect(f.instance.startThread({ instructions: 'host', tools: [] })).rejects.toThrow(/沙箱|权限/)
+  })
+  test('全权限 Worker 的探测缓存不能绕过前台隔离检查', async () => {
+    const full = compatibleClient({badEnvironments:true}, undefined, 'full-access')
+    await full.instance.initialize(); await full.instance.close()
+    const front = compatibleClient({badEnvironments:true}, full)
+    await expect(front.instance.initialize()).rejects.toThrow('environments')
+  })
+  test('同版本 CLI 文件被替换后重新检查能力', async () => {
+    const first = compatibleClient();await first.instance.initialize();await first.instance.close()
+    writeFileSync(first.executable,readFileSync(first.executable,'utf8')+'\n# updated executable\n')
+    const second = compatibleClient({removeMethod:'turn/interrupt'},first)
+    await expect(second.instance.initialize()).rejects.toThrow('turn/interrupt')
+  })
+  test('RPC 登录失败与接口缺失分开报告，不泄露原始诊断里的凭据', async () => {
+    const c = client(); await c.initialize()
+    await expect(c.call('test/auth-error',{})).rejects.toThrow(/登录|认证/)
+    await expect(c.call('test/auth-error',{})).rejects.not.toThrow('private-test-key')
+    await expect(c.call('test/method-error',{})).rejects.toThrow(/接口|协议/)
+  })
   test('全权限 Worker 启动和恢复保留工作环境，原生 Shell 不会触发 Router 工具拦截', async () => {
     const c = client(undefined, undefined, 'full-access')
     const thread = await c.startThread({ instructions: '不要更改工作目录之外的文件', tools: [] })
@@ -105,7 +181,7 @@ describe('Codex app-server transport', () => {
     const c = client()
     await c.initialize()
     const active = await c.startTurn('thread-test', 'working')
-    await expect(c.steer('thread-test', 'old-turn', 'update')).rejects.toThrow('active turn mismatch')
+    await expect(c.steer('thread-test', 'old-turn', 'update')).rejects.toThrow('轮次不匹配')
     await c.interrupt('thread-test', active.turnId)
     expect((await active.done).status).toBe('interrupted')
   })

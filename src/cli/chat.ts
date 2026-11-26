@@ -359,7 +359,7 @@ export class ChatHub {
       if (strict) renameSync(path, this.opts.statePath)
     } catch (error) {
       if (temporary) try { rmSync(temporary, { force: true }) } catch { /* 不掩盖原始保存错误。 */ }
-      if (strict) throw new Error(`数字员工注销状态未能保存，请重试：${(error as Error).message}`)
+      if (strict) throw new Error(`数字员工状态未能保存，请重试：${(error as Error).message}`)
       /* 写失败 → 本次内存有效 */
     }
   }
@@ -801,8 +801,8 @@ export class ChatHub {
       group.botMembers?.some(member => member.phoneId === actorPhoneId && member.human === true && !member.guest) === true
   }
 
-  private invalidateBotPolicy(name: string, rec: AgentRec): void {
-    if (rec.bot?.id) void this.runtime?.policyChanged(rec.bot.id)
+  private invalidateBotPolicy(name: string, rec: AgentRec): Promise<void> {
+    const stopped = rec.bot?.id ? this.runtime?.policyChanged(rec.bot.id) : undefined
     for (const group of Object.values(rec.groups)) {
       delete group.botSessionId; delete group.botSessions
       for (const pending of group.botQueue ?? []) if (pending.reply && !pending.reply.system) pending.reply = { text: 'BOT 权限已更新，旧回复已作废，请重新发送消息。', system: true, offset: 0 }
@@ -813,6 +813,7 @@ export class ChatHub {
       pending.reject(new Error('BOT 权限已更新，本次确认失效'))
     }
     this.opts.onBotPolicyChanged?.(name)
+    return stopped ?? Promise.resolve()
   }
 
   async botPolicy(name: string, actorPhoneId: string, permissions?: unknown): Promise<BotPolicyResult> {
@@ -826,6 +827,7 @@ export class ChatHub {
         if (rec.bot.retirement) throw new Error('数字员工已停止或注销，不能修改权限')
         if (!canManage) throw new Error('只有 BOT 创建者可以修改权限')
         const validated = fullAccess ? fullAccessPermissions(validateBotPermissions(permissions)) : validateBotPermissions(permissions)
+        if (rec.bot.onboarding && validated.directory !== rec.bot.policy?.permissions.directory) throw new Error('请通过数字人资料中的工作目录入口修改目录')
         resolveBotDirectory(rec.cwd, validated)
         if (!fullAccess && validated.execute !== 'deny' && !this.opts.commandSandbox?.()) throw new Error('当前机器不支持受控命令沙箱，暂不能授予命令执行权限')
         if (rec.bot.policy && rec.bot.policy.ownerPhoneId !== actorPhoneId) throw new Error('BOT 已由其他创建者管理')
@@ -835,12 +837,35 @@ export class ChatHub {
       }
       const policy = rec.bot.policy
       return { ok: true, data: {
+        ...(rec.bot.onboarding && this.opts.rootDir ? { workDirectory: { path: '/' + relative(realpathSync(this.opts.rootDir), resolve(rec.cwd, policy?.permissions.directory ?? '.')).split(sep).join('/'), cwd: resolve(rec.cwd, policy?.permissions.directory ?? '.') } } : {}),
         permissions: fullAccess ? fullAccessPermissions(policy?.permissions ?? botPermissionPreset('readonly')) : policy?.permissions ?? botPermissionPreset('readonly'), ownerPhoneId: policy?.ownerPhoneId,
         ...(fullAccess ? { workerAccessMode: 'full-access' as const } : {}),
         revision: policy?.revision ?? 0, canManage,
         approvals: canManage ? [...[...this.botApprovals.values()].filter(p => p.name === name && p.approval.expiresAt > Date.now()).map(p => ({ ...p.approval })), ...(rec.bot.id && this.runtime ? this.runtime.approvals(rec.bot.id) : [])] : [],
         people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true,
       } }
+    } catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  async botDirectory(name: string, actor: string, expectedRevision: number, directory: unknown): Promise<BotPolicyResult> {
+    try {
+      const rec = this.state.agents[name]; const bot = rec?.bot
+      if (!bot?.onboarding || !bot.policy || !rec.cwd || !bot.id) throw new Error('只有独立创建的数字人支持修改工作目录')
+      if (!actor || bot.policy.ownerPhoneId !== actor) throw new Error('只有数字人创建者可以修改工作目录')
+      if (bot.retirement) throw new Error('数字人已停止或注销，不能修改工作目录')
+      if (bot.onboarding.status !== 'ready' || !this.runtime?.enabled(bot.id)) throw new Error('请先完成数字人初始化')
+      if (!Number.isInteger(expectedRevision) || expectedRevision !== bot.policy.revision) throw new Error('配置版本已变化，请刷新后重试')
+      if (typeof directory !== 'string' || !directory.trim() || directory.length > 2000 || /[\\\r\n\0]/.test(directory) || directory.split('/').includes('..')) throw new Error('请选择设备内有效的工作目录，不可使用上级目录')
+      const cwd = digitalPersonDirectory(this.opts.rootDir, directory.trim())
+      if (cwd === rec.cwd && bot.policy.permissions.directory === '.') return this.botPolicy(name, actor)
+      // 检查与同步持久化之间不让出执行权，避免在旧目录派出新任务。
+      this.runtime.assertDirectoryChangeAllowed(bot.id)
+      const previousCwd = rec.cwd; const previousPolicy = bot.policy
+      rec.cwd = cwd
+      bot.policy = { ...previousPolicy, permissions: { ...previousPolicy.permissions, directory: '.' }, revision: previousPolicy.revision + 1 }
+      try { this.save(true) } catch (error) { rec.cwd = previousCwd; bot.policy = previousPolicy; throw error }
+      await this.invalidateBotPolicy(name, rec)
+      return this.botPolicy(name, actor)
     } catch (error) { return { ok: false, error: (error as Error).message } }
   }
 
@@ -1031,22 +1056,24 @@ export class ChatHub {
       if (!actor || p.botProtocol !== 1 || p.botPolicyProtocol !== 1 || !p.groupId) throw new Error('创建数字人需要已认证 owner 和新版入职协议')
       if (!this.runtime) throw new Error('当前 CE 未启用数字人运行环境，请更新 CE')
       const setup = validateDigitalPerson(p.onboarding)
+      const platform = (p.platform ?? 'claude') as BotPlatform
+      let rec = this.state.agents[p.name]
+      // 创建配置是不可变的恢复凭据；已就绪身份恢复不能重置当前目录或要求旧目录仍存在。
+      if (rec?.bot?.onboarding?.status === 'ready') {
+        if (rec.bot.retirement) throw new Error('数字人已注销，不能重新初始化')
+        if (rec.bot.policy?.ownerPhoneId !== actor || rec.platform !== platform || rec.bot.dmGroupId !== p.groupId || JSON.stringify(validateDigitalPerson(rec.bot.onboarding)) !== JSON.stringify(setup)) throw new Error('该名称已有其他数字人或创建配置已改变，请使用原配置重试')
+        return { ok: true, data: { botProtocol: 1, botPolicyProtocol: 1, onboardingProtocol: 1, ready: true, cwd: rec.cwd, groupId: p.groupId, policy: (await this.botPolicy(p.name, actor)).data } }
+      }
       const cwd = digitalPersonDirectory(this.opts.rootDir, setup.directory)
       const permissions = validateBotPermissions(p.permissions)
       if (permissions.directory !== '.' || permissions.commanders !== 'owner' || permissions.allowedPhoneIds.length) throw new Error('数字人必须以所选目录为工作根，且仅 owner 可以指挥')
       resolveBotDirectory(cwd, permissions)
-      const platform = (p.platform ?? 'claude') as BotPlatform
       const fingerprint = createHash('sha256').update(JSON.stringify({ setup, cwd, platform, permissions, groupId: p.groupId })).digest('hex')
-      let rec = this.state.agents[p.name]
-      // 已入职联系人的有效权限会随宿主模式更新，恢复身份不能绑定这份可变配置。
-      const sameReadyIdentity = rec?.bot?.onboarding?.status === 'ready' && rec.cwd === cwd && rec.platform === platform && rec.bot.dmGroupId === p.groupId &&
-        JSON.stringify(validateDigitalPerson(rec.bot.onboarding)) === JSON.stringify(setup)
-      if (rec && (rec.bot?.policy?.ownerPhoneId !== actor || rec.bot?.onboarding?.creationId !== setup.creationId || (!sameReadyIdentity && rec.bot.onboarding.fingerprint !== fingerprint))) throw new Error('该名称已有其他数字人或创建配置已改变，请使用原配置重试')
+      if (rec && (rec.bot?.policy?.ownerPhoneId !== actor || rec.bot?.onboarding?.creationId !== setup.creationId || rec.bot.onboarding.fingerprint !== fingerprint)) throw new Error('该名称已有其他数字人或创建配置已改变，请使用原配置重试')
       if (!rec && Object.values(this.state.agents).some(row => row.bot?.onboarding?.creationId === setup.creationId)) throw new Error('此创建请求已经用于另一位数字人')
       if (rec?.bot?.retirement) throw new Error('数字人已注销，不能重新初始化')
       const result = async () => ({ ok: true, data: { botProtocol: 1, botPolicyProtocol: 1, onboardingProtocol: 1, ready: true, cwd,
         groupId: p.groupId, policy: (await this.botPolicy(p.name, actor)).data } })
-      if (rec?.bot?.onboarding?.status === 'ready') return result()
       if (!await (this.opts.botCliAvailable ? this.opts.botCliAvailable(platform) : botCliAvailable(platform, this.opts.botCliPaths?.[platform]))) throw new Error(`机器未安装或无法启动 ${platform} CLI，请安装后重试`)
       if (!rec) {
         rec = { platform, cwd, joinedAt: Date.now(), groups: {}, bot: { id: randomUUID(), sourceSessionId: `digital:${setup.creationId}`,

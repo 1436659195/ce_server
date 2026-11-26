@@ -1551,6 +1551,9 @@ async function main(): Promise<void> {
           } else if (req.op === 'chat.botPolicy') {
             const q = req as { name?: string; permissions?: BotPermissions }
             resp = await chatHub.botPolicy(q.name ?? '', srcPhone, q.permissions)
+          } else if (req.op === 'chat.botDirectory') {
+            const q = req as { name?: string; expectedRevision?: number; directory?: unknown }
+            resp = await chatHub.botDirectory(q.name ?? '', srcPhone, q.expectedRevision ?? -1, q.directory)
           } else if (req.op === 'chat.botRetire') {
             const q = req as { name?: string }
             resp = await chatHub.botRetire(q.name ?? '', srcPhone)

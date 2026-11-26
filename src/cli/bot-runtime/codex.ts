@@ -1,9 +1,12 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import type { WorkerAccessMode } from './worker-policy'
+import { checkCodexProtocol, cliVersion, compatibilityKey, rememberCompatible, requireCliOptions, RuntimeCompatibilityError, runtimeFailure, wasCompatible } from './compatibility'
 
-/** 只保留本产品使用、经本机 0.170.0 协议核对的字段。 */
+/** The installed CLI must expose these protocol capabilities; its version is diagnostic only. */
 export interface CodexToolSpec { name: string; description: string; inputSchema: Record<string, unknown> }
 export interface CodexToolCall { threadId: string; turnId: string; callId: string; tool: string; arguments: Record<string, unknown> }
 export interface CodexTurn { id: string; status: string; error?: { message?: string } | null; items?: Array<Record<string, unknown>> }
@@ -26,7 +29,7 @@ interface Options {
   /** 宿主测试专用命令，不可来自聊天输入或远端 RPC。 */
   command?: string[]
 }
-type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }
+type Pending = { method: string; resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }
 type TurnWaiter = { promise: Promise<CodexTurn>; resolve: (turn: CodexTurn) => void; reject: (error: Error) => void }
 
 const DISABLED_FEATURES = ['shell_tool', 'view_image', 'apps', 'plugins', 'hooks', 'browser_use', 'computer_use', 'image_generation', 'multi_agent', 'multi_agent_v2', 'memory_tool', 'skill_search', 'tool_suggest']
@@ -50,6 +53,7 @@ export class CodexAppServer {
   private exited = true
   private closing = false
   private failure?: Error
+  private version = 'unknown'
   constructor(private readonly options: Options) {}
 
   get closed(): boolean { return this.exited }
@@ -114,9 +118,21 @@ export class CodexAppServer {
   private async safeCommand(): Promise<string[]> {
     const executable = this.options.executable ?? 'codex'
     try {
-      const version = await this.probe(executable, ['--version'], 5000)
-      if (!/^codex-cli 0\.170\.0\s*$/.test(version.trim())) throw new Error()
-    } catch { throw new Error('前后台模式需要已验证的 Codex 0.170.0；当前版本尚未通过兼容验证') }
+      this.version = cliVersion(await this.probe(executable, ['--version'], 5000), 'codex')
+    } catch (error) { throw error instanceof RuntimeCompatibilityError ? error : new Error('无法启动 Codex CLI，请检查工作设备上的安装与可执行文件路径') }
+    const key = compatibilityKey('codex', executable, this.version, this.options.accessMode ?? 'controlled')
+    if (!wasCompatible(key)) {
+      const help = await this.probe(executable, ['app-server', '--help'], 5000).catch(error => { throw runtimeFailure('Codex', error, '无法检查 Codex app-server 入口，请核对 CLI 安装') })
+      requireCliOptions(help, ['--stdio'], `Codex ${this.version}`)
+      const directory = mkdtempSync(join(tmpdir(), 'ce-codex-protocol-'))
+      try {
+        await this.probe(executable, ['app-server', 'generate-json-schema', '--experimental', '--out', directory], 15_000)
+          .catch(error => { throw runtimeFailure('Codex', error, `无法读取 Codex ${this.version} 的协议能力，请核对 schema 生成接口与临时目录权限`) })
+        checkCodexProtocol(name => JSON.parse(readFileSync(join(directory, name), 'utf8')), this.options.accessMode === 'full-access', this.version)
+        if (this.closing) throw new Error('Codex app-server 已关闭')
+        rememberCompatible(key)
+      } finally { rmSync(directory, { recursive: true, force: true }) }
+    }
     if (this.options.accessMode === 'full-access') return [executable, 'app-server', '--stdio', '-c', 'sandbox_mode="danger-full-access"', '-c', 'approval_policy="never"', '-c', 'features.shell_tool=true']
     let servers: Array<{ name: string }>
     try {
@@ -132,21 +148,28 @@ export class CodexAppServer {
 
   async startThread(options: ThreadOptions): Promise<string> {
     await this.initialize()
-    const response = await this.call<{ thread: { id: string } }>('thread/start', {
+    const response = await this.call<{ thread: { id: string }; sandbox?: { type?: string }; approvalPolicy?: unknown }>('thread/start', {
       ...this.threadConfig(options.instructions), ephemeral: options.ephemeral ?? false,
       dynamicTools: options.tools.map(tool => ({ type: 'function', ...tool })),
     })
     if (!response.thread?.id) throw new Error('Codex 未返回线程 ID')
+    this.checkThreadPolicy(response)
     this.threadTools.set(response.thread.id, new Set(options.tools.map(t => t.name)))
     return response.thread.id
   }
 
   async resumeThread(threadId: string, options: { instructions: string; tools?: CodexToolSpec[] }): Promise<string> {
     await this.initialize()
-    const response = await this.call<{ thread: { id: string } }>('thread/resume', { threadId, ...this.threadConfig(options.instructions) })
+    const response = await this.call<{ thread: { id: string }; sandbox?: { type?: string }; approvalPolicy?: unknown }>('thread/resume', { threadId, ...this.threadConfig(options.instructions) })
     if (response.thread?.id !== threadId) throw new Error('Codex 恢复了不匹配的线程')
+    this.checkThreadPolicy(response)
     if (options.tools) this.threadTools.set(threadId, new Set(options.tools.map(t => t.name)))
     return response.thread.id
+  }
+
+  private checkThreadPolicy(response: { sandbox?: { type?: string }; approvalPolicy?: unknown }): void {
+    const expected = this.options.accessMode === 'full-access' ? 'dangerFullAccess' : 'readOnly'
+    if (response.sandbox?.type !== expected || response.approvalPolicy !== 'never') throw new RuntimeCompatibilityError(`Codex ${this.version} 返回的沙箱或审批权限与 CE 要求不符，未开始模型任务`)
   }
 
   private threadConfig(instructions: string): Record<string, unknown> {
@@ -178,6 +201,7 @@ export class CodexAppServer {
     } finally { this.startingThreads.delete(threadId) }
     if (!response.turn?.id) throw new Error('Codex 未返回轮次 ID')
     const turnId = response.turn.id
+    response.turn = this.safeTurn(response.turn)
     const key = this.turnKey(threadId, turnId)
     if (['completed', 'failed', 'interrupted'].includes(response.turn.status)) {
       this.finished.set(key, response.turn)
@@ -208,7 +232,7 @@ export class CodexAppServer {
     const id = this.nextId++
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Codex 请求超时：${method}`)) }, this.options.requestTimeoutMs ?? 30_000)
-      this.pending.set(id, { resolve: value => resolve(value as T), reject, timer })
+      this.pending.set(id, { method, resolve: value => resolve(value as T), reject, timer })
       try { this.write({ id, method, params }) }
       catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error) }
     })
@@ -227,7 +251,13 @@ export class CodexAppServer {
       const pending = this.pending.get(message.id)
       if (!pending) return
       this.pending.delete(message.id); clearTimeout(pending.timer)
-      if (message.error) pending.reject(new Error(`Codex ${message.error.code ?? ''}: ${String(message.error.message ?? '请求失败').slice(0, 1000)}`))
+      if (message.error) {
+        const code = message.error.code
+        const raw = String(message.error.message ?? '')
+        if (/active turn mismatch/i.test(raw)) pending.reject(new Error('Codex 活动轮次不匹配，补充要求未投递'))
+        else if (code === -32601 || code === -32602) pending.reject(new RuntimeCompatibilityError(`Codex ${this.version} 的 ${pending.method} 接口或参数不兼容（${code}），请更新 CE 适配器`))
+        else pending.reject(runtimeFailure('Codex', `${code ?? ''} ${raw}`, `Codex ${pending.method} 请求失败，请核对模型配置与工作设备日志`))
+      }
       else pending.resolve(message.result)
       return
     }
@@ -246,6 +276,7 @@ export class CodexAppServer {
     if (event.method === 'turn/started' || event.method === 'turn/completed') {
       const p = event.params as { threadId: string; turn: CodexTurn }
       if (typeof p.threadId === 'string' && typeof p.turn?.id === 'string') {
+        p.turn = this.safeTurn(p.turn)
         const key = this.turnKey(p.threadId, p.turn.id)
         if (event.method === 'turn/completed') {
           this.finished.set(key, p.turn)
@@ -256,6 +287,10 @@ export class CodexAppServer {
       }
     }
     try { this.options.onNotification?.(event) } catch { /* 观察者错误不能破坏 RPC 接收循环。 */ }
+  }
+
+  private safeTurn(turn: CodexTurn): CodexTurn {
+    return turn.error ? { ...turn, error: { message: runtimeFailure('Codex', turn.error.message ?? '').message } } : turn
   }
 
   private async serverRequest(message: Record<string, any>): Promise<void> {

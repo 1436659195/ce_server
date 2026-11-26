@@ -6,6 +6,8 @@ import type { MemorySummary } from './memory'
 import type { ExperienceSummary } from './experience'
 import type { RuntimeBot, RuntimeCase, RuntimeInbox, RuntimeOperation, RuntimeReply, RuntimeTask } from './types'
 import { fullAccessPermissions, workerExecutionPolicy } from './worker-policy'
+import { caseSummary, selectCases, selectTasks } from './cases'
+import type { RuntimeArtifact, RuntimeCaseUpdate, RuntimeCaseDecision } from './types'
 
 export const ROUTER_INSTRUCTIONS = `你是这个数字员工唯一对外说话的前台 Agent，负责长期自然对话、工作管理和把工作结果讲给用户。
 你正在聊天窗口里和用户交流：先理解对方这句话想知道什么，再决定说什么、说多少。直接回应所问，不主动增加用户没问的未知事项或验收总结。查证依据保存在内部记录；日常气泡不默认罗列“来源”、章节、内部路径，用户要求出处、需要核验或正式报告时再提供。对会影响当前结论的限制和风险必须清楚表达。100字是上限，不是每次都要用满。
@@ -18,7 +20,9 @@ export const ROUTER_INSTRUCTIONS = `你是这个数字员工唯一对外说话�
 用户附件已安全保存在本机。你只看名称、类型等元信息；Worker 可通过 work_read_attachment 分页读文本或看图片。带附件的分析、读图、写报告请求应派给 Worker，不能声称无法接收图片；未知格式先评估，不能编造内容。只有附件没有需求时自然询问用途，不擅自处理。
 用户提到之前上传的材料时，从 recentMessages 或聊天查询找到带附件的消息，在decision.priorAttachmentMessageIds中选择；当前整批的附件由宿主自动关联，不必重复填写，不把无关文件带入工单。每次start在decision中明确delivery：用户要报告、文档、图片等文件则为 files，只需口头调查结论则为 chat；补充要求交付文件时也标记 files。
 工作目录里的现有文件由 Worker 读取，不属于聊天附件，不填写priorAttachmentMessageIds。以 capabilities.executionMode 为准：full-access 表示后台拥有原生文件工具、Shell 和网络，旧 commandSandbox 与逐项权限不限制它，不要声称命令不可用、不能联网或只能读小文本。工作目录为软隔离，要求所有文件变更留在目录内，不破坏系统。全权限不等于账号已登录或发布已获授权，具体工具、依赖与账号状态让 Worker 核实。其他模式才按 operations 与 commandSandbox 判断受控工具权限。
-卷宗按具体对象和持续目标匹配，先检查候选；已有卷宗的新交付创建新工单，不能把旧 Session 当作权限。
+卷宗按工作对象与成果的延续关系归档，不按当前动作或首轮问题划界。引用、追问、修订、验证或继续加工已有工作及成果，默认归入原卷宗；总结→核对设计差异→修改并另存设计文档是一份卷宗。动作、输出文件名、交付形式、从读变写、任务完成或时间间隔都不是拆卷理由。同项目里的独立事项仍可新建；确有不同对象、独立工作链或用户明确另起事项时，kind=new并用reason说明为什么已有候选不能承接，不因没找到同名标题就新建。先核对候选的任务、成果及原话，必要时case_search；用户说“这个文档”“不一致的地方”应追溯对应成果和任务。上下文未找到不代表不存在，查询后仍有多个合理对象才澄清。
+卷宗title只是可演进的展示名称，id才是身份；object是具体工作对象，goal是累计工作范围，summary是最近进展。每次续接都检查名称和范围是否仍能概括已确认的工作链，必要时通过dossier.update或caseUpdate更新title/goal；仍适合时不改名。累计范围保留前序工作关系，不改成最新任务的一句话，不预测用户没要求的工作。历史名称由宿主保留，不要为了改名新建。task_inspect标记goalTruncated时须先case_search读取完整累计范围，不能据截断片段覆盖它。已有卷宗用kind=existing、caseId、relation（follow_up追问/验证，revision修订，next_step后续阶段）和reason说明承接关系。
+已有卷宗的新交付或已完成任务的后续要求使用start创建后续工单，仍选择原caseId。本轮goal/acceptance/allowedOps描述当前任务，和卷宗累计范围分开。前序任务只读不限制后续任务；用户已要求修改且当前能力允许时，在原卷宗创建具有相应操作范围的新工单，不能因旧工单只读而拒绝或另建卷宗。活动任务补充超出原allowedOps时也用原卷宗的新工单承接，避免给只读工单直接追加写要求。旧Session只是上下文，不是权限，始终以当前工单与宿主能力为准。
 已有活动任务的合理、可行、获准补充使用 append；原话会立即送给 Worker，不等它结束。需要现在回答的专业问题使用 ask_worker。
 主人说「别搞了」「停」是在叫停正在跑的任务：用 stop 并带上 taskId。任务停下后它的结果不再发出；已经改了的文件不会自动改回去，要照实说明。主人说「继续」是恢复最近停下的任务（已停止或失败）：用 resume 并带上 taskId。宿主会先核对权限和有没有结果未知的操作，核对不过会把原因告诉你，你照实转述，不要换一个新任务绕过去。任务还在停止过程中也可以直接 resume，宿主会等它真正停下后恢复。分不清指哪个任务时先问一句。主人是在回答必要问题时用 answer，不是 resume。
 用户问当前进度或专业细节时，先匹配正在执行的任务，用 ask_worker 把追问插入原 Worker 会话；不能为同一个进度问题另建 Worker。summaryUpdatedAt 是进展摘要的记录时间，observedAt 是宿主本次读取状态的时间，两者不能混淆；旧摘要只能描述为最近一次已知进展，不能推断完成百分比、剩余时间或编造新进展。activeOperations 只证明对应工具正在执行或等待审批，不证明操作已经成功。你可以按这些事实简短接话，详细解释交给 Worker。
@@ -57,14 +61,15 @@ const taskTarget = { taskId: modelId('从已披露工单中选择目标ID；不�
 const delivery = z.enum(['chat', 'files']).describe('用户只要口头结论用chat；要报告、文档或图片文件用files')
 const priorAttachments = z.array(modelId('之前带上传附件的聊天消息ID')).max(4).optional()
   .describe('仅在用户明确引用之前的聊天附件时填写。当前整批附件宿主已自动关联，无需填写；工作目录文件也不填。')
-const taskInput = { ...taskTarget, delivery: delivery.optional(), priorAttachmentMessageIds: priorAttachments }
+const caseUpdate = z.strictObject({ title: modelText('仅在旧名不再概括累计工作时改名；不改成最新任务名', 100).optional(), goal: modelText('累计工作范围：保留前序工作及本次延伸，不预测未来要求', 1000).optional() })
+const taskInput = { ...taskTarget, delivery: delivery.optional(), priorAttachmentMessageIds: priorAttachments, caseUpdate: caseUpdate.optional() }
 const decisionSchema = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('reply') }),
   z.strictObject({ action: z.literal('request_access') }),
   z.strictObject({ action: z.literal('start'),
     dossier: z.discriminatedUnion('kind', [
-      z.strictObject({ kind: z.literal('existing'), caseId: modelId('选择已有卷宗') }),
-      z.strictObject({ kind: z.literal('new'), title: modelText('新卷宗标题', 100), object: modelText('具体工作对象', 500), goal: modelText('持续目标', 1000) }),
+      z.strictObject({ kind: z.literal('existing'), caseId: modelId('选择本轮已披露的原卷宗'), relation: z.enum(['follow_up', 'revision', 'next_step']), reason: modelText('依据具体对象、任务或成果说明承接关系', 500), update: caseUpdate.optional() }),
+      z.strictObject({ kind: z.literal('new'), title: modelText('概括工作对象的卷宗名称，不以一次动作限制范围', 100), object: modelText('具体工作对象', 500), goal: modelText('已确认的工作范围', 1000), reason: modelText('独立事项的边界，以及已有候选不能承接的原因；动作或读写变化不是理由', 500) }),
     ]).describe('明确选择复用已有卷宗，或新建卷宗；不能同时选择'),
     goal: modelText('本次任务目标'), delivery,
     allowedOps: z.array(z.enum(['read', 'create', 'edit', 'delete', 'execute'])).min(1).max(5)
@@ -91,7 +96,7 @@ const routerCallSchema = z.strictObject({
 export const ROUTER_TOOLS: CodexToolSpec[] = [
   tool('chat_recent', '按需读取当前私聊最近消息；含你自己此前的回复。', { limit: num('最多 20 条') }),
   tool('chat_search', '在当前私聊本地记录里搜索关键词。', { query: str('要查询的关键词') }, ['query']),
-  tool('case_search', '查具体对象和目标对应的卷宗。', { query: str('对象/目标关键词') }, ['query']),
+  tool('case_search', '按对象、当前或历史名称、累计范围、任务和成果查卷宗；支持多个关键词，返回真实任务与成果归属。', { query: str('对象、成果文件名或多个关键词') }, ['query']),
   tool('task_inspect', '核对指定工单的状态与未处理输入，宿主同时记录本轮已披露的版本。', { taskId: str('工单 ID') }, ['taskId']),
   tool('experience_read', '按经验摘要 ID 获取详细经过与来源。', { experienceId: str('经验 ID') }, ['experienceId']),
   { name: 'router_decide', description: '提交自然回复及一个类型明确的动作。宿主绑定本轮已披露的版本、问题和内部来源，并验权保存。', inputSchema: z.toJSONSchema(routerCallSchema) as Record<string, unknown> },
@@ -106,6 +111,7 @@ export interface RouterDecision {
   workerReplyId?: string
   workerReplyIndexes?: number[]
   sourceInputIds?: string[]; delivery?: 'chat' | 'files'
+  caseUpdate?: RuntimeCaseUpdate; caseDecision?: RuntimeCaseDecision
 }
 export function boundedText(value: unknown, label: string, max = 2000): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max) throw new Error(`${label} 需要 1～${max} 字符`)
@@ -168,7 +174,8 @@ export function parseRouterDecision(value: Record<string, unknown>, bot: Runtime
 /** 本轮真正提供给模型的事实；不能在提交时用最新值覆盖这些快照。 */
 export interface RouterBindings {
   policyRevision: number
-  tasks: Map<string, { revision: number; questionId?: string }>
+  tasks: Map<string, { revision: number; questionId?: string; caseId?: string }>
+  cases: Map<string, { revision: number; scopeComplete?: boolean }>
   currentInputIds: string[]
   workerReplyId?: string
 }
@@ -177,15 +184,30 @@ export function bindRouterDecision(value: Record<string, unknown>, bot: RuntimeB
   if (!parsed.success) throw new Error(`决策参数格式错误：${parsed.error.issues.slice(0, 4).map(i => `${i.path.join('.')}: ${i.message}`).join('；')}`)
   const { decision, ...expression } = parsed.data
   const intent: Record<string, unknown> = { ...decision }
+  let update: RuntimeCaseUpdate | undefined
+  let caseDecision: RuntimeCaseDecision | undefined
+  const bindCase = (caseId: string, patch?: { title?: string; goal?: string }) => {
+    const seen = snapshot.cases.get(caseId)
+    if (!seen) throw new Error('目标卷宗尚未在本轮披露，请先使用case_search或task_inspect核对')
+    if (patch?.goal !== undefined && seen.scopeComplete === false) throw new Error('累计工作范围尚未完整披露，请先使用case_search读取完整卷宗再更新')
+    intent.caseId = caseId
+    if (patch && (patch.title !== undefined || patch.goal !== undefined)) update = { ...patch, expectedRevision: seen.revision }
+  }
   if ('dossier' in decision) {
-    if (decision.dossier.kind === 'existing') intent.caseId = decision.dossier.caseId
-    else { const { kind: _, ...newCase } = decision.dossier; intent.newCase = newCase }
+    const dossier = decision.dossier
+    if (dossier.kind === 'existing') { bindCase(dossier.caseId, dossier.update); caseDecision = { kind: 'existing', relation: dossier.relation, reason: dossier.reason } }
+    else { const { kind: _, reason, ...newCase } = dossier; intent.newCase = newCase; caseDecision = { kind: 'new', reason } }
     delete intent.dossier
   }
   if ('taskId' in decision) {
     const seen = snapshot.tasks.get(decision.taskId)
     if (!seen) throw new Error('目标工单尚未在本轮披露，请先使用task_inspect核对')
     intent.expectedRevision = seen.revision
+    if ('caseUpdate' in decision && decision.caseUpdate) {
+      if (!seen.caseId) throw new Error('任务所属卷宗尚未披露，请先使用task_inspect核对')
+      bindCase(seen.caseId, decision.caseUpdate)
+      delete intent.caseUpdate
+    }
     if (decision.action === 'answer') {
       if (!seen.questionId) throw new Error('本轮已披露的目标工单没有待回答的必要问题，请核对')
       intent.questionId = seen.questionId
@@ -196,7 +218,10 @@ export function bindRouterDecision(value: Record<string, unknown>, bot: RuntimeB
     intent.sourceInputIds = decision.priorAttachmentMessageIds?.filter(id => !snapshot.currentInputIds.includes(id))
     delete intent.priorAttachmentMessageIds
   }
-  return parseRouterDecision({ ...intent, ...expression, policyRevision: snapshot.policyRevision, workerReplyId: snapshot.workerReplyId }, bot)
+  const result = parseRouterDecision({ ...intent, ...expression, policyRevision: snapshot.policyRevision, workerReplyId: snapshot.workerReplyId }, bot)
+  if (update) { result.caseId = String(intent.caseId); result.caseUpdate = update }
+  if (caseDecision) result.caseDecision = caseDecision
+  return result
 }
 
 /** 停止、继续这类整句不等安静期。只认整句，句末标点可省；夹在长句里的不算。 */
@@ -210,7 +235,8 @@ export function activeOperationStatus(operations: RuntimeOperation[]) {
   return operations.filter(o => ['pending_approval', 'approved', 'running', 'unknown'].includes(o.state)).slice(-6)
     .map(o => ({ id: o.id, taskId: o.taskId, tool: o.tool, state: o.state, createdAt: o.createdAt }))
 }
-export function routerContext(p: { bot: RuntimeBot; input?: RuntimeInbox; inputs?: RuntimeInbox[]; workerMessage?: RuntimeReply; workerRequest?: string; workerArtifacts?: Array<{ id: string; name: string; mime: string; size: number }>; pendingReplies?: Array<{ id: string; text: string }>; profile: string; messages: RuntimeInbox[]; cases: RuntimeCase[]; tasks: RuntimeTask[]; experienceSummaries: ExperienceSummary[]; operations?: RuntimeOperation[]; previousReplies?: Array<{ text: string; createdAt: number }>; toolsLocked?: boolean; memories?: { long: MemorySummary[]; mid: MemorySummary[]; overflow: number } }): string {
+export function routerContext(p: { bot: RuntimeBot; input?: RuntimeInbox; inputs?: RuntimeInbox[]; workerMessage?: RuntimeReply; workerRequest?: string; workerArtifacts?: Array<{ id: string; name: string; mime: string; size: number }>; pendingReplies?: Array<{ id: string; text: string }>; profile: string; messages: RuntimeInbox[]; cases: RuntimeCase[]; tasks: RuntimeTask[]; artifacts?: RuntimeArtifact[]; relatedTaskIds?: string[]; experienceSummaries: ExperienceSummary[]; operations?: RuntimeOperation[]; previousReplies?: Array<{ text: string; createdAt: number; taskId?: string; caseId?: string }>; toolsLocked?: boolean; memories?: { long: MemorySummary[]; mid: MemorySummary[]; overflow: number } }): string {
+  const relatedTaskIds = p.relatedTaskIds ?? [...(p.inputs ?? (p.input ? [p.input] : [])).flatMap(m => m.targetTaskId ? [m.targetTaskId] : []), ...(p.workerMessage?.taskId ? [p.workerMessage.taskId] : [])]
   return JSON.stringify({
     observedAt: Date.now(),
     trigger: p.inputs?.length || p.input ? 'user_messages' : 'worker_message',
@@ -224,10 +250,14 @@ export function routerContext(p: { bot: RuntimeBot; input?: RuntimeInbox; inputs
     pendingReplies: (p.pendingReplies ?? []).slice(-12).map(r => ({ id: r.id, text: r.text.slice(0, 400) })),
     olderPendingReplyCount: Math.max(0, (p.pendingReplies?.length ?? 0) - 12),
     currentMessage: p.input ? { ...p.input, attachments: p.input.attachments ?? [], text: p.input.text.slice(0, 8000), ...(p.input.text.length > 8000 ? { truncated: true, instruction: '原文过长，先澄清具体处理目标，不能忽略未加载的限制' } : {}) } : null,
-    recentMessages: p.messages.slice(-8).map(m => ({ id: m.id, text: m.text.slice(0, 600), attachments: m.attachments, createdAt: m.createdAt })),
+    recentMessages: p.messages.slice(-8).map(m => {
+      const taskId = m.decision && typeof m.decision === 'object' && 'taskId' in m.decision ? m.decision.taskId : undefined
+      const task = p.tasks.find(t => t.botId === p.bot.botId && (t.id === taskId || t.originInputId === m.id || t.originInputIds?.includes(m.id)))
+      return { id: m.id, text: m.text.slice(0, 600), attachments: m.attachments, createdAt: m.createdAt, ...(task ? { taskId: task.id, caseId: task.caseId } : {}) }
+    }),
     previousReplies: p.previousReplies?.slice(-8),
-    cases: p.cases.slice(-5).map(c => ({ id: c.id, title: c.title, object: c.object, goal: c.goal, summary: c.summary.slice(0, 300) })),
-    tasks: p.tasks.slice(-6).map(t => ({ id: t.id, caseId: t.caseId, goal: t.goal, state: t.state, revision: t.revision, summary: t.summary.slice(0, 500), summaryUpdatedAt: t.summaryUpdatedAt ?? null, question: t.question, followup: t.followup, allowedOps: t.mandate.allowedOps, exclusions: t.mandate.exclusions, updatedAt: t.updatedAt })),
+    cases: selectCases(p.cases, p.tasks, p.artifacts ?? [], { query: (p.inputs ?? (p.input ? [p.input] : [])).map(m => m.text).join('\n'), relatedTaskIds }).map(c => caseSummary(c, p.tasks, p.artifacts ?? [])),
+    tasks: selectTasks(p.tasks, relatedTaskIds).map(t => ({ id: t.id, caseId: t.caseId, goal: t.goal, state: t.state, revision: t.revision, summary: t.summary.slice(0, 500), summaryUpdatedAt: t.summaryUpdatedAt ?? null, question: t.question, followup: t.followup, allowedOps: t.mandate.allowedOps, exclusions: t.mandate.exclusions, updatedAt: t.updatedAt })),
     activeOperations: activeOperationStatus((p.operations ?? []).filter(o => o.botId === p.bot.botId && p.tasks.some(t => t.id === o.taskId))),
     experienceSummaries: p.experienceSummaries,
   })

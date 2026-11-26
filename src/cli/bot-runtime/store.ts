@@ -4,6 +4,8 @@ import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload } from './types'
 import { EXPERIENCE_ESTABLISHED_USES } from './experience'
+import { selectCases } from './cases'
+import type { RuntimeCaseUpdate, RuntimeCaseDecision } from './types'
 
 type Table = 'settings' | 'inbox' | 'cases' | 'tasks' | 'task_inputs' | 'runs' | 'tool_operations' | 'outbox' | 'artifacts' | 'controls' | 'uploads' | 'memories' | 'memory_log' | 'experiences'
 const tables: Table[] = ['settings', 'inbox', 'cases', 'tasks', 'task_inputs', 'runs', 'tool_operations', 'outbox', 'artifacts', 'controls', 'uploads', 'memories', 'memory_log', 'experiences']
@@ -125,9 +127,26 @@ export class BotRuntimeStore {
   cases(botId: string): RuntimeCase[] { return this.all('cases', botId) }
   case(caseId: string): RuntimeCase | undefined { return this.get('cases', caseId) }
   saveCase(value: RuntimeCase): void { this.put('cases', value) }
+  findCases(botId: string, query: string): RuntimeCase[] { return selectCases(this.cases(botId), this.tasks(botId), this.artifacts(botId), { query, searchOnly: true }) }
+  updateCase(botId: string, caseId: string, patch?: RuntimeCaseUpdate): RuntimeCase {
+    const dossier = this.case(caseId)
+    if (!dossier || dossier.botId !== botId) throw new Error('卷宗归属不匹配')
+    const revision = dossier.revision ?? 1
+    if (patch && patch.expectedRevision !== revision) throw new Error('卷宗版本已变化，请重新核对')
+    const text = (value: string | undefined, fallback: string, max: number) => {
+      if (value === undefined) return fallback
+      if (typeof value !== 'string' || !value.trim() || value.trim().length > max) throw new Error('卷宗名称或范围长度无效')
+      return value.trim()
+    }
+    const title = text(patch?.title, dossier.title, 100); const goal = text(patch?.goal, dossier.goal, 1000)
+    const changed = title !== dossier.title || goal !== dossier.goal
+    const aliases = [...new Set([...(dossier.aliases ?? []), ...(title !== dossier.title ? [dossier.title] : [])])].filter(name => name !== title)
+    const updated = { ...dossier, title, goal, aliases, revision: revision + Number(changed), updatedAt: Date.now() }
+    this.saveCase(updated); return updated
+  }
   tasks(botId?: string): RuntimeTask[] { return this.all('tasks', botId) }
   task(taskId: string): RuntimeTask | undefined { return this.get('tasks', taskId) }
-  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup'>>): RuntimeTask {
+  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason'>>): RuntimeTask {
     const task = this.task(taskId); if (!task) throw new Error('工单不存在')
     const now = Date.now()
     const next = { ...task, ...patch, ...(patch.summary !== undefined ? { summaryUpdatedAt: now } : {}), updatedAt: now }
@@ -160,7 +179,7 @@ export class BotRuntimeStore {
     if (texts.length) validateChatText(texts.join(''))
     for (const [index, text] of texts.entries()) this.reply({ ...p, ...(index ? { artifactIds: undefined } : {}), text, key: index ? `${p.key}:${index}` : p.key, replyGroupId: p.key, bubbleIndex: index })
   }
-  acceptWork(p: { inputId: string; inputIds?: string[]; caseId?: string; newCase?: { title: string; object: string; goal: string }; goal: string; acceptance: string[]; mandate: RuntimeMandate; replyText?: string; replies?: string[]; sourceInputIds?: string[]; delivery?: RuntimeTask['delivery'] }): RuntimeTask {
+  acceptWork(p: { inputId: string; inputIds?: string[]; caseId?: string; caseUpdate?: RuntimeCaseUpdate; caseDecision?: RuntimeCaseDecision; newCase?: { title: string; object: string; goal: string }; goal: string; acceptance: string[]; mandate: RuntimeMandate; replyText?: string; replies?: string[]; sourceInputIds?: string[]; delivery?: RuntimeTask['delivery'] }): RuntimeTask {
     return this.transaction(() => {
       const batch = this.requireBatch(p.inputId, p.inputIds); const input = batch.at(-1)!
       if (input.senderId !== p.mandate.ownerPhoneId) throw new Error('原消息与授权 owner 不一致')
@@ -168,14 +187,17 @@ export class BotRuntimeStore {
       if (Boolean(p.caseId) === Boolean(p.newCase)) throw new Error('已有卷宗和新卷宗必须二选一')
       let dossier = p.caseId ? this.case(p.caseId) : undefined
       if (p.caseId && (!dossier || dossier.botId !== input.botId)) throw new Error('卷宗归属不匹配')
+      if (dossier) dossier = this.updateCase(input.botId, dossier.id, p.caseUpdate)
+      else if (p.caseUpdate) throw new Error('新卷宗不能更新已有卷宗')
       if (!dossier) {
-        dossier = { ...p.newCase!, id: id('case'), botId: input.botId, summary: '', createdAt: Date.now(), updatedAt: Date.now() }
+        dossier = { ...p.newCase!, id: id('case'), botId: input.botId, summary: '', revision: 1, aliases: [], createdAt: Date.now(), updatedAt: Date.now() }
         this.saveCase(dossier)
       }
       const task: RuntimeTask = { id: id('task'), botId: input.botId, caseId: dossier.id, originInputId: input.id, groupId: input.groupId, requesterMemberId: input.memberId, goal: p.goal, acceptance: p.acceptance, mandate: structuredClone(p.mandate), state: 'queued', revision: 1, summary: '', createdAt: Date.now(), updatedAt: Date.now() }
       task.originInputIds = batch.map(m => m.id)
       task.attachmentInputIds = attachmentInputIds
       task.delivery = p.delivery
+      task.caseDecision = p.caseDecision
       this.put('tasks', task)
       this.routerBubbles({ botId: input.botId, groupId: input.groupId, inputId: input.id, taskId: task.id, taskRevision: task.revision, author: 'router', purpose: 'ack', key: `${input.id}:router`, policyRevision: p.mandate.policyRevision }, p.replies ?? [p.replyText!])
       for (const m of batch) this.markInput(m.id, 'routed', { action: 'start', taskId: task.id, inputIds: batch.map(m => m.id) })

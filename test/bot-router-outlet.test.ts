@@ -261,7 +261,7 @@ test('同一任务的必要问题已替换时，不把用户答案自动套用�
 })
 
 test('隐藏工单只有成功披露后可提交，超预算查询不会登记为已读',async()=>{
-  const f=fixture()
+  const f=fixture();f.store.updateTask(f.task.id,{state:'completed'})
   for(let i=0;i<6;i++){
     const input=f.store.receive({botId:'b',groupId:'dm',seq:100+i,text:`其他事项${i}`,senderId:'owner',memberId:'om',createdAt:Date.now()})
     const t=f.store.acceptWork({inputId:input.id,newCase:{title:`其他事项${i}`,object:`对象${i}`,goal:'查看'},goal:'查看',acceptance:[],replies:[],mandate:f.task.mandate})
@@ -270,11 +270,46 @@ test('隐藏工单只有成功披露后可提交，超预算查询不会登记�
   f.send('查一下之前的工作');await until(()=>f.turns.length===1)
   expect(f.turns[0].context.tasks.some((t:{id:string})=>t.id===f.task.id)).toBe(false)
   await expect(f.turns[0].decide({action:'ask_worker',taskId:f.task.id,replies:[]})).rejects.toThrow(/披露|核对/)
-  f.store.updateTask(f.task.id,{question:{id:'oversize',text:'说明'.repeat(3000),options:[],createdAt:Date.now()}})
+  f.store.updateTask(f.task.id,{state:'running',question:{id:'oversize',text:'说明'.repeat(3000),options:[],createdAt:Date.now()}})
   await expect(f.turns[0].call('task_inspect',{taskId:f.task.id})).rejects.toThrow(/预算/)
   await expect(f.turns[0].decide({action:'ask_worker',taskId:f.task.id,replies:[]})).rejects.toThrow(/披露|核对/)
   f.store.updateTask(f.task.id,{question:undefined})
   await f.turns[0].call('task_inspect',{taskId:f.task.id})
   await f.turns[0].decide({action:'ask_worker',taskId:f.task.id,replies:[]});f.turns[0].finish()
   expect(f.store.inputs(f.task.id)).toHaveLength(1)
+})
+
+test('任务查询的卷宗摘要不挤掉三个合法长补充的读取预算',async()=>{
+  const f=fixture()
+  const input=f.store.receive({botId:'b',groupId:'dm',seq:100,text:'分析',senderId:'owner',memberId:'om',createdAt:Date.now()})
+  const task=f.store.acceptWork({inputId:input.id,newCase:{title:'题'.repeat(100),object:'对象'.repeat(100),goal:'范'.repeat(500)},goal:'目'.repeat(500),acceptance:[],replies:[],mandate:f.task.mandate})
+  f.store.updateTask(task.id,{state:'running',summary:'进'.repeat(500)})
+  f.store.saveCase({...f.store.case(task.caseId)!,summary:'摘'.repeat(300)})
+  for(let i=0;i<3;i++){
+    const addition=f.store.receive({botId:'b',groupId:'dm',seq:101+i,text:'补'.repeat(500),senderId:'owner',memberId:'om',createdAt:Date.now()})
+    f.store.acceptInput({inputId:addition.id,taskId:task.id,expectedRevision:f.store.task(task.id)!.revision,kind:'append',replies:[]})
+  }
+  f.send('核对这份任务');await until(()=>f.turns.length===1)
+  const result=await f.turns[0].call('task_inspect',{taskId:task.id})
+  expect(result.inputs).toHaveLength(3)
+  expect(result.dossier.id).toBe(task.caseId)
+  expect(JSON.stringify(result).length).toBeLessThanOrEqual(4000)
+})
+
+test('长卷宗仍可完整查询累计范围，辅助信息不会占满单次预算',async()=>{
+  const f=fixture();const goal='范围'.repeat(500)
+  f.store.saveCase({...f.store.case(f.task.caseId)!,title:'T'.repeat(100),object:'对'.repeat(200),goal,summary:'摘'.repeat(300),aliases:Array.from({length:5},(_,i)=>String(i).repeat(100))})
+  for(let i=0;i<3;i++)f.store.saveArtifact({id:`artifact-${String(i).repeat(40)}`,botId:'b',caseId:f.task.caseId,taskId:f.task.id,title:'标'.repeat(120),name:'名'.repeat(120),mime:'text/plain',path:'/unused',size:1,hash:'hash',revision:1,createdAt:i})
+  const input=f.store.receive({botId:'b',groupId:'dm',seq:100,text:'后续任务',senderId:'owner',memberId:'om',createdAt:Date.now()})
+  f.store.updateTask(f.task.id,{state:'completed'})
+  for(let i=0;i<2;i++){
+    await Bun.sleep(2)
+    const m=i===0?input:f.store.receive({botId:'b',groupId:'dm',seq:101,text:'后续任务2',senderId:'owner',memberId:'om',createdAt:Date.now()})
+    const next=f.store.acceptWork({inputId:m.id,caseId:f.task.caseId,goal:'目'.repeat(500),acceptance:[],replies:[],mandate:f.task.mandate})
+    f.store.updateTask(next.id,{state:'completed'})
+  }
+  f.send('查原卷宗');await until(()=>f.turns.length===1)
+  const results=await f.turns[0].call('case_search',{query:'T'.repeat(100)})
+  expect(results[0]).toMatchObject({id:f.task.caseId,goal})
+  expect(JSON.stringify(results).length).toBeLessThanOrEqual(4000)
 })

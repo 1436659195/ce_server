@@ -1,7 +1,7 @@
 import { routerCall } from './helpers/router-decision'
 import { afterEach, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { BotRuntimeService, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
@@ -20,6 +20,7 @@ function gate() {
   return { promise, release }
 }
 interface FixtureOptions {
+  finishBeforeTurnReturn?: boolean
   fullAccess?: boolean
   accessDelayMs?: number
   accessGate?: ReturnType<typeof gate>
@@ -30,6 +31,7 @@ interface FixtureOptions {
   resumeIntentMs?: number
   tickMs?: number
   followupQuietMs?: number
+  resumeFailure?: string
 }
 function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: FixtureOptions | number = {}) {
   const options = typeof optionsOrDelay === 'number' ? { accessDelayMs: optionsOrDelay } : optionsOrDelay
@@ -63,7 +65,7 @@ function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: Fixt
       let clientDone: ((v: CodexTurn) => void) | undefined
       const threadId = `thread-${role}`
       return {
-        initialize: async () => {}, startThread: async options => { if (role === 'worker') workerThreads.push({ method: 'start', ...options }); return threadId }, resumeThread: async (_id, options) => { if (role === 'worker') workerThreads.push({ method: 'resume', ...options }); return threadId },
+        initialize: async () => {}, startThread: async options => { if (role === 'worker') workerThreads.push({ method: 'start', ...options }); return threadId }, resumeThread: async (_id, threadOptions) => { if (role === 'worker') { workerThreads.push({ method: 'resume', ...threadOptions }); if (options.resumeFailure) throw new Error(options.resumeFailure) } return threadId },
         startTurn: async (_threadId, text) => {
           if (role === 'router') {
             const context = JSON.parse(text)
@@ -78,6 +80,11 @@ function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: Fixt
           }
           started++
           workerPayloads.push(text)
+          if (options.finishBeforeTurnReturn) {
+            const task = JSON.parse(text).task
+            await opts.onToolCall({ threadId, turnId: 'turn-worker', callId: 'early-finish', tool: 'work_finish', arguments: { revision: task.revision, text: '已完成', artifactIds: [], checks: ['核对'] } })
+            return { threadId, turnId: 'turn-worker', done: Promise.resolve({ id: 'turn-worker', status: 'completed' }) }
+          }
           return { threadId, turnId: 'turn-worker', done: new Promise<CodexTurn>(r => { workerDone = clientDone = r }) }
         },
         steer: async (_thread, _turn, text) => { steers.push(text); return 'turn-worker' },
@@ -102,6 +109,121 @@ function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: Fixt
   return { store, service, bot, dir, send, sent, steers, actions, workerPayloads, workerThreads, workerCall, get workerOptions() { return workerOptions }, started: () => started, workerCloses: () => workerCloses, complete: () => workerDone?.({ id: 'turn-worker', status: 'completed' }) }
 }
 const start = { action: 'start', delivery: 'chat', replyText: '我先看现有材料。', newCase: { title: '论文 A', object: '论文 A', goal: '解读' }, goal: '写报告', acceptance: ['交付报告'], allowedOps: ['read', 'create', 'edit', 'delete'], exclusions: [] }
+
+test('CLI 升级后原 Session 恢复失败，保留卷宗且不自动新开重跑', async () => {
+  const decisions:Array<Record<string,unknown>>=[start]
+  const f=fixture(decisions,{resumeFailure:'Codex thread/resume 接口不兼容'})
+  f.send(1,'整理材料');await waitFor(()=>f.started()===1)
+  const first=f.store.tasks(f.bot.botId)[0]
+  await f.workerCall('work_finish',{revision:first.revision,text:'材料已整理',artifactIds:[],checks:['核对']})
+  f.complete();await waitFor(()=>f.workerCloses()===1)
+  const originalThread=f.store.case(first.caseId)!.threadId
+  decisions.push({...start,newCase:undefined,caseId:first.caseId,relation:'revision'})
+  f.send(2,'继续修订');await waitFor(()=>f.store.tasks(f.bot.botId)[1]?.state==='failed')
+  expect(f.workerThreads.map(t=>t.method)).toEqual(['start','resume'])
+  expect(f.started()).toBe(1)
+  expect(f.store.cases(f.bot.botId)).toHaveLength(1)
+  expect(f.store.case(first.caseId)!.threadId).toBe(originalThread)
+  expect(f.store.tasks(f.bot.botId)[1].sessionOrigin).toBeUndefined()
+})
+
+test('换目录保护待派工与执行中任务，完成后同卷宗在新目录新开Session', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { fullAccess: true })
+  expect(() => f.service.assertDirectoryChangeAllowed(f.bot.botId)).not.toThrow()
+  f.send(1, '写报告')
+  expect(() => f.service.assertDirectoryChangeAllowed(f.bot.botId)).toThrow(/任务|处理/)
+  await waitFor(() => f.started() === 1)
+  expect(() => f.service.assertDirectoryChangeAllowed(f.bot.botId)).toThrow(/任务|处理/)
+  const first = f.store.tasks(f.bot.botId)[0]
+  await f.workerCall('work_finish', { revision: first.revision, text: '报告完成', artifactIds: [], checks: ['核对'] }); f.complete()
+  await waitFor(() => { try { f.service.assertDirectoryChangeAllowed(f.bot.botId); return true } catch { return false } })
+  const next = join(f.dir, 'next'); mkdirSync(next); f.bot.directory = f.bot.sourceCwd = next; f.bot.policyRevision++
+  await f.service.policyChanged(f.bot.botId)
+  decisions.push({ ...start, newCase: undefined, caseId: first.caseId, relation: 'revision', goal: '在新目录修订报告' })
+  f.send(2, '继续修订报告'); await waitFor(() => f.started() === 2)
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+  expect(f.workerOptions?.cwd).toBe(next)
+  expect(f.store.tasks(f.bot.botId)[1]).toMatchObject({ caseId: first.caseId, sessionOrigin: 'new', mandate: { directory: next, policyRevision: 2 } })
+  expect(JSON.parse(f.workerPayloads[1]).caseContext.previousTasks[0].id).toBe(first.id)
+})
+
+test('未知的旧执行必须核对后才能换目录', () => {
+  const f = fixture([], { seed: (store, bot) => {
+    const task = seedTask(store, bot)
+    store.updateTask(task.id, { state: 'failed' })
+    store.saveRun({ id: 'old-run', botId: bot.botId, taskId: task.id, state: 'unknown', createdAt: 1, updatedAt: 1 })
+  } })
+  expect(() => f.service.assertDirectoryChangeAllowed(f.bot.botId)).toThrow(/核对/)
+})
+
+test('Worker 在 startTurn 返回前完成，仍保存真实 Session 来源和 turnId', async () => {
+  const f = fixture([start], { finishBeforeTurnReturn: true })
+  f.send(1, '检查材料')
+  await waitFor(() => f.store.tasks(f.bot.botId)[0]?.state === 'completed' && f.workerCloses() === 1)
+  expect(f.store.tasks(f.bot.botId)[0].sessionOrigin).toBe('new')
+  expect(f.store.runs(f.bot.botId)[0].turnId).toBe('turn-worker')
+})
+
+test('项目总结→设计对比→修改另存：一个卷宗，读写工单独立授权并续接同一 Session', async () => {
+  const decisions: Array<Record<string, unknown>> = [{ ...start, newCase: { title: '项目文档总结', object: '示例项目及文档', goal: '梳理项目实现' }, goal: '总结项目', allowedOps: ['read'] }]
+  const f = fixture(decisions, { runTool: async (tool, args, dir) => {
+    if (tool === 'create_file') writeFileSync(join(dir, String(args.path)), String(args.content))
+    return '操作完成'
+  } })
+  writeFileSync(join(f.dir, 'design.md'), '原始设计')
+  f.send(1, '根据项目写总结文档'); await waitFor(() => f.started() === 1)
+  const first = f.store.tasks(f.bot.botId)[0]
+  await expect(f.workerCall('project_create_file', { path: 'forbidden.md', content: 'x' })).rejects.toThrow(/授权/)
+  await f.workerCall('work_finish', { revision: first.revision, text: '总结已完成', artifactIds: [], checks: ['检查实现'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  decisions.push({ ...start, newCase: undefined, caseId: first.caseId, goal: '核对设计差异', allowedOps: ['read'], relation: 'follow_up' })
+  f.send(2, '这个文档和设计文档哪里不一致'); await waitFor(() => f.started() === 2)
+  const second = f.store.tasks(f.bot.botId)[1]
+  await f.workerCall('work_finish', { revision: second.revision, text: '差异已核对', artifactIds: [], checks: ['比较设计'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 2)
+  decisions.push({ ...start, newCase: undefined, caseId: first.caseId, goal: '修改并另存最新设计', allowedOps: ['read', 'create'], relation: 'revision', caseUpdate: { title: '项目文档梳理与设计修订', goal: '整理项目总结、核对设计差异，并修订设计文档' } })
+  f.send(3, '不一致的地方修改下文档，另存最新设计文档'); await waitFor(() => f.started() === 3)
+  const third = f.store.tasks(f.bot.botId)[2]
+  const operation = await f.workerCall('project_create_file', { path: 'design-latest.md', content: '已修订的新设计' }) as { operationId: string }
+  await waitFor(() => f.store.operation(operation.operationId)?.state === 'completed')
+  expect(readFileSync(join(f.dir, 'design.md'), 'utf8')).toBe('原始设计')
+  expect(readFileSync(join(f.dir, 'design-latest.md'), 'utf8')).toBe('已修订的新设计')
+  expect(f.store.cases(f.bot.botId)).toHaveLength(1)
+  expect(f.store.tasks(f.bot.botId).map(t => t.caseId)).toEqual([first.caseId, first.caseId, first.caseId])
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'resume', 'resume'])
+  expect(third.sessionOrigin).toBe('inherited')
+  expect(third.sessionReason).toContain('续接')
+  expect(f.store.case(first.caseId)).toMatchObject({ title: '项目文档梳理与设计修订', aliases: ['项目文档总结'] })
+  const payload = JSON.parse(f.workerPayloads[2])
+  expect(payload.caseContext.goal).toContain('核对设计差异')
+  expect(payload.caseContext.previousTasks.map((t: { id: string }) => t.id)).toEqual([first.id, second.id])
+  expect(payload.instruction).toContain('当前工单')
+})
+
+test('配置变化只换 Session，同卷宗旧成果仍可读取且不能读取其他卷宗成果', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions)
+  f.send(1, '整理材料'); await waitFor(() => f.started() === 1)
+  const first = f.store.tasks(f.bot.botId)[0]
+  const bytes = Buffer.from('前序交付的重要事实')
+  const file = join(f.dir, 'snapshot.txt'); writeFileSync(file, bytes)
+  const artifact = { id: 'prior-result', botId: f.bot.botId, caseId: first.caseId, taskId: first.id, title: '旧成果', name: 'report.txt', mime: 'text/plain', path: file, size: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'), revision: 1, createdAt: Date.now() }
+  f.store.saveArtifact(artifact)
+  await f.workerCall('work_finish', { revision: first.revision, text: '材料已整理', artifactIds: [artifact.id], checks: ['核对'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  f.store.saveSettings({ ...f.store.settings(f.bot.botId), model: 'changed-model' })
+  f.store.saveArtifact({ ...artifact, id: 'foreign-result', caseId: 'other-case' })
+  decisions.push({ ...start, newCase: undefined, caseId: first.caseId })
+  f.send(2, '继续修订'); await waitFor(() => f.started() === 2)
+  const next = f.store.tasks(f.bot.botId)[1]
+  expect(next.caseId).toBe(first.caseId)
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+  expect(next.sessionReason).toContain('配置已变化')
+  expect(JSON.parse(f.workerPayloads[1]).availableAttachments).toContainEqual(expect.objectContaining({ id: artifact.id, kind: 'artifact' }))
+  expect(await f.workerCall('work_read_attachment', { attachmentId: artifact.id })).toMatchObject({ text: '前序交付的重要事实' })
+  await expect(f.workerCall('work_read_attachment', { attachmentId: 'foreign-result' })).rejects.toThrow(/卷宗/)
+})
 
 test('全权限工单持久化软隔离约束，在原目录启动，追加和续接均重申约束', async () => {
   const decisions: Array<Record<string, unknown>> = [start]

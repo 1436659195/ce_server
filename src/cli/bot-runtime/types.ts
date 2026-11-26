@@ -111,8 +111,12 @@ export interface RuntimeInbox {
 }
 export interface RuntimeCase {
   id: string; botId: string; title: string; object: string; goal: string; summary: string
+  /** goal 是累计工作范围，summary 是最近进展；改名不改变身份或执行会话。 */
+  aliases?: string[]; revision?: number
   threadId?: string; fingerprint?: string; createdAt: number; updatedAt: number
 }
+export interface RuntimeCaseUpdate { expectedRevision: number; title?: string; goal?: string }
+export interface RuntimeCaseDecision { kind: 'new' | 'existing'; reason: string; relation?: 'follow_up' | 'revision' | 'next_step' }
 export interface RuntimeMandate {
   ownerPhoneId: string; policyRevision: number; directory: string
   allowedOps: BotOperation[]; exclusions: string[]; mode: 'execute' | 'assess'
@@ -125,6 +129,8 @@ export interface RuntimeTask {
   id: string; botId: string; caseId: string; originInputId: string; groupId: string; requesterMemberId: string
   goal: string; acceptance: string[]; mandate: RuntimeMandate; state: RuntimeTaskState; revision: number
   summary: string; createdAt: number; updatedAt: number; latestRunId?: string; error?: string
+  caseDecision?: RuntimeCaseDecision
+  sessionOrigin?: 'inherited' | 'new'; sessionReason?: string
   /** 摘要本身的记录时间；普通状态/需求变更不刷新它。旧账本可能没有。 */
   summaryUpdatedAt?: number
   question?: { id: string; text: string; options: string[]; createdAt: number }
