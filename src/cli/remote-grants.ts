@@ -203,7 +203,9 @@ export function resolveGrantDirectory(rootDir: string, logical: string): { ok: t
   const directory = normalizeLogical(logical)
   const root = resolve(rootDir)
   const abs = resolve(root, '.' + directory)
-  if (abs !== root && !abs.startsWith(root + sep)) return { ok: false, error: '目录不在本机文件根目录之内' }
+  // 根目录本身就是 / 时,任何绝对路径都在根之内;不能用 root + sep 前缀判(会变成 '//' 开头,永不匹配)
+  const insideRoot = root === sep || abs === root || abs.startsWith(root + sep)
+  if (!insideRoot) return { ok: false, error: '目录不在本机文件根目录之内' }
   let stat
   try {
     stat = statSync(abs)

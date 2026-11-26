@@ -95,6 +95,9 @@ describe('授权目录', () => {
     expect(resolveGrantDirectory(root, '/proj/../note.txt').ok).toBe(false)
     expect(resolveGrantDirectory(root, 'proj').ok).toBe(false)
     expect(resolveGrantDirectory(root, '/proj\n').ok).toBe(false)
+    // 根目录 = / 的机器(宿主机根作文件根):/ 下的真实目录全部可选
+    expect(resolveGrantDirectory('/', '/data/AI-project')).toEqual({ ok: true, directory: '/data/AI-project', abs: '/data/AI-project' })
+    expect(resolveGrantDirectory('/', '/')).toEqual({ ok: true, directory: '/', abs: '/' })
   })
 
   test('建终端的目录只能落在授权目录之内', () => {
