@@ -96,6 +96,37 @@ export interface RuntimeBot {
   /** 新版宿主默认提供全权限 Worker；缺省兼容旧的受控工具运行方式。 */
   workerAccessMode?: 'full-access'
   platform: string
+  /** 其他电脑连接:这台数字人被授权操作的另外几台电脑(不带任何密钥)。 */
+  computers?: RuntimeComputer[]
+}
+/** 一台「其他电脑」:数字人可用的远程终端。密钥留在宿主,不进运行时。 */
+export interface RuntimeComputer {
+  id: string
+  label: string
+  /** 授权目录的逻辑路径(相对对端文件根目录,以 / 开头)。 */
+  directory: string
+  directoryAbs: string
+  platform?: string
+}
+/** 一条远程命令的审计记录。 */
+export interface RuntimeRemoteOp {
+  id: string
+  botId: string
+  taskId: string
+  runId: string
+  computerId: string
+  computerLabel: string
+  directory: string
+  command: string
+  state: 'running' | 'done' | 'failed' | 'unknown'
+  exitCode?: number
+  /** 清理后输出的开头一段(给人看)。 */
+  outputHead: string
+  /** 清理后输出总字数。 */
+  outputChars: number
+  error?: string
+  createdAt: number
+  finishedAt?: number
 }
 export interface RuntimeInbox {
   id: string; botId: string; groupId: string; seq: number; senderId: string; memberId: string
@@ -203,4 +234,6 @@ export interface RuntimeView {
   memory: { active: RuntimeMemory[]; review: RuntimeMemory[]; failedJobs: Array<{ id: string; text: string; error?: string }>; log: RuntimeMemoryLog[] }
   experiences: RuntimeExperience[]
   updatedAt: number
+  /** 最近的远程命令审计(其他电脑连接)。 */
+  remoteOps?: RuntimeRemoteOp[]
 }

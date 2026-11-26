@@ -2,13 +2,13 @@ import { Database } from 'bun:sqlite'
 import { randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload } from './types'
+import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload, RuntimeRemoteOp } from './types'
 import { EXPERIENCE_ESTABLISHED_USES } from './experience'
 import { selectCases } from './cases'
 import type { RuntimeCaseUpdate, RuntimeCaseDecision } from './types'
 
-type Table = 'settings' | 'inbox' | 'cases' | 'tasks' | 'task_inputs' | 'runs' | 'tool_operations' | 'outbox' | 'artifacts' | 'controls' | 'uploads' | 'memories' | 'memory_log' | 'experiences'
-const tables: Table[] = ['settings', 'inbox', 'cases', 'tasks', 'task_inputs', 'runs', 'tool_operations', 'outbox', 'artifacts', 'controls', 'uploads', 'memories', 'memory_log', 'experiences']
+type Table = 'settings' | 'inbox' | 'cases' | 'tasks' | 'task_inputs' | 'runs' | 'tool_operations' | 'outbox' | 'artifacts' | 'controls' | 'uploads' | 'memories' | 'memory_log' | 'experiences' | 'remote_ops'
+const tables: Table[] = ['settings', 'inbox', 'cases', 'tasks', 'task_inputs', 'runs', 'tool_operations', 'outbox', 'artifacts', 'controls', 'uploads', 'memories', 'memory_log', 'experiences', 'remote_ops']
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const segments = new Intl.Segmenter('zh', { granularity: 'grapheme' })
 export function validateChatText(value: unknown): string {
@@ -337,6 +337,22 @@ export class BotRuntimeStore {
     for (const id of new Set(ids)) { const memory = this.memory(id); if (memory && memory.status === 'active') this.saveMemory({ ...memory, triggers: { count: memory.triggers.count + 1, lastTriggeredAt: now }, updatedAt: now }) }
   }
   /** 流水只增不改：同一编号写第二次直接报错。 */
+  saveRemoteOp(op: RuntimeRemoteOp): void { this.put('remote_ops', op) }
+  remoteOps(botId: string, limit = 40): RuntimeRemoteOp[] {
+    const rows = this.db.query('SELECT body FROM remote_ops WHERE bot_id=? ORDER BY rowid DESC LIMIT ?').all(botId, Math.max(1, Math.floor(limit))) as Array<{ body: string }>
+    return rows.map(r => JSON.parse(r.body) as RuntimeRemoteOp).reverse()
+  }
+  /** 启动恢复:进行中的远程命令结果未知。botId 缺省 = 全部。 */
+  markRemoteOpsUnknown(botId: string, note: string): void {
+    const rows = botId === '__all__'
+      ? this.db.query("SELECT body FROM remote_ops WHERE json_extract(body,'$.state')='running'").all() as Array<{ body: string }>
+      : this.db.query("SELECT body FROM remote_ops WHERE bot_id=? AND json_extract(body,'$.state')='running'").all(botId) as Array<{ body: string }>
+    for (const row of rows) {
+      const op0 = JSON.parse(row.body) as RuntimeRemoteOp
+      this.put('remote_ops', { ...op0, state: 'unknown', error: note, finishedAt: Date.now() })
+    }
+  }
+
   appendMemoryLog(log: RuntimeMemoryLog): void { this.db.query('INSERT INTO memory_log(id,bot_id,body) VALUES(?,?,?)').run(log.id, log.botId, JSON.stringify(log)) }
   applyMemoryOps(ops: RuntimeMemory[], logs: RuntimeMemoryLog[]): void { this.transaction(() => { for (const op of ops) this.saveMemory(op); for (const log of logs) this.appendMemoryLog(log) }) }
   memoryLog(botId: string, limit = 30): RuntimeMemoryLog[] {
