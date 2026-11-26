@@ -60,7 +60,7 @@ function fixture() {
           if (role === 'router') {
             const context = JSON.parse(text); const decision = context.currentMessages.length ? decisions.shift() : { action: 'reply', replies: [context.workerMessage.text] }
             const call = (tool: string, args: Record<string, unknown> = {}) => opts.onToolCall({ threadId: 'thread-router', turnId: 'turn-router', callId: `router-${++calls}`, tool, arguments: args } satisfies CodexToolCall)
-            const done = Promise.resolve().then(async () => { if (decision) await call('router_decide', { decision: { action: decision.action ?? 'reply', ...(decision.action === 'start' ? { dossier: { kind: 'new', ...(decision.newCase as object) }, goal: decision.goal, delivery: 'chat', allowedOps: ['read'] } : {}) }, feasibility: 'can', replies: decision.replies ?? [] }) ; return { id: 'turn-router', status: 'completed' } })
+            const done = Promise.resolve().then(async () => { if (decision) await call('router_decide', { decision: { action: decision.action ?? 'reply', ...(decision.action === 'start' ? { dossier: { kind: 'new', ...(decision.newCase as object), reason: '新的独立事项，没有可承接的已有工作' }, goal: decision.goal, delivery: 'chat', allowedOps: ['read'] } : {}) }, feasibility: 'can', replies: decision.replies ?? [] }) ; return { id: 'turn-router', status: 'completed' } })
             return { threadId: 'thread-router', turnId: 'turn-router', done }
           }
           started++

@@ -8,7 +8,7 @@ const bot: RuntimeBot = { botId: 'b', name: '示例同事', groupId: 'dm', owner
   permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'deny', execute: 'deny', commanders: 'owner', allowedPhoneIds: [] } }
 const call = (decision: Record<string, unknown>) => ({ decision, feasibility: 'can', replies: ['我看一下。'] })
 const schema = () => z.fromJSONSchema(router.ROUTER_TOOLS.find(t => t.name === 'router_decide')!.inputSchema)
-const bindings = (): RouterBindings => ({ policyRevision: 3, tasks: new Map([['t1', { revision: 2, questionId: 'q1' }]]), currentInputIds: ['m1'], workerReplyId: undefined })
+const bindings = (): RouterBindings => ({ policyRevision: 3, tasks: new Map([['t1', { revision: 2, questionId: 'q1', caseId: 'case-a' }]]), cases: new Map([['case-a', { revision: 3 }]]), currentInputIds: ['m1'], workerReplyId: undefined })
 const bind = (value: Record<string, unknown>, snapshot = bindings(), liveBot = bot) => router.bindRouterDecision(value, liveBot, snapshot)
 
 test('模型工具仅要求意图参数，不要求抄写权限版本和工单版本', () => {
@@ -23,11 +23,33 @@ test('模型工具仅要求意图参数，不要求抄写权限版本和工单�
 test('不同动作各有必填项，卷宗只能选新建或复用之一', () => {
   expect(schema().safeParse(call({ action: 'reply' })).success).toBe(true)
   expect(schema().safeParse(call({ action: 'ask_worker' })).success).toBe(false)
-  const start = { action: 'start', goal: '解读材料', allowedOps: ['read'], delivery: 'chat', dossier: { kind: 'new', title: '示例材料', object: '材料A', goal: '理解材料A' } }
+  const start = { action: 'start', goal: '解读材料', allowedOps: ['read'], delivery: 'chat', dossier: { kind: 'new', title: '示例材料', object: '材料A', goal: '理解材料A', reason: '新的独立材料，与已有卷宗对象不同' } }
   expect(schema().safeParse(call(start)).success).toBe(true)
   expect(schema().safeParse(call({ ...start, dossier: undefined })).success).toBe(false)
-  expect(schema().safeParse(call({ ...start, dossier: { kind: 'existing', caseId: 'case-a' } })).success).toBe(true)
+  expect(schema().safeParse(call({ ...start, dossier: { kind: 'existing', caseId: 'case-a', relation: 'follow_up', reason: '追问原材料' } })).success).toBe(true)
   expect(schema().safeParse(call({ ...start, dossier: { ...start.dossier, caseId: 'case-a' } })).success).toBe(false)
+})
+
+test('新卷宗必须说明独立边界；已有卷宗必须披露，改名绑定宿主元数据版本', () => {
+  const start = { action: 'start', goal: '修改设计并另存', delivery: 'files', allowedOps: ['read', 'create'] }
+  expect(() => bind(call({ ...start, dossier: { kind: 'new', title: '修订', object: '原文档', goal: '修改' } }))).toThrow()
+  expect(() => bind(call({ ...start, dossier: { kind: 'existing', caseId: 'unknown', relation: 'revision', reason: '修改旧成果' } }))).toThrow(/披露|核对/)
+  expect(bind(call({ ...start, dossier: { kind: 'existing', caseId: 'case-a', relation: 'revision', reason: '根据差异修订原设计', update: { title: '项目文档梳理与设计修订', goal: '整理总结、核对差异并修订设计' } } }))).toMatchObject({
+    caseId: 'case-a', caseUpdate: { expectedRevision: 3, title: '项目文档梳理与设计修订', goal: '整理总结、核对差异并修订设计' }, caseDecision: { kind: 'existing', relation: 'revision', reason: '根据差异修订原设计' },
+  })
+})
+
+test('活动任务的补充可以更新卷宗范围，但不能指定别的卷宗或伪造版本', () => {
+  expect(bind(call({ action: 'append', taskId: 't1', caseUpdate: { title: '项目文档梳理', goal: '核对项目及其设计文档' } }))).toMatchObject({ caseId: 'case-a', caseUpdate: { expectedRevision: 3, title: '项目文档梳理' } })
+  expect(() => bind(call({ action: 'append', taskId: 't1', caseUpdate: { title: '改名', expectedRevision: 999 } }))).toThrow()
+  expect(() => bind(call({ action: 'append', taskId: 't1', caseUpdate: { title: '改名', caseId: 'foreign' } }))).toThrow()
+})
+
+test('仅披露截断范围时不能覆盖累计范围，需要先完整查询卷宗', () => {
+  const snapshot = bindings(); snapshot.cases.set('case-a', { revision: 3, scopeComplete: false })
+  expect(() => bind(call({ action: 'append', taskId: 't1', caseUpdate: { goal: '新的范围' } }), snapshot)).toThrow(/完整|case_search/)
+  snapshot.cases.set('case-a', { revision: 3, scopeComplete: true })
+  expect(bind(call({ action: 'append', taskId: 't1', caseUpdate: { goal: '已有工作并包含新的要求' } }), snapshot).caseUpdate?.goal).toBe('已有工作并包含新的要求')
 })
 
 test('工单与问题只绑定本轮已披露快照，不能凭空引用其他任务', () => {

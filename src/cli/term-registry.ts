@@ -135,6 +135,11 @@ export class TermRegistry {
     return freed
   }
 
+  /** 某属主名下的全部终端名(撤销远程授权时关它的终端用)。 */
+  namesOwnedBy(ownerId: string): string[] {
+    return [...this.map].filter(([, rec]) => rec.owner?.id === ownerId).map(([name]) => name)
+  }
+
   /** 硬删(关闭终端):整条移除。 */
   remove(name: string): void {
     if (!this.map.delete(name)) return
@@ -156,6 +161,7 @@ export class TermRegistry {
 /**
  * 接管门禁(纯函数,可单测):一条 resize/stdin 想接上某终端时的裁决。
  *  - 别人的归属终端 → denied(附属主显示名,手机回 attachDenied 提示「X 正在使用」);
+ *    属主是远程数字人(agentOwned)时例外 → view:人只能旁观(输出也发给他,归属不变);
  *  - 手机带的指纹与在册不符 → gone(编号被复用:接的是「同名不同实例」,原实例已死);
  *  - 名字不在册 → unknown(可能只是 observe 陈旧 —— 终端刚在 PC 端建;调用方刷新
  *    observe 后重判,仍不在册 = 真不活 → gone);
@@ -166,6 +172,7 @@ export type AttachGate =
   | { verdict: 'denied'; occupiedBy: string }
   | { verdict: 'gone' }
   | { verdict: 'unknown' }
+  | { verdict: 'view' }
 
 export function gateAttach(input: {
   owner?: TermOwner
@@ -174,13 +181,17 @@ export function gateAttach(input: {
   /** 手机自称的指纹(旧手机不带 = undefined → 跳过指纹校验,向后兼容) */
   presentedFinger?: string
   phoneId: string
+  /** 属主是远程数字人(调用方按授权表算出):别人接上时按「旁观」放行 */
+  agentOwned?: boolean
 }): AttachGate {
-  if (input.owner && input.owner.id !== input.phoneId) {
-    return { verdict: 'denied', occupiedBy: input.owner.name }
+  const other = !!input.owner && input.owner.id !== input.phoneId
+  if (other && !input.agentOwned) {
+    return { verdict: 'denied', occupiedBy: input.owner!.name }
   }
   if (input.presentedFinger && input.finger && input.presentedFinger !== input.finger) {
     return { verdict: 'gone' }
   }
   if (!input.finger) return { verdict: 'unknown' }
+  if (other) return { verdict: 'view' }
   return { verdict: 'ok' }
 }

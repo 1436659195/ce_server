@@ -33,7 +33,8 @@ import { TermBuffers } from './term-buffers'
 import { loadOrCreateIdentity } from './identity'
 import { handleHttpProxy, type HttpProxyRequest } from './http-proxy'
 import { tryAcquire } from './ownership'
-import { TermRegistry, gateAttach } from './term-registry'
+import { TermRegistry, gateAttach, type AttachGate } from './term-registry'
+import { RemoteGrants, cwdWithinGrant, grantHandshake, grantRpcAllowed, grantTerminalAllowed, grantTicket, normalizeLogical, resolveGrantDirectory, type RemoteGrant } from './remote-grants'
 import { CloseProbe } from './close-probe'
 import { loadAuthorized, loadPaired, addAuthorized, removeAuthorized, authorize, loadPin, savePin, type PairingMode } from './pairing'
 import { spawn, execFile } from 'node:child_process'
@@ -549,7 +550,19 @@ async function main(): Promise<void> {
   let ws: WebSocket | null = null
   // 多手机共连:每台手机一条独立 E2E 通道(phoneId → 派生 sharedKey + 显示名)。
   // 握手按 frame.sourcePhoneId(hub 注入)分通道;加密按 targetPhoneId、解密按 sourcePhoneId 寻路。
-  const phoneKeys = new Map<string, { sharedKey: Uint8Array; name: string }>()
+  const phoneKeys = new Map<string, { sharedKey: Uint8Array; name: string; grant?: { id: string; directory: string } }>()
+  // 远程授权(其他电脑连接):另一台机器上的 ce 带着数字人,以 grant-<hex> 为编号连到本机,只能操作终端。
+  // 凭证表落盘 ~/.ce/remote-grants.json;握手只认「密钥对本次临时公钥的 HMAC」,不带密钥明文。
+  const remoteGrants = new RemoteGrants(join(homedir(), '.ce', 'remote-grants.json'))
+  /** 该对端若带凭证,返回它登记的目录;undefined = 普通手机(全部接口)。 */
+  const peerGrant = (peerId: string) => phoneKeys.get(peerId)?.grant
+  /** 终端属主是否远程数字人:人接上时按「旁观」放行。 */
+  const ownedByAgent = (ownerId?: string) => (ownerId ? remoteGrants.byPeer(ownerId) !== undefined : false)
+  /** 终端旁观者:terminalName → 正在看的人。输出同时发属主和旁观者,归属不变。 */
+  const termViewers = new Map<string, Set<string>>()
+  // 中继会话号与令牌:开远程授权时写进票据,对端凭它连到本机的会话。
+  let relaySid = ''
+  let relayJoinToken = ''
   // 握手认证:pin 模式下新手机首次连接须带正确 PIN 才入白名单,已授权 phoneId 重连放行;
   //   --pairing-mode=open 退回旧的「明文 phonePub 即配对」(过渡兼容)。白名单持久 ~/.ce/authorized-phones.json。
   // 2026-09-21:① 内存 Set 与磁盘同步(配对 add/踢出 delete —— 此前只写盘,同进程内新配对手机
@@ -647,6 +660,7 @@ async function main(): Promise<void> {
     getBot: nameOrId => chatHub.runtimeBot(nameOrId),
     sendReply: reply => chatHub.sendRuntimeReply(reply),
     checkAccess: (bot, memberId, operation) => chatHub.checkRuntimeAccess(bot.botId, memberId, operation),
+      remoteTicket: (botId, computerId) => chatHub.remoteTicket(botId, computerId),
     openTools: (bot, memberId, authorize) => {
       // 每个具体操作一个短期凭据；模型不可见，取消时立即撤销。
       const grant = botTools.open({ name: bot.name, groupId: bot.groupId, memberId, requesterName: bot.name }, (_context, operation, summary) => authorize(operation, summary))
@@ -672,6 +686,7 @@ async function main(): Promise<void> {
    *  v1 审查楔子:事件/审批请求不定向单机 —— 该 ce 上所有授权手机都可见(多手机任一可审/批,先到先得)。 */
   function broadcastAgentEvent(plaintext: Uint8Array, sid?: string): void {
     for (const [phoneId, info] of phoneKeys) {
+      if (info.grant) continue // 远程数字人不是人:不收审批卡和事件广播
       sendFrame({ type: FrameType.AgentEvent, sid, targetPhoneId: phoneId, payload: seal(info.sharedKey, plaintext) })
     }
   }
@@ -755,7 +770,7 @@ async function main(): Promise<void> {
           running: true, pid: process.pid, version: VERSION,
           relay: relayUrl, jupyter: baseUrl, pairingMode,
           pin: currentPin,
-          phones: [...phoneKeys.entries()].map(([id, v]) => ({ id, name: v.name })),
+          phones: [...phoneKeys.entries()].filter(([, v]) => !v.grant).map(([id, v]) => ({ id, name: v.name })),
           paired: loadPaired(), // 带名字+配对时间(控制台白名单页用;此前只是内存 id 集,重启前配对的不显示)
           wsConnected: ws?.readyState === WebSocket.OPEN,
           connectionCode,
@@ -942,6 +957,72 @@ async function main(): Promise<void> {
     }
   }
 
+  /** 终端输出寻路:发给属主;属主是远程数字人时,同时发给正在看的人(归属不变)。 */
+  function sendTermOutput(name: string, out: string): void {
+    const owner = terminalOwner.get(name)
+    if (owner) encryptThenSend(FrameType.TermOutput, enc.encode(out), { sid: name, targetPhoneId: owner })
+    for (const viewer of termViewers.get(name) ?? []) {
+      if (viewer !== owner && phoneKeys.has(viewer)) encryptThenSend(FrameType.TermOutput, enc.encode(out), { sid: name, targetPhoneId: viewer })
+    }
+  }
+  /** 旁观者登记:人打开数字人占用的终端时调用,输出从此也发给他。 */
+  function addViewer(name: string, phoneId: string): void {
+    let set = termViewers.get(name)
+    if (!set) termViewers.set(name, (set = new Set()))
+    set.add(phoneId)
+  }
+  /** 硬删一个 Jupyter 终端:关 ce 侧 WS、出册、清旁观者、Jupyter DELETE。cc 会话不走这里。 */
+  async function destroyTerminal(name: string): Promise<void> {
+    const tws = terms.get(name)
+    if (tws) {
+      expectedCloses.add(name) // 主动关闭:close 处理器据此跳过「死亡点名」
+      try {
+        tws.close()
+      } catch {
+        /* 已关 */
+      }
+      terms.delete(name)
+    }
+    terminalOwner.delete(name) // 释放占用(终端已删,owner 无意义)
+    termRegistry.remove(name) // 硬删 → 出册(指纹/归属随终端一起消失)
+    managedTerms.remove(name) // 硬删 → 不再 managed(杀 app 重开不恢复)
+    termViewers.delete(name)
+    try {
+      await fetch(`${baseUrl}/api/terminals/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Token ${token}` },
+      })
+    } catch {
+      /* 尽力删,失败不阻塞(至多留服务端孤儿终端) */
+    }
+  }
+  /**
+   * 接上某终端前的统一裁决(resize 与 stdin 共用):
+   *  - 远程数字人(带凭证的对端)只能动自己建的终端,cc 会话与别人的终端一律不行;
+   *  - 属主是远程数字人、来的是人 → view(旁观:输出也发给他,归属不变);
+   *  - 其余沿用 gateAttach:别人的归属拒;指纹不符判死;不在册待刷新。
+   */
+  async function judgeAttach(name: string, srcPhone: string, presentedFinger?: string): Promise<AttachGate> {
+    const owner = termRegistry.ownerOf(name)
+    if (peerGrant(srcPhone) && !grantTerminalAllowed(owner, srcPhone, name)) return { verdict: 'denied', occupiedBy: owner?.name ?? '' }
+    const input = { owner, finger: termRegistry.fingerOf(name), presentedFinger, phoneId: srcPhone, agentOwned: ownedByAgent(owner?.id) }
+    let gate = gateAttach(input)
+    if (gate.verdict === 'unknown') {
+      await refreshRegistry()
+      gate = gateAttach({ ...input, owner: termRegistry.ownerOf(name), finger: termRegistry.fingerOf(name) })
+    }
+    return gate
+  }
+  /** 撤销远程授权:通知对端、关它的终端、清通道。之后这个对端编号只认凭证,而凭证已失效。 */
+  async function revokeGrant(grant: RemoteGrant): Promise<void> {
+    remoteGrants.revoke(grant.id)
+    encryptThenSend(FrameType.Control, enc.encode(JSON.stringify({ op: 'grantRevoked', grantId: grant.id })), { targetPhoneId: grant.peerId })
+    for (const name of termRegistry.namesOwnedBy(grant.peerId)) await destroyTerminal(name)
+    phoneKeys.delete(grant.peerId)
+    termRegistry.releaseAllOf(grant.peerId)
+    for (const viewers of termViewers.values()) viewers.delete(grant.peerId)
+  }
+
   // ── 终端对账(验活):60s 轮询兜底 + WS 断开即时触发,共用一次 reconcile ────────────
   // 对账 Jupyter live 列表:消失的名字 = 死亡(整条出册:指纹与归属一起解除)+ 广播
   // termGone;新名字收养(下次 listTerminals 带 finger 给手机)。拉取失败跳过本轮
@@ -1008,11 +1089,9 @@ async function main(): Promise<void> {
           // stderr 包红码,对齐直连(terminalConnection 把 stderr 渲染红)
           const out = etype === 'stderr' ? `\x1b[1;31m${content}\x1b[0m` : content
           buffers.append(name, Buffer.from(out)) // 旁路缓存:read_terminal 读尾部≈当前帧(与 owner 无关,无条件存)
-          // 输出只发给 owner(Task 4 的 tryAcquire 在 attach 时标 owner);无 owner → 不发(避免泄露给非占用者)
-          const owner = terminalOwner.get(name)
-          if (owner) {
-            encryptThenSend(FrameType.TermOutput, enc.encode(out), { sid: name, targetPhoneId: owner })
-          }
+          // 输出发给 owner(attach 时标的);属主是远程数字人时同时发给正在看的人;
+          // 无 owner 也无旁观者 → 不发(避免泄露给非占用者)。
+          sendTermOutput(name, out)
         }
       } catch {
         /* setup/exit/控制帧忽略 */
@@ -1024,6 +1103,7 @@ async function main(): Promise<void> {
       // 旧 WS 的延迟 close 不应误清刚由新 WS 的 attach 设上的新 owner。
       if (terms.get(name) !== tws) return
       terminalOwner.delete(name)
+      termViewers.delete(name)
       // 即时死亡点名:非预期断开(不是 ce 主动 detach/硬删)= 终端多半死了。当场对账:
       // name 已不在 live 列表 → 秒级出册 + 广播 termGone;还在 → 只是 app 侧刷新的
       // detach(终端活着),不动。极端竞态(名单更新略晚于挂断)由 60s 轮询兜底。
@@ -1091,11 +1171,17 @@ async function main(): Promise<void> {
             for (const [tname, owner] of terminalOwner) {
               if (owner === notice.phoneId) terminalOwner.delete(tname) // 终端占用随连接重置
             }
+            for (const viewers of termViewers.values()) viewers.delete(notice.phoneId) // 旁观关系随连接重置
             // 【不杀管家/agent】。手机瞬时断连(后台/切应用致 WS 冻结重连)极常见,此时杀进程会让重连后接到
             //   已死 sid → 发消息无响应。留活,重连后续接同一会话。「移除服务器不回来」→ 6h 回收计时兜底(重连取消)。
-            butlers.markPhoneLeft(notice.phoneId)
-            agentRunner.markPhoneLeft(notice.phoneId)
-            console.log(`[ce] 手机离开 phoneId=${notice.phoneId},终端占用已清(管家/agent 留活,sharedKey 保留供中继缓冲补发,6h 不归则回收)`)
+            if (peerGrant(notice.phoneId)) {
+              // 远程数字人断线:它重连后会重新接上自己的终端(持久归属还在),没有管家/agent 要记账
+              console.log(`[ce] 远程数字人离开 peer=${notice.phoneId}`)
+            } else {
+              butlers.markPhoneLeft(notice.phoneId)
+              agentRunner.markPhoneLeft(notice.phoneId)
+              console.log(`[ce] 手机离开 phoneId=${notice.phoneId},终端占用已清(管家/agent 留活,sharedKey 保留供中继缓冲补发,6h 不归则回收)`)
+            }
           }
         } catch {
           /* 真正的非法帧 → 忽略 */
@@ -1110,6 +1196,7 @@ async function main(): Promise<void> {
       // 群聊帧(GroupFrame=9):信封明文(relay 解析路由),不经 phone E2E 通道 ——
       // 必须在 srcPhone 守卫前分流(pending 补发帧也走这里,顺序天然正确)。
       if (frame.type === FrameType.GroupFrame) {
+        if (srcPhone && peerGrant(srcPhone)) return // 远程数字人只开终端,不能投群聊帧
         try {
           chatHub.onEnvelope(JSON.parse(dec.decode(frame.payload)) as Parameters<ChatHub['onEnvelope']>[0])
         } catch {
@@ -1142,25 +1229,15 @@ async function main(): Promise<void> {
               // 接管门禁(归属 + 验活):① 别人的归属终端 → attachDenied(防抢);
               // ② 指纹不符 / 不在册(刷新后仍不在)= 终端已死或被同名重建 → termGone,
               //    不 ensureTerm(治「+ 面板陈列表接管死终端变白屏」)。
-              let gate = gateAttach({
-                owner: termRegistry.ownerOf(frame.sid),
-                finger: termRegistry.fingerOf(frame.sid),
-                presentedFinger: msg.finger,
-                phoneId: srcPhone,
-              })
-              if (gate.verdict === 'unknown') {
-                await refreshRegistry()
-                gate = gateAttach({
-                  owner: termRegistry.ownerOf(frame.sid),
-                  finger: termRegistry.fingerOf(frame.sid),
-                  presentedFinger: msg.finger,
-                  phoneId: srcPhone,
-                })
-              }
+              const gate = await judgeAttach(frame.sid, srcPhone, msg.finger)
               if (gate.verdict === 'denied') {
                 denyAttach(frame.sid, srcPhone, gate.occupiedBy)
               } else if (gate.verdict === 'gone' || gate.verdict === 'unknown') {
                 sendTermGone(frame.sid, srcPhone)
+              } else if (gate.verdict === 'view') {
+                // 旁观:输出同时发给来人,归属不变;尺寸跟随来人(他看到的就是这个尺寸)
+                addViewer(frame.sid, srcPhone)
+                ensureTerm(frame.sid).send(JSON.stringify(['set_size', msg.rows, msg.cols]))
               } else if (acquireTerm(frame.sid, srcPhone)) {
                 const tws = ensureTerm(frame.sid)
                 tws.send(JSON.stringify(['set_size', msg.rows, msg.cols])) // ensureTerm 自缓冲(CONNECTING 时)
@@ -1174,22 +1251,40 @@ async function main(): Promise<void> {
             /* 解密失败 → 落到下面当握手 phonePub 处理 */
           }
         }
-        // 当作握手 phonePub(明文):{ k, n?, pin? } 或兼容老格式(纯 b64 公钥,无 pin)
+        // 当作握手 phonePub(明文):{ k, n?, pin?, g? } 或兼容老格式(纯 b64 公钥,无 pin)
         try {
           const text = dec.decode(frame.payload).trim()
           let phonePubB64 = ''
           let name = ''
           let framePin: string | undefined
+          let grantClaim: unknown
           if (text.startsWith('{')) {
-            const obj = JSON.parse(text) as { k?: string; n?: string; pin?: string }
+            const obj = JSON.parse(text) as { k?: string; n?: string; pin?: string; g?: unknown }
             if (!obj.k || typeof obj.k !== 'string') throw new Error('handshake json missing k')
             phonePubB64 = obj.k
             name = obj.n ?? ''
             framePin = obj.pin
+            grantClaim = obj.g
           } else {
             phonePubB64 = text // 老格式:纯 b64 公钥
           }
           const phoneId = srcPhone ?? `anon-${randId(8)}`
+          // 远程授权握手(其他电脑连接):对端编号登记过凭证、或这次带了凭证 → 只认凭证,
+          // 不回落白名单 / PIN / 免配对。证明 = 凭证密钥对本次临时公钥的 HMAC(不带密钥明文)。
+          const verdict = grantHandshake({ grants: remoteGrants.list(), phoneId, claim: grantClaim, phonePubB64 })
+          if (verdict.kind === 'admit') {
+            // 名字只取凭证里的标签,不采信对端自报的 n;不进白名单,不是「手机」。
+            phoneKeys.set(phoneId, { sharedKey: sharedSecret(cliPriv, unb64(phonePubB64)), name: verdict.grant.label, grant: { id: verdict.grant.id, directory: verdict.grant.directory } })
+            remoteGrants.touch(verdict.grant.id, Date.now())
+            console.log(`[ce] 远程授权接入 peer=${phoneId} label=${verdict.grant.label}`)
+            return
+          }
+          if (verdict.kind === 'reject') {
+            phoneKeys.delete(phoneId) // 不留旧通道
+            if (srcPhone) sendFrame({ type: FrameType.PairReject, targetPhoneId: srcPhone, payload: enc.encode(JSON.stringify({ reason: 'grant_invalid' })) })
+            console.log(`[ce] 拒绝远程授权握手 phoneId=${phoneId}`)
+            return
+          }
           // 认证门禁:open 模式直放;pin 模式下白名单内 phoneId 放行,否则需正确 PIN 首次配对。
           const auth = authorize({ mode: pairingMode, phoneId, authorized, pin: framePin, currentPin })
           if (!auth.allow) {
@@ -1243,7 +1338,11 @@ async function main(): Promise<void> {
           let resp: RpcResponse
           // butlerStart 的合成 init 要排在 RPCResp 之【后】发(见 butlerStart 分支注释),此处先占位。
           let postRespInit: { sid: string } | null = null
-          if (req.op === 'listTerminals') {
+          // 远程数字人(带凭证的对端)只开终端四个接口;其余一律拒绝(exec、文件、内核、转发、chat.*、管家、上传)。
+          const grant = peerGrant(srcPhone)
+          if (grant && !grantRpcAllowed(req.op)) {
+            resp = { ok: false, error: '远程授权只开放终端操作' }
+          } else if (req.op === 'listTerminals') {
             // 转发 GET /api/terminals 拿「Jupyter 上所有终端」+ 用 ce 的 terms map 标 managed。
             // 手机「+」面板显示全部;杀 app 重开自动恢复只挑 managed(= ce 经手过的),零回归。
             let all: { name: string; last_activity?: string }[] = []
@@ -1288,36 +1387,19 @@ async function main(): Promise<void> {
                 terminals.push({ name: a.sid, lastActivityAt: Date.now(), managed: true, occupiedBy: null, cwd: a.cwd, finger: a.sid, ownedByMe: true })
               }
             }
-            resp = { ok: true, data: { terminals } }
+            const visible = terminals.map((t) => ({ ...t, agentOwned: ownedByAgent(termRegistry.ownerOf(t.name)?.id) ? true : undefined }))
+            resp = { ok: true, data: { terminals: grant ? visible.filter((t) => t.ownedByMe) : visible } }
           } else if (req.op === 'deleteTerminal' && (req as { name?: string }).name) {
             // 手机「关闭终端」:关 ce 端 terminado + Jupyter DELETE,否则杀 app 重开又恢复回来
             const termName = (req as { name?: string }).name!
-            if (termName.startsWith('cc-')) {
+            if (grant && !grantTerminalAllowed(termRegistry.ownerOf(termName), srcPhone, termName)) {
+              resp = { ok: false, error: '远程授权只能关闭自己创建的终端' }
+            } else if (termName.startsWith('cc-')) {
               // CC 对话 agent 会话:停 agent-runner(非 Jupyter 终端,无 terminado/DELETE)
               agentRunner.stop(termName)
               resp = { ok: true }
             } else {
-              const tws = terms.get(termName)
-              if (tws) {
-                expectedCloses.add(termName) // 主动关闭:close 处理器据此跳过「死亡点名」
-                try {
-                  tws.close()
-                } catch {
-                  /* 已关 */
-                }
-                terms.delete(termName)
-              }
-              terminalOwner.delete(termName) // 释放占用(终端已删,owner 无意义)
-              termRegistry.remove(termName) // 硬删 → 出册(指纹/归属随终端一起消失)
-              managedTerms.remove(termName) // 硬删 → 不再 managed(杀 app 重开不恢复)
-              try {
-                await fetch(`${baseUrl}/api/terminals/${encodeURIComponent(termName)}`, {
-                  method: 'DELETE',
-                  headers: { Authorization: `Token ${token}` },
-                })
-              } catch {
-                /* 尽力删,失败不阻塞(至多留服务端孤儿终端) */
-              }
+              await destroyTerminal(termName)
               resp = { ok: true }
             }
           } else if (req.op === 'detachTerminal' && (req as { name?: string }).name) {
@@ -1325,7 +1407,18 @@ async function main(): Promise<void> {
             // → terms map 移除该 name → 下次 listTerminals managed=false → 杀 app 重开不自动恢复;
             //   Jupyter 终端仍在(GET /api/terminals 仍返回)→「+」面板可见、可重新接管。
             const termName = (req as { name?: string }).name!
-            if (termName.startsWith('cc-')) {
+            const termOwner = termRegistry.ownerOf(termName)
+            if (grant && !grantTerminalAllowed(termOwner, srcPhone, termName)) {
+              resp = { ok: false, error: '远程授权只能移除自己创建的终端' }
+            } else if (grant) {
+              // 数字人「移除」自己的终端 = 关掉(它不该留着孤儿会话)
+              await destroyTerminal(termName)
+              resp = { ok: true }
+            } else if (!termName.startsWith('cc-') && ownedByAgent(termOwner?.id)) {
+              // 人在看数字人的终端时关掉页面:只取消旁观,不动数字人的会话(要真关用「关闭终端」)
+              termViewers.get(termName)?.delete(srcPhone)
+              resp = { ok: true }
+            } else if (termName.startsWith('cc-')) {
               agentRunner.stop(termName) // CC agent 软移除 = 停(无「Jupyter 终端保留」语义)
               resp = { ok: true }
             } else {
@@ -1346,7 +1439,23 @@ async function main(): Promise<void> {
             }
           } else if (req.op === 'createTerminal') {
             const termType = (req as { type?: string }).type
-            if (termType === 'cc' || termType === 'workshop') {
+            // 远程数字人只能开普通终端,而且目录必须落在授权目录内、必须仍然存在
+            // (ce 建终端时目录不存在会在别处静默启动,这里先拦)。
+            let denied: string | undefined
+            let createReq: RpcRequest = req
+            if (grant) {
+              const wanted = normalizeLogical((req as { cwd?: string }).cwd ?? grant.directory)
+              if (termType === 'cc' || termType === 'workshop') denied = '远程授权只能开普通终端'
+              else if (!cwdWithinGrant(grant.directory, wanted)) denied = '目录不在授权范围之内'
+              else {
+                const target = resolveGrantDirectory(root, wanted)
+                if (!target.ok) denied = target.error
+                else createReq = { ...req, cwd: target.directory }
+              }
+            }
+            if (denied) {
+              resp = { ok: false, error: denied }
+            } else if (termType === 'cc' || termType === 'workshop') {
               // CC 对话 / 插件工坊:起 ce 端 Agent SDK runner(不开 Jupyter 终端、不 parse TUI)。一机可多开
               // (各目录独立),每次 createTerminal 新建一个 agent(不复用)。返 sid(形如 cc-xxxx)作「终端名」——
               // 手机据它路由 stdin(TermStdin cc- 分支)+ demux agentEvents(帧带 sid)+ 渲染对话组件。
@@ -1359,7 +1468,7 @@ async function main(): Promise<void> {
               // 普通终端:Jupyter 分配的新 name 必空闲 → 创建者即 owner(先到先得天然满足)。
               // 成功后【不】在此 eager 开 terminado WS(懒开:等手机首条 resize/stdin 才开,对齐直连,
               // 治「晚到 resize 致 Windows 第一个命令错位」——详见 git 历史)。
-              resp = await handleRpc(jupyter, req)
+              resp = await handleRpc(jupyter, createReq)
               if (
                 resp.ok &&
                 resp.data &&
@@ -1372,6 +1481,35 @@ async function main(): Promise<void> {
                 managedTerms.add(newName) // 新建即经手 → managed
                 resp = { ok: true, data: { name: newName, finger } }
               }
+            }
+          } else if (req.op === 'remoteGrants') {
+            // 本机的远程授权清单(给人看,不带密钥)
+            resp = { ok: true, data: { grants: remoteGrants.publicList() } }
+          } else if (req.op === 'remoteGrant') {
+            // 开一张远程授权:编号、对端编号、密钥都由本机生成;票据带本机的连接信息,由手机转交给对端。
+            const body = req as { label?: unknown; directory?: unknown }
+            const label = typeof body.label === 'string' ? body.label.trim() : ''
+            const target = typeof body.directory === 'string' ? resolveGrantDirectory(root, body.directory) : undefined
+            if (!label || label.length > 60 || /[\r\n\0]/u.test(label)) resp = { ok: false, error: '标签需要 1～60 个字符' }
+            else if (!target?.ok) resp = { ok: false, error: target ? target.error : '目录无效' }
+            else if (!relayUrl || !relaySid || !relayJoinToken) resp = { ok: false, error: '本机尚未连上中继,稍后再试' }
+            else {
+              try {
+                const created = remoteGrants.create({ label, directory: target.directory, directoryAbs: target.abs, createdBy: srcPhone })
+                resp = { ok: true, data: grantTicket(created, { relayUrl, sid: relaySid, cliPub: cliPubB64, token: relayJoinToken, platform: process.platform }) }
+                console.log(`[ce] 开远程授权 id=${created.id} label=${label} directory=${target.directory} (phone=${srcPhone})`)
+              } catch (error) {
+                resp = { ok: false, error: (error as Error).message }
+              }
+            }
+          } else if (req.op === 'remoteGrantRevoke') {
+            const grantId = (req as { grantId?: unknown }).grantId
+            const target = typeof grantId === 'string' ? remoteGrants.get(grantId) : undefined
+            if (!target) resp = { ok: false, error: '授权不存在' }
+            else {
+              await revokeGrant(target)
+              console.log(`[ce] 撤销远程授权 id=${target.id} (phone=${srcPhone})`)
+              resp = { ok: true }
             }
           } else if (req.op === 'butlerStart') {
             // AI 管家:ce 用 SDK query 起 cc,回 butlerSid;手机据此收发 ButlerStdin/ButlerOutput。skill 由手机传。
@@ -1551,12 +1689,24 @@ async function main(): Promise<void> {
           } else if (req.op === 'chat.botPolicy') {
             const q = req as { name?: string; permissions?: BotPermissions }
             resp = await chatHub.botPolicy(q.name ?? '', srcPhone, q.permissions)
+          } else if (req.op === 'chat.botDirectory') {
+            const q = req as { name?: string; expectedRevision?: number; directory?: unknown }
+            resp = await chatHub.botDirectory(q.name ?? '', srcPhone, q.expectedRevision ?? -1, q.directory)
           } else if (req.op === 'chat.botRetire') {
             const q = req as { name?: string }
             resp = await chatHub.botRetire(q.name ?? '', srcPhone)
           } else if (req.op === 'chat.botApprove') {
             const q = req as { name?: string; approvalId?: string; allow?: boolean }
             resp = await chatHub.botApprove(q.name ?? '', srcPhone, q.approvalId ?? '', q.allow === true)
+          } else if (req.op === 'chat.botComputers') {
+            const q = req as { name?: string; botId?: string }
+            resp = chatHub.botComputers(q.botId ?? q.name ?? '', srcPhone)
+          } else if (req.op === 'chat.botComputerAdd') {
+            const q = req as { name?: string; botId?: string; computer?: unknown }
+            resp = chatHub.botComputerAdd(q.botId ?? q.name ?? '', srcPhone, q.computer)
+          } else if (req.op === 'chat.botComputerRemove') {
+            const q = req as { name?: string; botId?: string; computerId?: unknown }
+            resp = await chatHub.botComputerRemove(q.botId ?? q.name ?? '', srcPhone, q.computerId)
           } else if (req.op === 'chat.hireStatus') {
             // 雇佣账本一览(手机雇佣页展示额度/用量)
             resp = chatHub.hireStatus()
@@ -1611,25 +1761,19 @@ async function main(): Promise<void> {
           }
           // 接管门禁(同 resize):归属校验(防抢)+ 验活(死了/被同名重建 → termGone,不懒开)。
           // stdin 不带指纹(旧协议就是裸文本),指纹校验由「在册与否」承担。
-          let gate = gateAttach({
-            owner: termRegistry.ownerOf(name),
-            finger: termRegistry.fingerOf(name),
-            phoneId: srcPhone,
-          })
-          if (gate.verdict === 'unknown') {
-            await refreshRegistry()
-            gate = gateAttach({
-              owner: termRegistry.ownerOf(name),
-              finger: termRegistry.fingerOf(name),
-              phoneId: srcPhone,
-            })
-          }
+          const gate = await judgeAttach(name, srcPhone)
           if (gate.verdict === 'denied') {
             denyAttach(name, srcPhone, gate.occupiedBy)
             break
           }
           if (gate.verdict === 'gone' || gate.verdict === 'unknown') {
             sendTermGone(name, srcPhone)
+            break
+          }
+          if (gate.verdict === 'view') {
+            // 旁观者也能敲字(插手);归属不变
+            addViewer(name, srcPhone)
+            ensureTerm(name).send(JSON.stringify(['stdin', text]))
             break
           }
           if (!acquireTerm(name, srcPhone)) {
@@ -1641,6 +1785,7 @@ async function main(): Promise<void> {
           break
         }
         case FrameType.ButlerStdin: {
+          if (peerGrant(srcPhone)) break // 远程数字人只开终端,没有管家
           // 管家 ButlerStdin 两种 payload:① 审批响应 {type:'butler_approval_response',reqId,allow}
           //   → 解 canUseTool 的 pending;② 用户发言帧(SDKUserMessage)→ writeStdin 入对话队列。
           if (!frame.sid) break
@@ -1679,6 +1824,8 @@ async function main(): Promise<void> {
           reconnectDelay = 2000 // 连上即重置退避
           const sid: string = m.sid
           const relayToken: string = m.token
+          relaySid = sid
+          relayJoinToken = relayToken
           console.log(`[ce] 已连中继,sid=${sid}`)
           if (!qrPrinted) {
             qrPrinted = true

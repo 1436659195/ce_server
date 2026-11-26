@@ -27,6 +27,8 @@ export interface BotApproval {
 }
 export interface BotPolicyInfo {
   workerAccessMode?: 'full-access'
+  /** 独立数字人的当前工作目录；path 相对 CE 文件根，cwd 为机器确认路径。 */
+  workDirectory?: { path: string; cwd: string }
   permissions: BotPermissions
   ownerPhoneId?: string
   revision: number

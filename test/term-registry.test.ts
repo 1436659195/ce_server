@@ -77,6 +77,16 @@ test('持久化 roundtrip:新实例(模拟 daemon 重启)读回指纹与归属;�
   expect(r3.ownerOf('9')).toBeUndefined()
 })
 
+test('namesOwnedBy:列出某属主名下的终端(撤销远程授权时关它的终端用)', () => {
+  const r = new TermRegistry(tmpFile())
+  r.observe(['1', '2', '3'])
+  r.setOwner('1', { id: 'grant-a', name: '运维' })
+  r.setOwner('3', { id: 'grant-a', name: '运维' })
+  r.setOwner('2', { id: 'phone-1', name: '手机' })
+  expect(r.namesOwnedBy('grant-a').sort()).toEqual(['1', '3'])
+  expect(r.namesOwnedBy('nobody')).toEqual([])
+})
+
 test('gateAttach:别人的归属拒;指纹不符判死;不在册 unknown;游离/自己/无指纹放行', () => {
   const ownerA = { id: 'phone-A', name: 'A' }
   // 别人的归属 → denied(附属主显示名,手机提示「X 正在使用」)
@@ -96,4 +106,18 @@ test('gateAttach:别人的归属拒;指纹不符判死;不在册 unknown;游离/
   expect(gateAttach({ owner: ownerA, finger: 'f1', presentedFinger: 'f1', phoneId: 'phone-A' })).toEqual({
     verdict: 'ok',
   })
+})
+
+test('gateAttach:数字人占用的终端,人可以旁观(裁决 view,不改归属);指纹不符仍判死', () => {
+  const ownerAgent = { id: 'grant-abc123', name: '运维@机器A' }
+  // 人打开数字人的终端 → view:输出同时发给他,归属不变
+  expect(gateAttach({ owner: ownerAgent, finger: 'f1', phoneId: 'phone-B', agentOwned: true })).toEqual({ verdict: 'view' })
+  // 数字人对端自己 → ok
+  expect(gateAttach({ owner: ownerAgent, finger: 'f1', phoneId: 'grant-abc123', agentOwned: true })).toEqual({ verdict: 'ok' })
+  // 不带标记(调用方没算出来)= 原行为:拒绝
+  expect(gateAttach({ owner: ownerAgent, finger: 'f1', phoneId: 'phone-B' })).toEqual({ verdict: 'denied', occupiedBy: '运维@机器A' })
+  // 别的手机占用的终端不因标记而可旁观
+  expect(gateAttach({ owner: { id: 'phone-A', name: 'A' }, finger: 'f1', phoneId: 'phone-B', agentOwned: false })).toEqual({ verdict: 'denied', occupiedBy: 'A' })
+  // 旁观也要对得上实例:指纹不符 → gone
+  expect(gateAttach({ owner: ownerAgent, finger: 'f1', presentedFinger: 'f-old', phoneId: 'phone-B', agentOwned: true })).toEqual({ verdict: 'gone' })
 })

@@ -114,3 +114,24 @@ test('撤回消息重播到本机：以它为原话的规矩作废，本地原�
   expect(f.store.inbox(stored.id)).toMatchObject({ text: '', revokedAt: expect.any(Number) })
   expect(f.store.inbox(stored.id)?.attachments).toBeUndefined()
 })
+
+test('chat.botComputers 三个接口:只有创建者能管理,票据严格校验,密钥不回显', async () => {
+  const f = await fixture()
+  const name = 'Test' // fixture 里 addAgent({name:'Test', botProtocol:1}, 'owner') 注册的数字员工
+  const actor = 'owner'
+  const good = { grantId: 'grant_abc123def456', peerId: 'grant-abc123def456', key: Buffer.alloc(32, 3).toString('base64'), label: '运维@机器B', directory: '/proj', directoryAbs: '/srv/b', relayUrl: 'ws://relay.test', sid: 's1', cliPub: 'pub', token: 'tok' }
+  expect(f.chat.botComputerAdd(name!, 'stranger', good).error).toMatch(/创建者/)
+  expect(f.chat.botComputerAdd(name!, actor, { ...good, key: 'short' }).error).toMatch(/密钥/)
+  expect(f.chat.botComputerAdd(name!, actor, { ...good, grantId: 'nope' }).error).toMatch(/凭证编号/)
+  expect(f.chat.botComputerAdd(name!, actor, good)).toMatchObject({ ok: true })
+  const listed = f.chat.botComputers(name!, actor)
+  expect(listed.ok).toBe(true)
+  expect(listed.data).toHaveLength(1)
+  expect(JSON.stringify(listed)).not.toContain('secret')
+  expect(JSON.stringify(listed)).not.toContain(good.key.slice(0, 8))
+  const ticket = f.chat.remoteTicket(name!, 'grant_abc123def456')
+  expect(ticket?.key).toBe(good.key) // 密钥留在宿主,给运行时用
+  expect(await f.chat.botComputerRemove(name!, actor, 'grant_abc123def456')).toMatchObject({ ok: true })
+  expect(f.chat.botComputers(name!, actor).data).toHaveLength(0)
+  expect((await f.chat.botComputerRemove(name!, actor, 'grant_abc123def456')).error).toMatch(/不在登记/)
+})
