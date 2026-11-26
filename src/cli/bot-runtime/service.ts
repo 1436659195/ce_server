@@ -30,6 +30,10 @@ interface Options {
   rootDir: string
   claudeExecutable?: string
   getBot(botIdOrName: string): RuntimeBot
+  /** 校验设备内真实绝对目录；确认时重新校验，防止路径被替换。 */
+  resolveDirectory?: (directory: string) => string
+  /** owner 已确认且旧 Worker 已停止；同步保存目录并撤销旧工具授权。 */
+  changeDirectory?: (botId: string, actor: string, expectedPolicyRevision: number, directory: string) => void
   sendReply(reply: RuntimeReply): Promise<void>
   checkAccess(bot: RuntimeBot, memberId: string, operation: BotOperation): Promise<Authorization>
   openTools(bot: RuntimeBot, memberId: string, authorize: (operation: BotOperation, summary: string) => Promise<Authorization>): { call(tool: string, args: Record<string, unknown>): Promise<string>; close(): void }
@@ -73,7 +77,7 @@ interface ActiveWorker {
   run: RuntimeRun; bot: RuntimeBot; client: RuntimeClient; turn?: CodexActiveTurn; writable: boolean; stopping: boolean
   grants: Map<string, { close(): void }>; tools: number; budgetTimer?: ReturnType<typeof setTimeout>
 }
-export interface RuntimeControl { action: 'stop' | 'answer' | 'correct' | 'resume' | 'reconcile' | 'retry_input'; taskId?: string; expectedRevision?: number; requestId: string; inputId?: string; text?: string; questionId?: string; operationId?: string; confirmedStopped?: boolean }
+export interface RuntimeControl { action: 'stop' | 'answer' | 'correct' | 'resume' | 'approve_directory' | 'reconcile' | 'retry_input'; taskId?: string; expectedRevision?: number; requestId: string; inputId?: string; text?: string; questionId?: string; operationId?: string; confirmedStopped?: boolean }
 const opForTool: Record<string, BotOperation> = { list_files: 'read', read_file: 'read', export_file: 'read', create_file: 'create', edit_file: 'edit', delete_file: 'delete', run_command: 'execute' }
 const scalar = { type: 'string' }
 const array = { type: 'array', items: scalar }
@@ -85,7 +89,7 @@ export const WORKER_TOOLS: CodexToolSpec[] = [
   tool('work_consume_input', '确认已读取一条任务输入；随后仍需记录处理结论。', { inputId: scalar }, ['inputId']),
   tool('work_report', '保存事实进展和输入处理结论，不发聊天通知。', { summary: scalar, resolutions: { type: 'array', items: { type: 'object', properties: { inputId: scalar, resolution: scalar }, required: ['inputId', 'resolution'], additionalProperties: false } } }, ['summary']),
   tool('work_reply', '向Router提交明确追问的事实答案，最多4000字符；由Router对外表达。', { replyToInputId: scalar, text: scalar }, ['replyToInputId', 'text']),
-  tool('work_ask_user', '提交必须由用户决定的具体问题给Router。默认阻塞：之后结束本轮等待 owner 回答。blocks=false 表示不阻塞：问题照常提出，你继续当前工作，一轮最多一次。', { text: scalar, options: array, blocks: { type: 'boolean' } }, ['text']),
+  tool('work_ask_user', '提交必须由用户决定的具体问题给Router。默认阻塞：之后结束本轮等待 owner 回答。blocks=false 表示不阻塞：问题照常提出，你继续当前工作，一轮最多一次。', { text: scalar, options: array, blocks: { type: 'boolean' }, directory: { type: 'string', description: '需要修改目录外文件时，申请的目标工作目录绝对路径；必须阻塞并等待 owner 确认' } }, ['text']),
   tool('work_publish_artifact', '将已成功 read_file 的结果存为可交付文件快照。', { operationId: scalar, title: scalar, mime: { type: 'string', enum: ['text/plain', 'text/markdown', 'text/html', 'application/json'] } }, ['operationId', 'title', 'mime']),
   tool('work_finish', '按当前需求版本向Router提交结果和实际附件，确认所有输入与工具已处理后结束本轮。', { revision: { type: 'integer' }, text: scalar, artifactIds: array, checks: array }, ['revision', 'text', 'artifactIds', 'checks']),
 ]
@@ -102,6 +106,7 @@ export class BotRuntimeService {
   private replyTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private routerBusy = new Map<string, Promise<void>>()
   private configuring = new Set<string>()
+  private directoryApprovals = new Map<string, { taskId: string; cancelled: boolean; inputIds: Set<string> }>()
   private initializationClients = new Map<string, RuntimeClient>()
   private quiescing = new Map<string, number>()
   private routerClients = new Map<string, RouterSession>()
@@ -163,7 +168,7 @@ export class BotRuntimeService {
   view(botId: string, actor: string): RuntimeView {
     const bot = this.owner(botId, actor)
     const tasks = this.store.tasks(bot.botId).slice(-30)
-    return { protocol: 1, settings: this.store.settings(bot.botId), capabilities: { activeInput: true, runtime: bot.platform === 'claude' ? 'Claude Code / CLI 能力检测' : 'Codex app-server / 协议能力检测', ...(bot.workerAccessMode === 'full-access' ? { executionMode: 'full-access' as const, directoryIsolation: 'soft' as const } : {}), limitations: bot.workerAccessMode === 'full-access' ? ['仅 owner 私聊；一个活动 Worker', '全权限模式：原生文件工具、Shell 与网络可用', '工作目录软隔离：不得更改目录外文件或破坏系统', '账号与发布权限需按具体任务核实'] : ['仅 owner 私聊；一个活动 Worker', '项目命令禁止联网，最长 60 秒', '不具备发布、上架或订票账号工具'] }, cases: this.store.cases(bot.botId).filter(c => tasks.some(t => t.caseId === c.id)), tasks, inputs: tasks.flatMap(t => this.store.inputs(t.id).slice(-30)), artifacts: this.store.artifacts(bot.botId).slice(-30).map(({ path: _path, ...a }) => a), operations: this.store.operations().filter(o => o.botId === bot.botId && o.state === 'unknown').slice(-30).map(o => ({ id: o.id, taskId: o.taskId, tool: o.tool, state: o.state, summary: `${o.tool}: ${String(o.arguments.path ?? o.arguments.command ?? '').slice(0, 1500)}`, error: o.error, canReconcile: !this.active.has(bot.botId) })), recoveries: tasks.filter(t => this.store.runs(bot.botId).some(r => r.taskId === t.id && r.state === 'unknown')).map(t => ({ taskId: t.id, runIds: this.store.runs(bot.botId).filter(r => r.taskId === t.id && r.state === 'unknown').map(r => r.id), canReconcile: !this.active.has(bot.botId) })), failedInputs: this.store.failedInputs(bot.botId).map(i => ({ id: i.id, text: i.text.slice(0, 1000), error: i.error, createdAt: i.createdAt })), memory: { active: this.store.memories(bot.botId).filter(m => m.status === 'active').slice(-50), review: this.store.memories(bot.botId).filter(m => m.needsReview && m.status === 'active'), failedJobs: this.store.failedMemoryJobs(bot.botId), log: this.store.memoryLog(bot.botId) }, experiences: this.store.experiences(bot.botId).slice(-50), updatedAt: Date.now() }
+    return { protocol: 1, settings: this.store.settings(bot.botId), capabilities: { activeInput: true, directoryApproval: !!this.opts.resolveDirectory && !!this.opts.changeDirectory, runtime: bot.platform === 'claude' ? 'Claude Code / CLI 能力检测' : 'Codex app-server / 协议能力检测', ...(bot.workerAccessMode === 'full-access' ? { executionMode: 'full-access' as const, directoryIsolation: 'soft' as const } : {}), limitations: bot.workerAccessMode === 'full-access' ? ['仅 owner 私聊；一个活动 Worker', '全权限模式：原生文件工具、Shell 与网络可用', '工作目录软隔离：不得更改目录外文件或破坏系统', '账号与发布权限需按具体任务核实'] : ['仅 owner 私聊；一个活动 Worker', '项目命令禁止联网，最长 60 秒', '不具备发布、上架或订票账号工具'] }, cases: this.store.cases(bot.botId).filter(c => tasks.some(t => t.caseId === c.id)), tasks, inputs: tasks.flatMap(t => this.store.inputs(t.id).slice(-30)), artifacts: this.store.artifacts(bot.botId).slice(-30).map(({ path: _path, ...a }) => a), operations: this.store.operations().filter(o => o.botId === bot.botId && o.state === 'unknown').slice(-30).map(o => ({ id: o.id, taskId: o.taskId, tool: o.tool, state: o.state, summary: `${o.tool}: ${String(o.arguments.path ?? o.arguments.command ?? '').slice(0, 1500)}`, error: o.error, canReconcile: !this.active.has(bot.botId) })), recoveries: tasks.filter(t => this.store.runs(bot.botId).some(r => r.taskId === t.id && r.state === 'unknown')).map(t => ({ taskId: t.id, runIds: this.store.runs(bot.botId).filter(r => r.taskId === t.id && r.state === 'unknown').map(r => r.id), canReconcile: !this.active.has(bot.botId) })), failedInputs: this.store.failedInputs(bot.botId).map(i => ({ id: i.id, text: i.text.slice(0, 1000), error: i.error, createdAt: i.createdAt })), memory: { active: this.store.memories(bot.botId).filter(m => m.status === 'active').slice(-50), review: this.store.memories(bot.botId).filter(m => m.needsReview && m.status === 'active'), failedJobs: this.store.failedMemoryJobs(bot.botId), log: this.store.memoryLog(bot.botId) }, experiences: this.store.experiences(bot.botId).slice(-50), updatedAt: Date.now() }
   }
   /** 新人入职必须验证两个真实模型通道；任意一步失败均不开放聊天。 */
   async initializeBot(botId: string, actor: string, profile: string): Promise<RuntimeView> {
@@ -246,13 +251,15 @@ export class BotRuntimeService {
       if (message.state === 'pending') this.store.markInput(message.id, 'failed', undefined, `附件不可用：${this.error(error)}；请重新选择后发送`)
       return this.store.inbox(message.id)!
     }
-    if (this.quiescing.has(bot.botId)) {
+    if (this.quiescing.has(bot.botId) && !this.directoryApprovals.has(bot.botId)) {
       if (message.state === 'pending') this.store.markInput(message.id, 'failed', undefined, 'Bot 正在停止或切换权限，此消息未派工，请稍后重新提出')
       return this.store.inbox(message.id)!
     }
     this.routerInputChanged(message); return message
   }
   private routerInputChanged(message: RuntimeInbox): void {
+    const approval = this.directoryApprovals.get(message.botId)
+    if (message.state === 'pending' && approval && !approval.inputIds.has(message.id)) approval.cancelled = true
     if (message.state === 'pending') { this.store.retryWorkerReplies(message.botId); this.store.clearFollowups(message.botId) }
     const session = this.routerClients.get(message.botId)
     if (message.state === 'pending' && session) {
@@ -274,7 +281,7 @@ export class BotRuntimeService {
       if (!intent) continue
       if (['stopped', 'failed'].includes(task.state)) {
         if (intent.expired) { this.store.updateTask(task.id, { resumeIntent: undefined, error: RESUME_TIMEOUT }); continue }
-        try { this.resumeTask(this.opts.getBot(botId), task, `${intent.requestId}:after-stop`) }
+        try { this.resumeTask(this.owner(botId, intent.actor), task, `${intent.requestId}:after-stop`, intent.inputIds) }
         catch (error) { this.store.updateTask(task.id, { resumeIntent: undefined, error: this.error(error) }) }
       } else if (task.state !== 'stopping') this.store.updateTask(task.id, { resumeIntent: undefined })
       else if (!intent.expired && Date.now() > intent.expiresAt) this.store.updateTask(task.id, { resumeIntent: { ...intent, expired: true }, error: RESUME_TIMEOUT })
@@ -423,7 +430,7 @@ export class BotRuntimeService {
               for (const c of summaries) bindings.cases.set(c.id, { revision: c.revision, scopeComplete: true })
               return result
             }
-            if (call.tool === 'task_inspect') { const task = this.requireTask(botId, String(args.taskId)); const dossier = this.store.case(task.caseId)!; const result = boundedRead({ dossier: { id: dossier.id, title: dossier.title, goal: dossier.goal.slice(0, 200), goalTruncated: dossier.goal.length > 200, revision: dossier.revision ?? 1 }, id: task.id, caseId: task.caseId, goal: task.goal.slice(0, 500), state: task.state, revision: task.revision, summary: task.summary.slice(0, 500), summaryUpdatedAt: task.summaryUpdatedAt ?? null, observedAt: Date.now(), activeOperations: activeOperationStatus(this.store.operations(task.id)), question: task.question, allowedOps: task.mandate.allowedOps, inputs: this.store.inputs(task.id).filter(i => !i.resolution).slice(-3).map(i => ({ id: i.id, kind: i.kind, text: i.text.slice(0, 500), delivery: i.delivery, revision: i.revision, consumedAt: i.consumedAt })) }); bindings.tasks.set(task.id, { revision: task.revision, questionId: task.question?.id, caseId: task.caseId }); bindings.cases.set(dossier.id, { revision: dossier.revision ?? 1, scopeComplete: dossier.goal.length <= 200 || (bindings.cases.get(dossier.id)?.revision === (dossier.revision ?? 1) && bindings.cases.get(dossier.id)?.scopeComplete === true) }); return result }
+            if (call.tool === 'task_inspect') { const task = this.requireTask(botId, String(args.taskId)); const dossier = this.store.case(task.caseId)!; const result = boundedRead({ dossier: { id: dossier.id, title: dossier.title, goal: dossier.goal.slice(0, 200), goalTruncated: dossier.goal.length > 200, revision: dossier.revision ?? 1 }, id: task.id, caseId: task.caseId, goal: task.goal.slice(0, 500), state: task.state, revision: task.revision, summary: task.summary.slice(0, 500), summaryUpdatedAt: task.summaryUpdatedAt ?? null, observedAt: Date.now(), activeOperations: activeOperationStatus(this.store.operations(task.id)), question: task.question, directory: task.mandate.directory, policyRevision: task.mandate.policyRevision, directoryChanged: task.mandate.directory !== bot.directory, allowedOps: task.mandate.allowedOps, inputs: this.store.inputs(task.id).filter(i => !i.resolution).slice(-3).map(i => ({ id: i.id, kind: i.kind, text: i.text.slice(0, 500), delivery: i.delivery, revision: i.revision, consumedAt: i.consumedAt })) }); bindings.tasks.set(task.id, { revision: task.revision, questionId: task.question?.id, caseId: task.caseId }); bindings.cases.set(dossier.id, { revision: dossier.revision ?? 1, scopeComplete: dossier.goal.length <= 200 || (bindings.cases.get(dossier.id)?.revision === (dossier.revision ?? 1) && bindings.cases.get(dossier.id)?.scopeComplete === true) }); return result }
             if (call.tool === 'experience_read') {
               const item = this.store.experience(String(args.experienceId))
               if (!item || item.state !== 'active') return boundedRead({ error: '经验不存在或已失效' })
@@ -511,7 +518,7 @@ export class BotRuntimeService {
   private async decide(messages: RuntimeInbox[], d: RouterDecision, workerMessage?: RuntimeReply): Promise<void> {
     const message = messages.at(-1); const inputIds = messages.map(m => m.id)
     const botId = message?.botId ?? workerMessage!.botId
-    const bot = this.owner(botId, message?.senderId ?? this.opts.getBot(botId).ownerPhoneId)
+    let bot = this.owner(botId, message?.senderId ?? this.opts.getBot(botId).ownerPhoneId)
     if (d.workerReplyId !== workerMessage?.id) throw new Error('必须准确关联本轮Worker结果workerReplyId')
     if (message && workerMessage && !d.workerReplyIndexes) throw new Error('混合处理用户输入和Worker结果时，必须用workerReplyIndexes注明每个气泡的归属')
     if (d.workerReplyIndexes && (!workerMessage || !message && d.workerReplyIndexes.length !== d.replies.length)) throw new Error('没有用户输入时所有气泡都须关联Worker结果')
@@ -520,7 +527,12 @@ export class BotRuntimeService {
     if (this.stopped || this.quiescing.has(bot.botId) || !this.enabled(bot.botId) || bot.policyRevision !== d.policyRevision) throw new Error('运行模式或权限已改变')
     if (message) this.store.requireBatch(message.id, inputIds)
     for (const id of d.cancelReplyIds) if (!this.store.replies(bot.botId).some(r => r.id === id && r.author === 'router' && r.attemptedAt === undefined && r.state !== 'sent' && !(r.sourceReplyId && (r.artifactIds?.length || r.purpose === 'question')))) throw new Error('只能取消当前 Bot 尚未尝试发送的前台气泡')
-    if (d.action === 'stop' || d.action === 'resume') await this.control(bot.botId, message!.senderId, { action: d.action, taskId: d.taskId!, expectedRevision: d.expectedRevision!, requestId: message!.id })
+    if (d.action === 'stop' || d.action === 'resume') await this.control(bot.botId, message!.senderId, { action: d.action, taskId: d.taskId!, expectedRevision: d.expectedRevision!, requestId: message!.id }, inputIds)
+    if (d.action === 'approve_directory') {
+      await this.control(bot.botId, message!.senderId, { action: d.action, taskId: d.taskId!, expectedRevision: d.expectedRevision!, questionId: d.questionId, requestId: message!.id }, inputIds)
+      bot = this.owner(botId, message!.senderId)
+      d = { ...d, policyRevision: bot.policyRevision }
+    }
     let addition: RuntimeTaskInput | undefined
     const userReply: Omit<RuntimeReply, 'id' | 'createdAt' | 'state' | 'text'> = { botId, groupId: bot.groupId, inputId: message?.id, author: 'router', purpose: 'chat', key: `${message?.id}:router`, policyRevision: d.policyRevision }
     this.store.transaction(() => {
@@ -617,7 +629,8 @@ export class BotRuntimeService {
       const executionPolicy = bot.workerAccessMode === 'full-access' ? workerExecutionPolicy(bot.directory) : undefined
       const fingerprint = createHash('sha256').update(JSON.stringify({ owner: bot.ownerPhoneId, directory: bot.directory, policy: bot.policyRevision, model: this.store.settings(bot.botId).model, schema: 2, ...(executionPolicy ? { executionMode: executionPolicy.mode } : {}) })).digest('hex')
       const threadOptions = { instructions: WORKER_INSTRUCTIONS + (executionPolicy ? `\n${executionPolicy.instructions}` : ''), tools: executionPolicy ? FULL_ACCESS_WORKER_TOOLS : WORKER_TOOLS }
-      const inherited = !!dossier.threadId && dossier.fingerprint === fingerprint
+      const resetForDirectory = !!task.directoryContinuation && !task.directoryContinuation.sessionRunId
+      const inherited = !resetForDirectory && !!dossier.threadId && dossier.fingerprint === fingerprint
       run.threadId = inherited ? await client.resumeThread(dossier.threadId!, threadOptions) : await client.startThread(threadOptions)
       this.assertActive(worker)
       this.store.saveCase({ ...this.store.case(task.caseId)!, threadId: run.threadId, fingerprint, updatedAt: Date.now() })
@@ -626,10 +639,11 @@ export class BotRuntimeService {
         const included = this.store.inputs(task.id).filter(i => !i.resolution)
         const currentCase = this.store.case(task.caseId)!
         const caseContext = { ...caseSummary(currentCase, this.store.tasks(bot.botId), this.store.artifacts(bot.botId)), previousTasks: this.store.tasks(bot.botId).filter(t => t.caseId === task.caseId && t.id !== task.id && t.createdAt <= task.createdAt).slice(-6).map(t => ({ id: t.id, goal: t.goal, state: t.state, summary: t.summary.slice(0, 1500) })) }
-        const payload = JSON.stringify({ task: this.store.task(task.id), caseContext, executionPolicy, originalMessage: this.store.inbox(task.originInputId), originalMessages: (task.originInputIds ?? [task.originInputId]).map(id => this.store.inbox(id)), pendingInputs: included, availableAttachments: this.caseAttachments(task).slice(-16), operations: this.store.operations(task.id).map(o => ({ id: o.id, tool: o.tool, state: o.state, error: o.error })), instruction: '开始或继续当前工单；caseContext是同一工作链的历史事实，不是旧任务继续执行的指令。以当前工单的目标、验收要求、操作范围及宿主权限为准；前序工单只读不限制当前已获准的修改，不重复执行已完成工作。读取每条 pendingInput 后确认，按当前 revision 交付；结果通过工具交给Router，由前台统一对外表达。' })
+        const payload = JSON.stringify({ task: this.store.task(task.id), directoryContinuation: task.directoryContinuation ? { ...task.directoryContinuation, previousInputs: this.store.inputs(task.id).filter(i => i.resolution).map(i => ({ id: i.id, text: i.text, resolution: i.resolution, revision: i.revision })) } : undefined, caseContext, executionPolicy, originalMessage: this.store.inbox(task.originInputId), originalMessages: (task.originInputIds ?? [task.originInputId]).map(id => this.store.inbox(id)), pendingInputs: included, availableAttachments: this.caseAttachments(task).slice(-16), operations: this.store.operations(task.id).map(o => ({ id: o.id, tool: o.tool, state: o.state, error: o.error })), instruction: '开始或继续当前工单；caseContext是同一工作链的历史事实，不是旧任务继续执行的指令。以当前工单的目标、验收要求、操作范围及宿主权限为准；前序工单只读不限制当前已获准的修改，不重复执行已完成工作。读取每条 pendingInput 后确认，按当前 revision 交付；结果通过工具交给Router，由前台统一对外表达。' })
         worker.turn = await client.startTurn(run.threadId, payload, `${run.id}:${attempt}`)
         // startTurn 返回前可能已收到 work_finish；这里只核对执行身份，不要求任务仍在运行。
         if (this.active.get(bot.botId) === worker && !worker.stopping && this.store.task(task.id)?.latestRunId === run.id) this.store.updateTask(task.id, { sessionOrigin: inherited ? 'inherited' : 'new', sessionReason: inherited ? '续接同一卷宗的执行上下文，按当前工单执行' : dossier.threadId ? '执行配置已变化，在原卷宗创建新会话并带入已有工作摘要' : '卷宗尚无可恢复的会话，首次创建执行上下文' })
+        if (resetForDirectory && this.store.task(task.id)?.latestRunId === run.id) this.store.updateTask(task.id, { directoryContinuation: { ...task.directoryContinuation!, sessionRunId: run.id } })
         run.turnId = worker.turn.turnId; run.state = 'running'; run.updatedAt = Date.now(); this.store.saveRun(run)
         for (const input of included) this.store.delivered(input.id, 'accepted')
         // startTurn 在途时到达的补充不在初始 payload 中，必须现在真正投递，不能直接标成已送达。
@@ -720,8 +734,17 @@ export class BotRuntimeService {
       void this.flush(task.botId); return { saved: true }
     }
     if (call.tool === 'work_ask_user') {
-      const text = boundedText(args.text, '必要问题', 1000)
-      const question = { id: `question_${randomUUID()}`, text, options: Array.isArray(args.options) ? args.options.filter((s): s is string => typeof s === 'string' && s.length <= 100).slice(0, 5) : [], createdAt: Date.now() }
+      let text = boundedText(args.text, '必要问题', 1000)
+      let directoryChange: NonNullable<RuntimeTask['question']>['directoryChange']
+      if (args.directory !== undefined) {
+        if (args.blocks === false) throw new Error('目录申请必须是阻塞问题，确认前不能继续操作')
+        if (worker.bot.workerAccessMode !== 'full-access' || !this.opts.resolveDirectory || !this.opts.changeDirectory) throw new Error('当前运行环境不支持目录确认，请在设置中修改')
+        const directory = this.opts.resolveDirectory(boundedText(args.directory, '目标目录', 2000))
+        if (directory === worker.bot.directory) throw new Error('目标目录与当前工作目录相同')
+        directoryChange = { fromDirectory: worker.bot.directory, toDirectory: directory, policyRevision: worker.bot.policyRevision }
+        text = boundedText(`${text}\n申请将工作目录从 ${worker.bot.directory} 改为 ${directory}，后续任务也使用新目录。请确认后继续。`, '目录确认', 4000)
+      }
+      const question = { id: `question_${randomUUID()}`, text, ...(directoryChange ? { directoryChange } : {}), options: Array.isArray(args.options) ? args.options.filter((s): s is string => typeof s === 'string' && s.length <= 100).slice(0, 5) : [], createdAt: Date.now() }
       const blocking = args.blocks !== false
       this.store.transaction(() => {
         this.store.reply({ botId: task.botId, groupId: task.groupId, taskId: task.id, taskRevision: task.revision, runId: worker.run.id, questionId: question.id, author: 'worker', purpose: 'question', text, key: question.id, policyRevision: task.mandate.policyRevision })
@@ -854,7 +877,7 @@ export class BotRuntimeService {
     if (Buffer.byteLength(content) !== artifact.size || createHash('sha256').update(content).digest('hex') !== artifact.hash) throw new Error('成果快照已改变，请重新生成')
     return { title: artifact.title, mime: artifact.mime, content }
   }
-  async control(botId: string, actor: string, p: RuntimeControl): Promise<RuntimeView> {
+  async control(botId: string, actor: string, p: RuntimeControl, confirmationInputIds?: string[]): Promise<RuntimeView> {
     const bot = this.owner(botId, actor)
     boundedText(p.requestId, '请求 ID', 150)
     if (p.action === 'retry_input') {
@@ -869,8 +892,16 @@ export class BotRuntimeService {
     }
     const task = this.requireTask(bot.botId, String(p.taskId))
     if (this.store.hasControl(bot.botId, p.requestId)) return this.view(bot.botId, actor)
-    if (p.action === 'stop' && task.state === 'stopped') return this.view(bot.botId, actor)
     if (task.revision !== p.expectedRevision) throw new Error('工单版本已变化，请刷新后重试')
+    if (p.action === 'stop') {
+      const approval = this.directoryApprovals.get(bot.botId)
+      if (approval?.taskId === task.id) approval.cancelled = true
+      if (task.state === 'stopped') return this.view(bot.botId, actor)
+    }
+    if (p.action === 'approve_directory') {
+      await this.approveDirectory(bot, task, actor, p, confirmationInputIds)
+      return this.view(bot.botId, actor)
+    }
     if (p.action === 'stop') {
       await this.stopTask(bot.botId, task.id)
       this.store.control(bot.botId, p.requestId, () => ({ stopped: true }))
@@ -902,18 +933,73 @@ export class BotRuntimeService {
     } else if (p.action === 'resume') {
       if (task.state === 'stopping') {
         // 「继续」来的时候还在停：不报错，记下意图，真正停下后由宿主自动恢复。
-        this.store.control(bot.botId, `${p.requestId}:intent`, () => { if (!this.store.task(task.id)?.resumeIntent) this.store.updateTask(task.id, { resumeIntent: { requestId: p.requestId, actor, requestedAt: Date.now(), expiresAt: Date.now() + (this.opts.resumeIntentMs ?? RESUME_INTENT_MS) } }) })
+        this.store.control(bot.botId, `${p.requestId}:intent`, () => { if (!this.store.task(task.id)?.resumeIntent) this.store.updateTask(task.id, { resumeIntent: { requestId: p.requestId, actor, requestedAt: Date.now(), expiresAt: Date.now() + (this.opts.resumeIntentMs ?? RESUME_INTENT_MS), inputIds: confirmationInputIds } }) })
         return this.view(bot.botId, actor)
       }
-      this.resumeTask(bot, task, p.requestId)
+      this.resumeTask(bot, task, p.requestId, confirmationInputIds)
     } else throw new Error('未知控制动作')
     return this.view(bot.botId, actor)
   }
-  /** 恢复沿用原有核对：授权没变、没有结果未知的操作和执行；不放宽。 */
-  private resumeTask(bot: RuntimeBot, task: RuntimeTask, requestId: string): void {
+  private async approveDirectory(bot: RuntimeBot, task: RuntimeTask, actor: string, p: RuntimeControl, confirmationInputIds?: string[]): Promise<void> {
+    const proposal = task.question?.directoryChange
+    if (!proposal || task.question?.id !== p.questionId) throw new Error('目录确认问题已改变或不存在，请刷新')
+    if (!this.opts.resolveDirectory || !this.opts.changeDirectory || bot.workerAccessMode !== 'full-access' || task.mandate.executionMode !== 'full-access') throw new Error('当前运行环境不支持目录确认')
+    const approval = { taskId: task.id, cancelled: false, inputIds: new Set(confirmationInputIds ?? []) }
+    const verify = () => {
+      if (approval.cancelled) throw new Error('收到新的指令或停止请求，本次目录确认已取消')
+      const current = this.owner(bot.botId, actor); const latest = this.requireTask(bot.botId, task.id)
+      if (this.stopped || !this.enabled(bot.botId) || current.workerAccessMode !== 'full-access') throw new Error('数字人运行模式已变化')
+      if (current.policyRevision !== proposal.policyRevision || current.directory !== proposal.fromDirectory || task.mandate.ownerPhoneId !== actor || task.mandate.policyRevision !== proposal.policyRevision) throw new Error('目录或权限版本已变化，旧确认已失效')
+      if (latest.revision !== p.expectedRevision || latest.question?.id !== p.questionId || !['waiting_user', 'stopped', 'failed'].includes(latest.state)) throw new Error('问题或工单版本已变化，请刷新')
+      for (const id of confirmationInputIds ?? []) {
+        const input = this.store.inbox(id)
+        if (!input || input.revokedAt || input.botId !== bot.botId || input.groupId !== bot.groupId || input.senderId !== actor) throw new Error('目录确认原话归属已失效')
+      }
+      if (this.store.operations().some(o => o.botId === bot.botId && ['unknown', 'running', 'approved', 'pending_approval'].includes(o.state)) || this.store.runs(bot.botId).some(r => r.state === 'unknown')) throw new Error('旧操作或执行需要先核对并结束')
+      if (this.store.tasks(bot.botId).some(t => t.id !== task.id && ['queued', 'running', 'waiting_user', 'stopping', 'recovering'].includes(t.state))) throw new Error('请先完成或停止其他任务，再确认目录')
+      if (this.opts.resolveDirectory!(proposal.toDirectory) !== proposal.toDirectory) throw new Error('目标目录实际位置已变化，请重新申请')
+    }
+    if (this.configuring.has(bot.botId) || this.quiescing.has(bot.botId)) throw new Error('正在处理目录或配置，请稍后重试')
+    verify()
+    this.directoryApprovals.set(bot.botId, approval)
+    this.configuring.add(bot.botId)
+    this.quiescing.set(bot.botId, (this.quiescing.get(bot.botId) ?? 0) + 1)
+    try {
+      await this.stopTask(bot.botId, task.id)
+      verify()
+      if (this.active.has(bot.botId) || this.store.runs(bot.botId).some(r => r.taskId === task.id && r.state !== 'exited')) throw new Error('旧执行尚未结束，请稍后重试')
+      this.opts.changeDirectory(bot.botId, actor, proposal.policyRevision, proposal.toDirectory)
+      this.store.cancelReplies(bot.botId)
+    } finally { this.directoryApprovals.delete(bot.botId); this.configuring.delete(bot.botId); this.releaseQuiescing(bot.botId) }
+    this.resumeTask(this.owner(bot.botId, actor), this.requireTask(bot.botId, task.id), p.requestId, confirmationInputIds)
+  }
+  /** 普通恢复仍用原授权；owner 在已更换的目录明确继续，可更新同一全权限工单的目录授权。 */
+  private resumeTask(bot: RuntimeBot, task: RuntimeTask, requestId: string, confirmationInputIds?: string[]): void {
+    if (this.stopped || this.quiescing.has(bot.botId) || !this.enabled(bot.botId)) throw new Error('请先启用前台与 Worker 模式并等待切换完成')
     if (!['stopped', 'failed', 'waiting_user', 'recovering'].includes(task.state)) throw new Error('任务当前不需要恢复')
-    if (task.mandate.policyRevision !== bot.policyRevision || this.store.operations(task.id).some(o => o.state === 'unknown') || this.store.runs(bot.botId).some(r => r.taskId === task.id && r.state === 'unknown')) throw new Error('旧授权或未知操作/执行需先核对，不能直接重跑；请先核对旧执行与项目结果')
-    this.store.control(bot.botId, requestId, () => this.store.updateTask(task.id, { state: 'queued', error: undefined, resumeIntent: undefined })); void this.pump(bot.botId)
+    const operations = this.store.operations(task.id)
+    const runs = this.store.runs(bot.botId).filter(r => r.taskId === task.id)
+    if (operations.some(o => o.state === 'unknown') || runs.some(r => r.state === 'unknown')) throw new Error('旧操作/执行结果未知，请先核对旧执行与项目结果，不能直接重跑')
+    const changed = task.mandate.policyRevision !== bot.policyRevision || task.mandate.directory !== bot.directory
+    const patch: Partial<RuntimeTask> = { state: 'queued', error: undefined, resumeIntent: undefined }
+    if (changed) {
+      if (task.mandate.ownerPhoneId !== bot.ownerPhoneId || task.groupId !== bot.groupId || task.mandate.directory === bot.directory || task.mandate.policyRevision >= bot.policyRevision || task.mandate.executionMode !== 'full-access' || bot.workerAccessMode !== 'full-access' || !['stopped', 'failed'].includes(task.state)) throw new Error('原任务授权已改变，不能直接恢复；请按当前权限重新确认工作范围')
+      if (this.active.has(bot.botId) || runs.some(r => r.state !== 'exited') || operations.some(o => ['pending_approval', 'approved', 'running'].includes(o.state))) throw new Error('旧执行或操作尚未结束，请先核对并停止后继续')
+      const policy = workerExecutionPolicy(bot.directory)
+      const input = this.store.inbox(requestId)
+      confirmationInputIds ??= input ? [input.id] : []
+      const confirmationText = confirmationInputIds.map(id => this.store.inbox(id)?.text ?? '').join('\n')
+      Object.assign(patch, {
+        mandate: { ...task.mandate, directory: bot.directory, policyRevision: bot.policyRevision, safetyInstructions: policy.instructions },
+        revision: task.revision + 1, question: undefined, followup: undefined,
+        directoryContinuation: { fromDirectory: task.mandate.directory, toDirectory: bot.directory, previousPolicyRevision: task.mandate.policyRevision, policyRevision: bot.policyRevision, actor: bot.ownerPhoneId, requestId, confirmedAt: Date.now(), confirmationText: confirmationText || 'owner 通过继续按钮确认在当前工作目录继续原任务', previousQuestion: task.question },
+      } satisfies Partial<RuntimeTask>)
+    } else if (task.mandate.ownerPhoneId !== bot.ownerPhoneId) throw new Error('原任务 owner 授权已改变')
+    this.store.control(bot.botId, requestId, () => {
+      const updated = this.store.updateTask(task.id, patch)
+      if (changed) this.store.recordDirectoryConfirmation(updated, confirmationInputIds ?? [])
+      return updated
+    }); void this.pump(bot.botId)
   }
   private async stopTask(botId: string, taskId: string, reason?: string): Promise<void> {
     const worker = this.active.get(botId)
@@ -937,6 +1023,8 @@ export class BotRuntimeService {
     this.resumeAfterStop(botId)
   }
   async stopBot(botId: string): Promise<void> {
+    const approval = this.directoryApprovals.get(botId)
+    if (approval) approval.cancelled = true
     this.quiescing.set(botId, (this.quiescing.get(botId) ?? 0) + 1)
     try {
     clearTimeout(this.routeTimers.get(botId)); this.routeTimers.delete(botId)

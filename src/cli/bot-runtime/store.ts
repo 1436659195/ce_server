@@ -146,7 +146,7 @@ export class BotRuntimeStore {
   }
   tasks(botId?: string): RuntimeTask[] { return this.all('tasks', botId) }
   task(taskId: string): RuntimeTask | undefined { return this.get('tasks', taskId) }
-  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason'>>): RuntimeTask {
+  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason' | 'revision' | 'directoryContinuation'>>): RuntimeTask {
     const task = this.task(taskId); if (!task) throw new Error('工单不存在')
     const now = Date.now()
     const next = { ...task, ...patch, ...(patch.summary !== undefined ? { summaryUpdatedAt: now } : {}), updatedAt: now }
@@ -221,6 +221,15 @@ export class BotRuntimeStore {
     })
   }
   inputs(taskId: string): RuntimeTaskInput[] { return this.all<RuntimeTaskInput>('task_inputs').filter(i => i.taskId === taskId) }
+  /** 目录确认本身也是当前需求补充；不提前消费聊天批次，待 Router 正常提交。 */
+  recordDirectoryConfirmation(task: RuntimeTask, inputIds: string[]): void {
+    if (!inputIds.length) return
+    const batch = inputIds.map(id => this.requireInbox(id))
+    if (batch.some(m => m.botId !== task.botId || m.groupId !== task.groupId || m.senderId !== task.mandate.ownerPhoneId || m.revokedAt)) throw new Error('目录确认原话归属已失效')
+    const inboxId = batch.at(-1)!.id
+    if (this.inputs(task.id).some(i => i.inboxId === inboxId)) return
+    this.put('task_inputs', { id: id('input'), botId: task.botId, taskId: task.id, inboxId, inboxIds: inputIds, kind: 'correction', text: batch.map(m => m.text).join('\n'), attachments: batch.flatMap(m => m.attachments ?? []), revision: task.revision, delivery: 'pending', createdAt: Date.now() } satisfies RuntimeTaskInput)
+  }
   input(inputId: string): RuntimeTaskInput | undefined { return this.get('task_inputs', inputId) }
   delivered(inputId: string, delivery: RuntimeTaskInput['delivery']): void {
     const input = this.input(inputId); if (!input) throw new Error('补充不存在'); this.put('task_inputs', { ...input, delivery })

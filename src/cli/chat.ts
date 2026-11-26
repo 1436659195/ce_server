@@ -801,8 +801,8 @@ export class ChatHub {
       group.botMembers?.some(member => member.phoneId === actorPhoneId && member.human === true && !member.guest) === true
   }
 
-  private invalidateBotPolicy(name: string, rec: AgentRec): Promise<void> {
-    const stopped = rec.bot?.id ? this.runtime?.policyChanged(rec.bot.id) : undefined
+  private invalidateBotPolicy(name: string, rec: AgentRec, runtimeAlreadyStopped = false): Promise<void> {
+    const stopped = !runtimeAlreadyStopped && rec.bot?.id ? this.runtime?.policyChanged(rec.bot.id) : undefined
     for (const group of Object.values(rec.groups)) {
       delete group.botSessionId; delete group.botSessions
       for (const pending of group.botQueue ?? []) if (pending.reply && !pending.reply.system) pending.reply = { text: 'BOT 权限已更新，旧回复已作废，请重新发送消息。', system: true, offset: 0 }
@@ -845,6 +845,30 @@ export class ChatHub {
         people: this.opts.people?.() ?? [], commandSandbox: this.opts.commandSandbox?.() === true,
       } }
     } catch (error) { return { ok: false, error: (error as Error).message } }
+  }
+
+  resolveRuntimeDirectory(directory: string): string {
+    if (!this.opts.rootDir) throw new Error('无法确认设备文件根目录')
+    if (!isAbsolute(directory) || /[\r\n\0]/.test(directory) || directory.length > 2000) throw new Error('请提供有效的目标目录绝对路径')
+    const root = realpathSync(this.opts.rootDir)
+    const rel = relative(root, resolve(directory))
+    if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error('目标目录超出设备文件根目录')
+    return digitalPersonDirectory(root, '/' + rel.split(sep).join('/'))
+  }
+
+  /** 仅供运行时确认路径调用：调用方已停妥旧 Worker，不能再次关闭正在提交确认的 Router。 */
+  commitRuntimeDirectory(nameOrId: string, actor: string, expectedRevision: number, directory: string): void {
+    const current = this.runtimeBot(nameOrId); const rec = this.state.agents[current.name]; const bot = rec.bot!
+    if (!actor || actor !== bot.policy?.ownerPhoneId) throw new Error('只有 owner 创建者可以确认工作目录')
+    if (bot.onboarding?.status !== 'ready' || !this.runtime?.enabled(current.botId)) throw new Error('数字人尚未就绪')
+    if (bot.policy.revision !== expectedRevision) throw new Error('目录或权限版本已变化，请刷新')
+    const cwd = this.resolveRuntimeDirectory(directory)
+    if (cwd !== directory) throw new Error('目标目录实际位置已变化，请重新申请')
+    const previousCwd = rec.cwd; const previousPolicy = bot.policy
+    rec.cwd = cwd
+    bot.policy = { ...previousPolicy, permissions: { ...previousPolicy.permissions, directory: '.' }, revision: previousPolicy.revision + 1 }
+    try { this.save(true) } catch (error) { rec.cwd = previousCwd; bot.policy = previousPolicy; throw error }
+    void this.invalidateBotPolicy(current.name, rec, true)
   }
 
   async botDirectory(name: string, actor: string, expectedRevision: number, directory: unknown): Promise<BotPolicyResult> {

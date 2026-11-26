@@ -131,9 +131,15 @@ export interface RuntimeTask {
   summary: string; createdAt: number; updatedAt: number; latestRunId?: string; error?: string
   caseDecision?: RuntimeCaseDecision
   sessionOrigin?: 'inherited' | 'new'; sessionReason?: string
+  /** owner 明确继续后更新目录授权；旧工单内容保留，首次执行必须新建 Session。 */
+  directoryContinuation?: {
+    fromDirectory: string; toDirectory: string; previousPolicyRevision: number; policyRevision: number
+    actor: string; requestId: string; confirmedAt: number; confirmationText: string
+    previousQuestion?: RuntimeTask['question']; sessionRunId?: string
+  }
   /** 摘要本身的记录时间；普通状态/需求变更不刷新它。旧账本可能没有。 */
   summaryUpdatedAt?: number
-  question?: { id: string; text: string; options: string[]; createdAt: number }
+  question?: { id: string; text: string; options: string[]; createdAt: number; directoryChange?: { fromDirectory: string; toDirectory: string; policyRevision: number } }
   /** Worker 不阻塞的提问：问题已发出，任务继续；没人答时按跟进规则最多再提一次。 */
   followup?: { questionId: string; text: string; askedAt: number; askCount: number }
   /** Router 选定的前序附件消息；宿主校验同一 owner、Bot 和私聊。 */
@@ -143,7 +149,7 @@ export interface RuntimeTask {
   /** 旧工单可缺省；新文件交付任务必须附成果才能完成。 */
   delivery?: 'chat' | 'files'
   /** 「继续」来的时候任务还在停止过程中：记下意图，真正停下后由宿主自动恢复。 */
-  resumeIntent?: { requestId: string; actor: string; requestedAt: number; expiresAt: number; expired?: true }
+  resumeIntent?: { requestId: string; actor: string; requestedAt: number; expiresAt: number; expired?: true; inputIds?: string[] }
 }
 export interface RuntimeTaskInput {
   id: string; botId: string; taskId: string; inboxId: string; kind: 'append' | 'ask_worker' | 'answer' | 'correction'
@@ -189,7 +195,7 @@ export interface RuntimeArtifact {
   name?: string
 }
 export interface RuntimeView {
-  protocol: 1; settings: RuntimeSettings; capabilities: { activeInput: boolean; runtime: string; limitations: string[]; executionMode?: 'full-access'; directoryIsolation?: 'soft' }
+  protocol: 1; settings: RuntimeSettings; capabilities: { activeInput: boolean; runtime: string; limitations: string[]; executionMode?: 'full-access'; directoryIsolation?: 'soft'; directoryApproval?: boolean }
   cases: RuntimeCase[]; tasks: RuntimeTask[]; inputs: RuntimeTaskInput[]; artifacts: Array<Omit<RuntimeArtifact, 'path'>>
   operations: Array<{ id: string; taskId: string; tool: string; state: RuntimeOperation['state']; summary: string; error?: string; canReconcile: boolean }>
   recoveries: Array<{ taskId: string; runIds: string[]; canReconcile: boolean }>

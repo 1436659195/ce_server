@@ -645,6 +645,8 @@ async function main(): Promise<void> {
     store: botRuntimeStore, rootDir: join(homedir(), '.ce'),
     claudeExecutable: claudeBin ?? undefined,
     getBot: nameOrId => chatHub.runtimeBot(nameOrId),
+    resolveDirectory: directory => chatHub.resolveRuntimeDirectory(directory),
+    changeDirectory: (botId, actor, revision, directory) => chatHub.commitRuntimeDirectory(botId, actor, revision, directory),
     sendReply: reply => chatHub.sendRuntimeReply(reply),
     checkAccess: (bot, memberId, operation) => chatHub.checkRuntimeAccess(bot.botId, memberId, operation),
     openTools: (bot, memberId, authorize) => {

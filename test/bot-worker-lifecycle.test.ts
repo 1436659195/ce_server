@@ -32,6 +32,7 @@ interface FixtureOptions {
   tickMs?: number
   followupQuietMs?: number
   resumeFailure?: string
+  directoryApproval?: boolean
 }
 function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: FixtureOptions | number = {}) {
   const options = typeof optionsOrDelay === 'number' ? { accessDelayMs: optionsOrDelay } : optionsOrDelay
@@ -45,6 +46,13 @@ function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: Fixt
   let workerOptions: RuntimeClientOptions | undefined; let workerDone: ((v: CodexTurn) => void) | undefined; let started = 0; let calls = 0
   let workerClients = 0; let workerCloses = 0
   const service = new BotRuntimeService({ routerQuietMs: 0, store, rootDir: dir, getBot: () => bot, sendReply: async reply => { sent.push(reply.text) },
+    ...(options.directoryApproval ? {
+      resolveDirectory: (path: string) => { if (!path.startsWith(dir + '/')) throw new Error('目录超出设备范围'); return path },
+      changeDirectory: (_id: string, actor: string, revision: number, path: string) => {
+        if (actor !== bot.ownerPhoneId || revision !== bot.policyRevision) throw new Error('权限版本已改变')
+        bot.directory = bot.sourceCwd = path; bot.policyRevision++
+      },
+    } : {}),
     ...(options.tickMs !== undefined ? { tickMs: options.tickMs } : {}), ...(options.resumeIntentMs !== undefined ? { resumeIntentMs: options.resumeIntentMs } : {}),
     ...(options.followupQuietMs !== undefined ? { followupQuietMs: options.followupQuietMs } : {}),
     checkAccess: async () => {
@@ -155,6 +163,205 @@ test('未知的旧执行必须核对后才能换目录', () => {
     store.saveRun({ id: 'old-run', botId: bot.botId, taskId: task.id, state: 'unknown', createdAt: 1, updatedAt: 1 })
   } })
   expect(() => f.service.assertDirectoryChangeAllowed(f.bot.botId)).toThrow(/核对/)
+})
+
+test('目录阻塞后停止、换目录、聊天继续：原工单按新目录授权并新开 Session', async () => {
+  const decisions: Array<Record<string, unknown>> = [{ ...start, goal: '优化后端；当前只能在旧目录写入', exclusions: ['不发布'] }]
+  const f = fixture(decisions, { fullAccess: true })
+  f.send(1, '按方案实施'); await waitFor(() => f.started() === 1)
+  const original = f.store.tasks(f.bot.botId)[0]
+  await f.workerCall('work_report', { summary: '已定位后端五项改造位置，尚未改代码' })
+  await f.workerCall('work_ask_user', { text: '需要修改相邻后端，请调整工作目录后继续', options: [] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  await f.service.control(f.bot.botId, 'owner', { action: 'stop', taskId: original.id, expectedRevision: 1, requestId: 'stop-before-directory' })
+  f.service.assertDirectoryChangeAllowed(f.bot.botId)
+  const next = join(f.dir, 'next'); mkdirSync(next)
+  f.bot.directory = f.bot.sourceCwd = next; f.bot.policyRevision++
+  await f.service.policyChanged(f.bot.botId)
+  expect(f.started()).toBe(1) // 改设置本身不派工。
+  decisions.push({ action: 'resume', taskId: original.id, replyText: '按新目录继续原任务。' })
+  const confirmation = f.send(2, '工作目录已经改了，继续吧')
+  await waitFor(() => f.started() === 2)
+  const current = f.store.task(original.id)!
+  expect(f.store.tasks(f.bot.botId)).toHaveLength(1)
+  expect(f.store.cases(f.bot.botId)).toHaveLength(1)
+  expect(current).toMatchObject({ caseId: original.caseId, goal: original.goal, acceptance: original.acceptance, revision: 2,
+    mandate: { directory: next, policyRevision: 2, exclusions: ['不发布'] }, sessionOrigin: 'new' })
+  expect(current.question).toBeUndefined()
+  expect(f.workerOptions?.cwd).toBe(next)
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+  const payload = JSON.parse(f.workerPayloads[1])
+  expect(payload.directoryContinuation).toMatchObject({ fromDirectory: f.dir, toDirectory: next, requestId: confirmation.id, confirmationText: '工作目录已经改了，继续吧' })
+  expect(payload.task.summary).toBe('已定位后端五项改造位置，尚未改代码')
+  expect(payload.executionPolicy.directory).toBe(next)
+  await f.service.control(f.bot.botId, 'owner', { action: 'resume', taskId: original.id, expectedRevision: 1, requestId: confirmation.id })
+  expect(f.started()).toBe(2) // 同一确认重传不重复执行。
+  await f.service.control(f.bot.botId, 'owner', { action: 'stop', taskId: original.id, expectedRevision: 2, requestId: 'stop-again' })
+  await f.service.control(f.bot.botId, 'owner', { action: 'resume', taskId: original.id, expectedRevision: 2, requestId: 'resume-again' })
+  await waitFor(() => f.started() === 3)
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start', 'resume'])
+})
+
+test('换目录继续仍拒绝未知执行、未结束操作、不同 owner 及执行模式降级', async () => {
+  const f = fixture([start], { fullAccess: true })
+  f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  await f.service.control(f.bot.botId, 'owner', { action: 'stop', taskId: task.id, expectedRevision: 1, requestId: 'stop' })
+  f.bot.directory = join(f.dir, 'new'); mkdirSync(f.bot.directory); f.bot.policyRevision++
+  const request = { action: 'resume' as const, taskId: task.id, expectedRevision: 1, requestId: 'resume-new' }
+  await expect(f.service.control(f.bot.botId, 'stranger', request)).rejects.toThrow(/owner/)
+  f.bot.ownerPhoneId = 'new-owner'
+  await expect(f.service.control(f.bot.botId, 'new-owner', request)).rejects.toThrow(/授权|owner/)
+  f.bot.ownerPhoneId = 'owner'; f.bot.workerAccessMode = undefined
+  await expect(f.service.control(f.bot.botId, 'owner', request)).rejects.toThrow(/授权/)
+  f.bot.workerAccessMode = 'full-access'
+  const run = f.store.runs()[0]; f.store.saveRun({ ...run, state: 'unknown' })
+  await expect(f.service.control(f.bot.botId, 'owner', request)).rejects.toThrow(/核对/)
+  f.store.saveRun({ ...run, state: 'exited' })
+  f.store.saveOperation({ id: 'pending-old', botId: f.bot.botId, taskId: task.id, runId: run.id, callId: 'old-op', tool: 'edit_file', arguments: {}, operation: 'edit', policyRevision: 1, state: 'approved', createdAt: Date.now() })
+  await expect(f.service.control(f.bot.botId, 'owner', request)).rejects.toThrow(/核对|结束/)
+  expect(f.store.task(task.id)?.mandate.policyRevision).toBe(1)
+  expect(f.started()).toBe(1)
+})
+
+test('只改权限版本但目录未变，继续不能自动更新旧授权', async () => {
+  const f = fixture([start], { fullAccess: true })
+  f.send(1, '写报告'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  await f.service.control(f.bot.botId, 'owner', { action: 'stop', taskId: task.id, expectedRevision: 1, requestId: 'stop' })
+  f.bot.policyRevision++
+  await expect(f.service.control(f.bot.botId, 'owner', { action: 'resume', taskId: task.id, expectedRevision: 1, requestId: 'resume' })).rejects.toThrow(/授权/)
+  expect(f.started()).toBe(1)
+})
+
+for (const viaChat of [false, true]) test(`具体目录申请${viaChat ? '口头同意' : '卡片确认'}后自动换目录并继续，重复确认不重复派工`, async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { fullAccess: true, directoryApproval: true })
+  const next = join(f.dir, 'expanded'); mkdirSync(next)
+  f.send(1, '修改后端'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  await f.workerCall('work_ask_user', { text: '需要在后端修改文件，请确认新目录', directory: next })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  const question = f.store.task(task.id)!.question!
+  expect(question.directoryChange).toEqual({ fromDirectory: f.dir, toDirectory: next, policyRevision: 1 })
+  expect(f.bot.directory).toBe(f.dir)
+  expect(f.service.view(f.bot.botId, 'owner').capabilities.directoryApproval).toBe(true)
+  const request = { action: 'approve_directory' as const, taskId: task.id, expectedRevision: 1, questionId: question.id, requestId: 'approve-card' }
+  await expect(f.service.control(f.bot.botId, 'stranger', request)).rejects.toThrow(/owner/)
+  await expect(f.service.control(f.bot.botId, 'owner', { ...request, questionId: 'stale-question' })).rejects.toThrow(/问题/)
+  if (viaChat) {
+    decisions.push({ action: 'approve_directory', taskId: task.id, replyText: '已确认目录，继续。' })
+    const input = f.send(2, '同意，继续'); request.requestId = input.id
+  } else await f.service.control(f.bot.botId, 'owner', request)
+  await waitFor(() => f.started() === 2)
+  expect(f.bot.directory).toBe(next)
+  expect(f.store.task(task.id)).toMatchObject({ revision: 2, state: 'running', mandate: { directory: next, policyRevision: 2 } })
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+  expect(f.store.tasks()).toHaveLength(1)
+  await f.service.control(f.bot.botId, 'owner', request)
+  expect(f.started()).toBe(2)
+})
+
+test('目录申请只允许阻塞问题；撤回与过期确认都不能修改目录', async () => {
+  const f = fixture([start], { fullAccess: true, directoryApproval: true })
+  f.send(1, '修改后端'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]; const next = join(f.dir, 'new'); mkdirSync(next)
+  await expect(f.workerCall('work_ask_user', { text: '换目录', directory: next, blocks: false })).rejects.toThrow(/阻塞/)
+  await expect(f.workerCall('work_ask_user', { text: '换目录', directory: '/elsewhere' })).rejects.toThrow(/范围/)
+  await f.workerCall('work_ask_user', { text: '换目录', directory: next })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  const question = f.store.task(task.id)!.question!
+  f.bot.policyRevision++
+  await expect(f.service.control(f.bot.botId, 'owner', { action: 'approve_directory', taskId: task.id, expectedRevision: 1, questionId: question.id, requestId: 'old-approval' })).rejects.toThrow(/版本|失效/)
+  expect(f.bot.directory).toBe(f.dir)
+  expect(f.started()).toBe(1)
+})
+
+test('目录确认等待旧 Worker 退出时，主人停止会取消在途确认', async () => {
+  const closing = gate()
+  const f = fixture([start], { fullAccess: true, directoryApproval: true, firstWorkerCloseGate: closing })
+  f.send(1, '修改后端'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]; const next = join(f.dir, 'new'); mkdirSync(next)
+  await f.workerCall('work_ask_user', { text: '换目录', directory: next }); f.complete()
+  await waitFor(() => f.workerCloses() === 1)
+  const question = f.store.task(task.id)!.question!
+  const approving = f.service.control(f.bot.botId, 'owner', { action: 'approve_directory', taskId: task.id, expectedRevision: 1, questionId: question.id, requestId: 'approve' })
+  const outcome = approving.then(() => undefined, error => error as Error)
+  await waitFor(() => f.store.task(task.id)?.state === 'stopping')
+  const stopping = f.service.control(f.bot.botId, 'owner', { action: 'stop', taskId: task.id, expectedRevision: 1, requestId: 'cancel-approval' })
+  closing.release(); await stopping
+  expect((await outcome)?.message).toMatch(/取消|停止/)
+  expect(f.bot.directory).toBe(f.dir)
+  expect(f.store.task(task.id)?.state).toBe('stopped')
+  expect(f.started()).toBe(1)
+})
+
+test('其他工单的未知操作未核对时，不可通过目录确认绕过', async () => {
+  const f = fixture([start], { fullAccess: true, directoryApproval: true })
+  f.send(1, '修改后端'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]; const next = join(f.dir, 'new'); mkdirSync(next)
+  await f.workerCall('work_ask_user', { text: '换目录', directory: next }); f.complete()
+  await waitFor(() => f.workerCloses() === 1)
+  f.store.saveOperation({ id: 'other-unknown', botId: f.bot.botId, taskId: 'older-task', runId: 'older-run', callId: 'old-call', tool: 'edit_file', arguments: {}, operation: 'edit', policyRevision: 1, state: 'unknown', createdAt: 1 })
+  await expect(f.service.control(f.bot.botId, 'owner', { action: 'approve_directory', taskId: task.id, expectedRevision: 1, questionId: f.store.task(task.id)!.question!.id, requestId: 'approve' })).rejects.toThrow(/核对/)
+  expect(f.bot.directory).toBe(f.dir)
+})
+
+test('换目录的新 Session 保留已处理补充和整批确认中的新限制', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { fullAccess: true, directoryApproval: true })
+  f.send(1, '修改后端'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]
+  decisions.push({ action: 'append', taskId: task.id, replyText: '记下了。' })
+  f.send(2, '不得删除任何现有文件')
+  await waitFor(() => f.store.inputs(task.id).length === 1)
+  const prior = f.store.inputs(task.id)[0]
+  await f.workerCall('work_consume_input', { inputId: prior.id })
+  await f.workerCall('work_report', { summary: '已定位修改位置', resolutions: [{ inputId: prior.id, resolution: '已核对要求' }] })
+  const next = join(f.dir, 'new'); mkdirSync(next)
+  await f.workerCall('work_ask_user', { text: '需要换目录', directory: next }); f.complete()
+  await waitFor(() => f.workerCloses() === 1)
+  decisions.push({ action: 'approve_directory', taskId: task.id, replyText: '按你确认的范围继续。' })
+  f.send(3, '只修改 service.ts，不许改 store.ts')
+  f.send(4, '同意目录，继续吧')
+  await waitFor(() => f.started() === 2)
+  const payload = JSON.parse(f.workerPayloads[1])
+  expect(payload.directoryContinuation.confirmationText).toContain('不许改 store.ts')
+  expect(payload.directoryContinuation.previousInputs).toContainEqual(expect.objectContaining({ text: '不得删除任何现有文件' }))
+  expect(payload.pendingInputs).toContainEqual(expect.objectContaining({ text: '只修改 service.ts，不许改 store.ts\n同意目录，继续吧' }))
+  expect(f.store.inputs(task.id)).toHaveLength(2)
+})
+
+test('撤回等待中的口头确认，不能先改目录再发现原话失效', async () => {
+  const closing = gate()
+  const f = fixture([start], { fullAccess: true, directoryApproval: true, firstWorkerCloseGate: closing })
+  f.send(1, '修改后端'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]; const next = join(f.dir, 'new'); mkdirSync(next)
+  await f.workerCall('work_ask_user', { text: '换目录', directory: next }); f.complete()
+  await waitFor(() => f.workerCloses() === 1)
+  const input = f.store.receive({ botId: f.bot.botId, groupId: 'dm', senderId: 'owner', memberId: 'member-owner', seq: 2, text: '同意，继续', createdAt: Date.now() })
+  const outcome = f.service.control(f.bot.botId, 'owner', { action: 'approve_directory', taskId: task.id, expectedRevision: 1, questionId: f.store.task(task.id)!.question!.id, requestId: input.id }, [input.id]).then(() => undefined, error => error as Error)
+  await waitFor(() => f.store.task(task.id)?.state === 'stopping')
+  f.store.revokeInbox(input.id, Date.now()); closing.release()
+  expect((await outcome)?.message).toMatch(/失效/)
+  expect(f.bot.directory).toBe(f.dir)
+  expect(f.started()).toBe(1)
+})
+
+test('等待目录确认时新聊天指令保留并使在途确认失效', async () => {
+  const closing = gate()
+  const f = fixture([start], { fullAccess: true, directoryApproval: true, firstWorkerCloseGate: closing })
+  f.send(1, '修改后端'); await waitFor(() => f.started() === 1)
+  const task = f.store.tasks()[0]; const next = join(f.dir, 'new'); mkdirSync(next)
+  await f.workerCall('work_ask_user', { text: '换目录', directory: next }); f.complete()
+  await waitFor(() => f.workerCloses() === 1)
+  const outcome = f.service.control(f.bot.botId, 'owner', { action: 'approve_directory', taskId: task.id, expectedRevision: 1, questionId: f.store.task(task.id)!.question!.id, requestId: 'approve' }).then(() => undefined, error => error as Error)
+  await waitFor(() => f.store.task(task.id)?.state === 'stopping')
+  const changedMind = f.send(2, '先别改目录，停下来')
+  expect(f.store.inbox(changedMind.id)?.state).toBe('pending')
+  closing.release()
+  expect((await outcome)?.message).toMatch(/取消/)
+  expect(f.bot.directory).toBe(f.dir)
 })
 
 test('Worker 在 startTurn 返回前完成，仍保存真实 Session 来源和 turnId', async () => {
