@@ -85,3 +85,16 @@ test('回答必要问题或专业追问也能明确选择历史附件并要求�
     expect(bind(request)).toMatchObject({ action, delivery: 'files', sourceInputIds: ['older-upload'], expectedRevision: 2 })
   }
 })
+
+
+test('执行约束作为任务参数传递，返工意见与版本由宿主绑定', () => {
+  const snapshot = {...bindings(), workerReplyId:'source', workerSource:{worker:true,files:false}}
+  expect(bind(call({action:'revise',taskId:'t1',feedback:'原需求缺少局限分析',executionGuidance:'保留原始引用'}),snapshot)).toMatchObject({action:'revise',taskId:'t1',expectedRevision:2,workerReplyId:'source',executionGuidance:'保留原始引用',feedback:'原需求缺少局限分析'})
+  for (const action of ['append','ask_worker','answer']) expect(bind(call({action,taskId:'t1',executionGuidance:'本次结论保留原始引用'})).executionGuidance).toBe('本次结论保留原始引用')
+  expect(()=>bind(call({action:'append',taskId:'t1',executionGuidance:'字'.repeat(4001)}))).toThrow()
+})
+
+test('Router验收文字结果时能看到Worker实际检查记录', () => {
+  const context=JSON.parse(router.routerContext({bot,profile:'',messages:[],cases:[],tasks:[],experienceSummaries:[],workerMessage:{id:'source',key:'result',botId:'b',groupId:'dm',author:'worker',purpose:'result',text:'完成',checks:['实际执行了单元测试'],policyRevision:3,state:'pending',createdAt:1}}))
+  expect(context.workerMessage.checks).toEqual(['实际执行了单元测试'])
+})

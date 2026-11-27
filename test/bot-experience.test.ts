@@ -74,12 +74,12 @@ function fixture() {
 }
 const start = (object: string, goal: string) => ({ action: 'start', newCase: { title: object, object, goal }, goal, replyText: '我先看一下。' })
 
-test('Worker 交付后自动落一条经验；进过摘要就算用过一次；主人说不对就作废', async () => {
+test('Worker 交付经Router验收后自动落一条经验；进过摘要就算用过一次；主人说不对就作废', async () => {
   const f = fixture()
   f.decisions.push(start('报表 评分差异', '定位新旧环境评分差异'))
   f.send(1, '报表 新环境评分对不上，帮我定位'); await waitFor(() => f.started() === 1)
   await f.workerCall('work_finish', { revision: 1, text: '先比对 lua 脚本前后的意图。', artifactIds: [], checks: ['已比对两份日志'] })
-  expect(f.store.experiences('b')).toHaveLength(1)
+  await waitFor(() => f.store.experiences('b').length === 1)
   expect(f.store.experiences('b')[0]).toMatchObject({ object: '报表 评分差异', goal: '定位新旧环境评分差异', approach: '先比对 lua 脚本前后的意图', verified: true, uses: 0, state: 'active' })
   f.complete()
   await waitFor(() => f.store.replies('b').some(r => r.author === 'router' && r.purpose === 'result' && r.state === 'sent'))

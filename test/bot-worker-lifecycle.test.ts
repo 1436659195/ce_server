@@ -20,6 +20,7 @@ function gate() {
   return { promise, release }
 }
 interface FixtureOptions {
+  workerResultDecisions?: Array<Record<string, unknown>>
   finishBeforeTurnReturn?: boolean
   fullAccess?: boolean
   accessDelayMs?: number
@@ -77,7 +78,7 @@ function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: Fixt
         startTurn: async (_threadId, text) => {
           if (role === 'router') {
             const context = JSON.parse(text)
-            const decision = context.currentMessages.length ? decisions.shift() : { action: 'reply', replies: [context.workerMessage.text] }
+            const decision = context.currentMessages.length ? decisions.shift() : options.workerResultDecisions?.shift() ?? { action: 'reply', replies: [context.workerMessage.text] }
             const call = (tool: string, args: Record<string, unknown> = {}) => opts.onToolCall({ threadId, turnId: 'turn-router', callId: `router-${++calls}`, tool, arguments: args })
             const done = Promise.resolve().then(async () => {
               if (context.currentMessages.length) await options.routerReads?.(call)
@@ -417,7 +418,7 @@ test('配置变化只换 Session，同卷宗旧成果仍可读取且不能读取
   const file = join(f.dir, 'snapshot.txt'); writeFileSync(file, bytes)
   const artifact = { id: 'prior-result', botId: f.bot.botId, caseId: first.caseId, taskId: first.id, title: '旧成果', name: 'report.txt', mime: 'text/plain', path: file, size: bytes.length, hash: createHash('sha256').update(bytes).digest('hex'), revision: 1, createdAt: Date.now() }
   f.store.saveArtifact(artifact)
-  await f.workerCall('work_finish', { revision: first.revision, text: '材料已整理', artifactIds: [artifact.id], checks: ['核对'] })
+  await f.workerCall('work_finish', { revision: first.revision, text: '材料已整理', artifactIds: [artifact.id], artifactSummaries: [{ artifactId: artifact.id, summary: '材料原文', requirements: ['保留材料'], checks: ['核对'], limitations: [] }], checks: ['核对'] })
   f.complete(); await waitFor(() => f.workerCloses() === 1)
   f.store.saveSettings({ ...f.store.settings(f.bot.botId), model: 'changed-model' })
   f.store.saveArtifact({ ...artifact, id: 'foreign-result', caseId: 'other-case' })
@@ -509,7 +510,7 @@ test('项目导出生成真实成果快照，finish 不得省略已经准备好�
   expect(poll.result).not.toContain(Buffer.from('<h1>实际报告</h1>').toString('base64'))
   const task = f.store.tasks()[0]
   await expect(f.workerCall('work_finish', { revision: task.revision, text: '报告写好了。', artifactIds: [], checks: ['读取核对'] })).rejects.toThrow('附件')
-  await f.workerCall('work_finish', { revision: task.revision, text: '报告在附件里。', artifactIds: [artifact.artifactId], checks: ['读取核对'] })
+  await f.workerCall('work_finish', { revision: task.revision, text: '报告在附件里。', artifactIds: [artifact.artifactId], artifactSummaries: [{ artifactId: artifact.artifactId, summary: '报告文件', requirements: ['分析材料'], checks: ['读取核对'], limitations: [] }], checks: ['读取核对'] })
   expect(f.service.replyAttachments(f.store.replies(f.bot.botId).find(r => r.purpose === 'result')!)).toMatchObject([{ kind: 'artifact', name: 'report.html' }])
 })
 
@@ -550,7 +551,7 @@ test('前台能按文件名找回超出最近窗口的纯附件消息', async ()
   })
   f.send(25, '请再找找我以前发的材料')
   await waitFor(() => found !== undefined)
-  expect(found).toMatchObject([{ text: '', attachments: [{ name: 'brief.txt' }] }])
+  expect(found).toMatchObject({ messages: [{ text: '', attachments: [{ name: 'brief.txt' }] }] })
 })
 
 test('闲聊无工单；原消息重放不再次运行 Router 或发回复', async () => {
@@ -1043,4 +1044,62 @@ test('case_search长摘要裁页后按实际返回条数继续，不跳过候选
   f.send(1, '找旧卷宗'); await waitFor(() => f.sent.length === 1)
   expect(ids).toHaveLength(7)
   expect(new Set(ids).size).toBe(7)
+})
+
+
+test('Router验收返工复用原卷宗会话，旧Worker退出后才启动修正且执行指导完整', async () => {
+  const resultDecisions: Array<Record<string, unknown>> = []
+  const f = fixture([{...start, executionGuidance:'报告保留原文引用，不省略必要条件'}], {workerResultDecisions:resultDecisions})
+  f.send(1,'写报告，保留原文引用'); await waitFor(()=>f.started()===1)
+  const task=f.store.tasks()[0]
+  expect(JSON.parse(f.workerPayloads[0]).task.executionGuidance).toBe('报告保留原文引用，不省略必要条件')
+  resultDecisions.push({action:'revise',taskId:task.id,feedback:'缺少局限分析，按原目标补全',executionGuidance:'保留原文引用，说明未核实部分',replies:[]})
+  await f.workerCall('work_finish',{revision:1,text:'初稿完成',artifactIds:[],checks:['核对结构']})
+  await waitFor(()=>f.store.task(task.id)?.state==='queued')
+  expect(f.started()).toBe(1)
+  expect(f.store.experiences(f.bot.botId)).toHaveLength(0)
+  expect(f.sent).not.toContain('初稿完成')
+  f.complete(); await waitFor(()=>f.started()===2)
+  expect(f.workerThreads.map(t=>t.method)).toEqual(['start','resume'])
+  expect(f.store.tasks()).toHaveLength(1)
+  const payload=JSON.parse(f.workerPayloads[1])
+  expect(payload.task).toMatchObject({id:task.id,caseId:task.caseId,revision:2,executionGuidance:'报告保留原文引用，不省略必要条件',mandate:task.mandate})
+  expect(payload.pendingInputs[0]).toMatchObject({kind:'correction',executionGuidance:'保留原文引用，说明未核实部分'})
+  const input=payload.pendingInputs[0]
+  await f.workerCall('work_consume_input',{inputId:input.id})
+  await f.workerCall('work_report',{summary:'已补全局限',resolutions:[{inputId:input.id,resolution:'已补全局限并保留引用'}]})
+  await f.workerCall('work_finish',{revision:2,text:'修正报告完成',artifactIds:[],checks:['核对引用及局限']})
+  f.complete(); await waitFor(()=>f.store.task(task.id)?.review?.state==='approved')
+  expect(f.store.task(task.id)?.review).toEqual({state:'approved',rounds:1})
+  await waitFor(()=>f.sent.includes('修正报告完成'))
+  expect(f.sent).not.toContain('初稿完成')
+  expect(f.store.experiences(f.bot.botId)).toMatchObject([{detail:'修正报告完成',checks:['核对引用及局限']}])
+})
+
+test('切换模式或权限时停止待验收任务，避免永久核对中', async () => {
+  let taskId=''
+  const f=fixture([], {seed:(store,bot)=>{
+    const task=seedTask(store,bot); taskId=task.id
+    store.updateTask(task.id,{state:'running'})
+    store.finishTask(task.id,1,'待验收',[])
+  }})
+  await f.service.policyChanged(f.bot.botId)
+  expect(f.store.task(taskId)).toMatchObject({state:'stopped'})
+  expect(f.store.pendingReplies(f.bot.botId)).toHaveLength(0)
+  expect(f.started()).toBe(0)
+})
+
+test('已消费补充的执行约束在停止后恢复仍交给Worker，不依赖旧会话记忆', async () => {
+  const decisions:Array<Record<string,unknown>>=[start]
+  const f=fixture(decisions); f.send(1,'写报告'); await waitFor(()=>f.started()===1)
+  const task=f.store.tasks()[0]
+  decisions.push({action:'append',taskId:task.id,replies:[],executionGuidance:'报告必须保留原文引用'})
+  f.send(2,'保留原文引用'); await waitFor(()=>f.store.inputs(task.id).length===1)
+  const input=f.store.inputs(task.id)[0]
+  await f.workerCall('work_consume_input',{inputId:input.id})
+  await f.workerCall('work_report',{summary:'已补引用',resolutions:[{inputId:input.id,resolution:'引用已保留'}]})
+  await f.service.control(f.bot.botId,'owner',{action:'stop',taskId:task.id,expectedRevision:2,requestId:'stop-guidance'})
+  await f.service.control(f.bot.botId,'owner',{action:'resume',taskId:task.id,expectedRevision:2,requestId:'resume-guidance'})
+  await waitFor(()=>f.started()===2)
+  expect(JSON.parse(f.workerPayloads[1]).executionGuidanceHistory).toEqual([{inputId:input.id,revision:2,kind:'append',executionGuidance:'报告必须保留原文引用'}])
 })

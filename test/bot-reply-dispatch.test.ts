@@ -7,6 +7,7 @@ import { BotRuntimeService } from '../src/cli/bot-runtime/service'
 import { silentMemoryClient } from './helpers/model-client'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
 import type { RuntimeBot, RuntimeReply } from '../src/cli/bot-runtime/types'
+import type { ChatHistoryPage } from '../src/cli/bot-runtime/history'
 
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
@@ -29,7 +30,8 @@ function fixture(send?: (reply: RuntimeReply) => Promise<void>, inspectHistory?:
       return { initialize: async () => {}, startThread: async () => 'router-thread', resumeThread: async id => id,
         startTurn: async (threadId, text) => ({ threadId, turnId: 'router-turn', done: Promise.resolve().then(async () => {
           const call = (tool: string, args: Record<string, unknown>) => options.onToolCall({ threadId, turnId: 'router-turn', callId: tool, tool, arguments: args })
-          inspectHistory(JSON.parse(text), await call('chat_recent', { limit: 20 }))
+          const history=await call('chat_recent', { limit: 20, order: 'asc' }) as ChatHistoryPage
+          inspectHistory(JSON.parse(text), history.messages)
           await call('router_decide', routerCall({ action: 'reply', replyText: '刚才的聊天我看到了。' }))
           return { id: 'router-turn', status: 'completed' }
         }) }), steer: async () => '', interrupt: async () => {}, close: async () => {},
@@ -47,6 +49,11 @@ function fixture(send?: (reply: RuntimeReply) => Promise<void>, inspectHistory?:
   }
   // 本文件验证发送调度；Worker输入先模拟已通过Router整理。模型入口另有独立集成测试。
   const enqueue = (text: string, extra: Partial<RuntimeReply> = {}) => {
+    const sourceTask=extra.taskId ? store.task(extra.taskId) : undefined
+    if(extra.author==='worker' && sourceTask) {
+      extra={...extra,taskRevision:extra.taskRevision??sourceTask.revision}
+      if(extra.purpose==='result') store.updateTask(sourceTask.id,{state:'completed',review:{state:'pending',rounds:sourceTask.review?.rounds??0}})
+    }
     const reply = store.reply({ botId: bot.botId, groupId: bot.groupId, author: 'router', purpose: 'chat', text, policyRevision: 1, key: text, ...extra, ...(extra.purpose === 'question' ? { questionId: extra.questionId ?? extra.key } : {}) })
     if (reply.author === 'router') return reply
     store.presentWorkerReply(bot.botId, reply.id, [text], '')

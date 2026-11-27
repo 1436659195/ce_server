@@ -38,7 +38,10 @@ function fixture() {
   const origin = store.receive({ botId: 'b', groupId: 'dm', seq: ++seq, text: '示例引擎是什么', senderId: 'owner', memberId: 'om', createdAt: Date.now() })
   const task = store.acceptWork({ inputId: origin.id, newCase: { title: '产品关系', object: '示例引擎', goal: '理解产品' }, goal: origin.text, acceptance: [], replies: [], mandate: { ownerPhoneId: 'owner', policyRevision: 1, directory: dir, allowedOps: ['read'], exclusions: [], mode: 'execute' } })
   store.updateTask(task.id, { state: 'running' })
-  const output = (text = '示例引擎是语义引擎。', extra: Partial<RuntimeReply> = {}) => store.reply({ botId: 'b', groupId: 'dm', author: 'worker', purpose: 'answer', text, policyRevision: 1, inputId: origin.id, taskId: task.id, taskRevision: 1, key: crypto.randomUUID(), ...extra })
+  const output = (text = '示例引擎是语义引擎。', extra: Partial<RuntimeReply> = {}) => {
+    if(extra.purpose==='result') store.updateTask(task.id,{state:'completed',review:{state:'pending',rounds:store.task(task.id)?.review?.rounds??0}})
+    return store.reply({ botId: 'b', groupId: 'dm', author: 'worker', purpose: 'answer', text, policyRevision: 1, inputId: origin.id, taskId: task.id, taskRevision: store.task(task.id)!.revision, key: crypto.randomUUID(), ...extra })
+  }
   cleanups.push(async () => { await service.close(); store.close(); rmSync(dir, { recursive: true, force: true }) })
   return { store, service, bot, task, sent, turns, send, output }
 }

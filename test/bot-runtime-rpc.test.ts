@@ -86,6 +86,17 @@ test('Router 整理后的成果引用与正文一起加密发送，不把本地�
   expect(JSON.stringify(f.posted)).not.toContain(content)
 })
 
+test('Router 的显式 Markdown 格式随正文一起进入群消息密文', async () => {
+  const f = await fixture()
+  await f.chat.botRuntimeUpdate('Test', 'owner', 0, { mode: 'router-worker' })
+  const bot = f.chat.runtimeBot('Test')
+  const source = f.store.reply({ botId: bot.botId, groupId: bot.groupId, author: 'worker', purpose: 'answer', text: '结果正常。', key: 'format-source', policyRevision: bot.policyRevision })
+  f.store.presentWorkerReply(bot.botId, source.id, ['结果正常。'], '')
+  const reply = f.store.pendingReplies(bot.botId)[0]
+  await f.chat.sendRuntimeReply({ ...reply, format: 'markdown' })
+  expect(f.posted[0]).toMatchObject({ kind: 'text', text: '结果正常。', format: 'markdown' })
+})
+
 const memory = (p: { id: string; botId: string; prompt: string; source: { inboxId: string; quote: string } }): RuntimeMemory =>
   ({ channel: 'dm', senderId: 'owner', tier: 'long', status: 'active', triggers: { count: 1 }, createdAt: 1, updatedAt: 1, id: p.id, botId: p.botId, prompt: p.prompt, source: { ...p.source, context: '', sentAt: 1 } })
 

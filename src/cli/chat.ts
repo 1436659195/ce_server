@@ -302,7 +302,7 @@ export class ChatHub {
     if (!sync.ok) throw new Error(sync.error ?? '读取私聊失败')
     assertCurrent()
     const attachments = this.runtime!.replyAttachments(reply)
-    const body = { groupId: bot.groupId, text: reply.text, ...(attachments.length ? { attachments } : {}), opKey: `runtime_${reply.id}` }
+    const body = { groupId: bot.groupId, text: reply.text, format: reply.format ?? 'plain', ...(attachments.length ? { attachments } : {}), opKey: `runtime_${reply.id}` }
     let result = await this.opSend(bot.name, rec, body)
     if (!result.ok && result.error?.includes('new_messages')) { assertCurrent(); result = await this.opSend(bot.name, rec, body) }
     if (!result.ok) throw new Error(result.error ?? '回复发送失败')
@@ -1558,9 +1558,10 @@ export class ChatHub {
     const key = this.keyOf(gid)
     if (!key) return { ok: false, error: '群钥未下发:等手机端分发(成员刚加入会有一次延迟)' }
     const mentions = Array.isArray(body.mentions) ? (body.mentions as string[]).map(String) : undefined
+    const format = body.format === 'markdown' || body.format === 'plain' ? body.format : undefined
     const r = await this.rpc('group-post', gid, {
       // ct 走 base64(协议:字符串;裸 Uint8Array 经 JSON.stringify 会变对象 —— L2 管道测试抓的断层)
-      ct: Buffer.from(seal(key, new TextEncoder().encode(JSON.stringify({ kind: body.system === true ? 'system' : 'text', text, ...(attachments?.length ? { attachments } : {}) } satisfies GroupPlaintext)))).toString('base64'),
+      ct: Buffer.from(seal(key, new TextEncoder().encode(JSON.stringify({ kind: body.system === true ? 'system' : 'text', text, ...(format ? { format } : {}), ...(attachments?.length ? { attachments } : {}) } satisfies GroupPlaintext)))).toString('base64'),
       opKey: typeof body.opKey === 'string' ? body.opKey : 'ok_' + randomBytes(6).toString('hex'),
       replyTo: typeof body.replyTo === 'number' ? body.replyTo : undefined,
       mentions,

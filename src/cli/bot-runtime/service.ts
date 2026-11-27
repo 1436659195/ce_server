@@ -14,8 +14,12 @@ import { RemoteShellPool, type RemoteChannel, type RemoteRunResult } from './rem
 import type { RemoteTicket } from '../remote-peer'
 import type { RuntimeRemoteOp } from './types'
 import { BotRuntimeStore } from './store'
+import { AutomationScheduler } from './automation/scheduler'
+import { AUTOMATION_LIMITS, ACTIVE_OCCURRENCE_STATES, type AutomationJob, type AutomationSource, type RuntimeAutomationTrigger } from './automation/types'
+import { parseAutomationArgs, automationSummary } from './automation/tool'
+import type { collectHostMetric } from './automation/collectors'
 import { FULL_ACCESS_OPERATIONS, workerExecutionPolicy, type WorkerAccessMode } from './worker-policy'
-import type { RuntimeArtifact, RuntimeAttachment, RuntimeBot, RuntimeInbox, RuntimeMemory, RuntimeMemoryControl, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUploadRequest, RuntimeView } from './types'
+import type { RuntimeArtifact, RuntimeArtifactSummaryInput, RuntimeAttachment, RuntimeBot, RuntimeInbox, RuntimeMemory, RuntimeMemoryControl, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUploadRequest, RuntimeView } from './types'
 
 type Authorization = { directory: string; permissions: BotPermissions; revision: number }
 export interface RuntimeClientOptions { cwd: string; accessMode?: WorkerAccessMode; model?: string; effort?: 'low' | 'medium' | 'high'; onToolCall: (call: CodexToolCall) => Promise<unknown> }
@@ -29,6 +33,8 @@ export interface RuntimeClient {
   close(): Promise<void>
 }
 interface Options {
+  automationNow?: () => number
+  collectMetric?: typeof collectHostMetric
   store: BotRuntimeStore
   rootDir: string
   claudeExecutable?: string
@@ -60,7 +66,7 @@ interface Options {
 }
 interface RouterSession {
   client: RuntimeClient; fingerprint: string; threadId?: string; turns: number; contextChars: number
-  active?: { handler: RuntimeClientOptions['onToolCall']; turn?: Promise<CodexActiveTurn>; inputIds: string[]; workerReplyId?: string; superseded: boolean; committed: boolean }
+  active?: { handler: RuntimeClientOptions['onToolCall']; turn?: Promise<CodexActiveTurn>; inputIds: string[]; workerReplyId?: string; automationOccurrenceId?: string; superseded: boolean; committed: boolean }
   idleTimer?: ReturnType<typeof setTimeout>; closing?: Promise<void>
 }
 export const ROUTER_IDLE_MS = 60_000
@@ -98,7 +104,7 @@ export const WORKER_TOOLS: CodexToolSpec[] = [
   tool('work_reply', '向Router提交明确追问的事实答案，最多4000字符；由Router对外表达。', { replyToInputId: scalar, text: scalar }, ['replyToInputId', 'text']),
   tool('work_ask_user', '提交必须由用户决定的具体问题给Router。默认阻塞：之后结束本轮等待 owner 回答。blocks=false 表示不阻塞：问题照常提出，你继续当前工作，一轮最多一次。', { text: scalar, options: array, blocks: { type: 'boolean' }, directory: { type: 'string', description: '需要修改目录外文件时，申请的目标工作目录绝对路径；必须阻塞并等待 owner 确认' } }, ['text']),
   tool('work_publish_artifact', '将已成功 read_file 的结果存为可交付文件快照。', { operationId: scalar, title: scalar, mime: { type: 'string', enum: ['text/plain', 'text/markdown', 'text/html', 'application/json'] } }, ['operationId', 'title', 'mime']),
-  tool('work_finish', '按当前需求版本向Router提交结果和实际附件，确认所有输入与工具已处理后结束本轮。', { revision: { type: 'integer' }, text: scalar, artifactIds: array, checks: array }, ['revision', 'text', 'artifactIds', 'checks']),
+  tool('work_finish', '按当前需求版本向Router提交结果和实际附件，确认所有输入与工具已处理后结束本轮。', { revision: { type: 'integer' }, text: scalar, artifactIds: array, checks: array, artifactSummaries: { type: 'array', maxItems: 4, items: { type: 'object', properties: { artifactId: scalar, summary: scalar, requirements: array, checks: array, limitations: array }, required: ['artifactId','summary','requirements','checks','limitations'], additionalProperties: false } } }, ['revision', 'text', 'artifactIds', 'checks']),
 ]
 
 /** 文件处理由原生工具完成；宿主工具只承担工单通信、附件读取和交付。 */
@@ -117,6 +123,7 @@ const REMOTE_TOOL_NAMES = new Set(REMOTE_WORKER_TOOLS.map(t => t.name))
 
 /** 一个本地宿主，两条独立 Agent 通道；网络发送、派工、模型生成互不阻塞。 */
 export class BotRuntimeService {
+  readonly automations: AutomationScheduler
   readonly store: BotRuntimeStore
   readonly files: BotAttachmentFiles
   private routeTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -148,6 +155,9 @@ export class BotRuntimeService {
     this.store.markRemoteOpsUnknown('__all__', '宿主重启，远程命令结果未知')
     for (const input of this.store.runningMemoryJobs()) this.store.setMemoryJob(input.id, { state: 'failed', scheduledAt: input.memoryJob!.scheduledAt, finishedAt: Date.now(), error: '宿主重启，记忆整理未自动重跑' })
     this.remoteShell = this.opts.createRemoteChannel ? new RemoteShellPool({ connect: ticket => this.opts.createRemoteChannel!(ticket) }) : new RemoteShellPool()
+    this.automations = new AutomationScheduler({ store: this.store.automations, now: opts.automationNow, collect: opts.collectMetric,
+      authorized: job => this.automationAuthorized(job), available: botId => !this.stopped && !this.quiescing.has(botId) && this.enabled(botId), onWake: botId => { void this.route(botId) } })
+    this.automations.recover()
     this.timer = setInterval(() => this.tick(), this.opts.tickMs ?? 2000); this.timer.unref?.()
   }
   private readonly remoteShell: RemoteShellPool
@@ -294,8 +304,130 @@ export class BotRuntimeService {
     }
     void this.route(message.botId)
   }
+  private automationAuthorized(job: AutomationJob): boolean {
+    try {
+      if (job.expiresAt !== undefined && job.expiresAt <= (this.opts.automationNow ?? Date.now)()) return false
+      const bot = this.opts.getBot(job.botId); const source = job.source
+      return bot.ownerPhoneId === source.ownerId && bot.groupId === source.groupId && bot.directory === source.mandate.directory && bot.policyRevision === source.mandate.policyRevision
+        && source.inputIds.length > 0 && source.inputIds.every(id => { const m = this.store.inbox(id); return !!m && !m.revokedAt && m.botId === bot.botId && m.groupId === bot.groupId && m.senderId === bot.ownerPhoneId })
+    } catch { return false }
+  }
+  /** Same entry used by the host tick and deterministic clock tests. No synthetic user messages. */
+  async pollAutomations(): Promise<void> {
+    if (this.stopped) return
+    await this.cancelInvalidAutomationWork()
+    if (this.stopped) return
+    await this.automations.tick()
+    if (this.stopped) return
+    await this.cancelInvalidAutomationWork()
+    if (this.stopped) return
+    const now = (this.opts.automationNow ?? Date.now)()
+    for (const job of this.store.automations.jobs(undefined, 'enabled')) {
+      for (const r of this.store.automations.active(job.botId, job.id)) {
+        const task = r.taskId ? this.store.task(r.taskId) : undefined
+        if (!ACTIVE_OCCURRENCE_STATES.includes(r.state)) continue
+        if (r.state === 'working' && task?.state === 'completed' && task.review?.state === 'approved') this.store.automations.transition(r.id, 'delivery_pending', now)
+        const deliveryPending = this.store.automations.occurrence(r.id)?.state === 'delivery_pending'
+        // A failed network delivery retries the same outbox ID independently of execution time.
+        if (!deliveryPending && now - r.createdAt > job.timeoutMs) {
+          this.automations.fail(r.id, '事件执行时间预算已用尽，未自动重复执行')
+          if (task && ['queued', 'running', 'waiting_user'].includes(task.state)) await this.stopTask(job.botId, task.id, '事件执行时间预算已用尽')
+          continue
+        }
+        if (task && ['failed', 'recovering'].includes(task.state)) { this.automations.fail(r.id, task.error ?? '执行结果需要核对'); continue }
+        if (task?.state === 'stopped') { this.store.automations.transition(r.id, 'cancelled', now, { error: '本次任务已停止，下次周期不变' }); continue }
+        const current = this.store.automations.occurrence(r.id)!
+        if (current.state === 'delivery_pending') {
+          const replies = this.store.replies(job.botId).filter(reply => reply.automationOccurrenceId === r.id && reply.author === 'router')
+          if (!replies.some(reply => reply.state === 'pending')) this.automations.complete(r.id)
+        }
+      }
+      if (job.status === 'enabled' && job.schedule.kind === 'event') {
+        const task = this.store.task(job.schedule.taskId)
+        if (task?.botId === job.botId && task.state === 'completed' && task.review?.state === 'approved') this.automations.publishTaskCompleted(job.botId, task.id, `${task.id}:${task.revision}`, `工单「${task.goal}」已完成并通过验收：${task.summary.slice(0, 1000)}`)
+      }
+    }
+    for (const botId of this.store.enabledBots()) if (this.automations.hasReady(botId)) void this.route(botId)
+  }
+  /** Fence invalid sources BEFORE any unrelated collector I/O; start all interrupts immediately. */
+  private async cancelInvalidAutomationWork(): Promise<void> {
+    const now = (this.opts.automationNow ?? Date.now)()
+    for (const job of this.store.automations.jobs(undefined, 'enabled')) {
+      if (!this.automationAuthorized(job)) {
+        this.store.automations.setStatus(job.botId, job.id, job.revision, 'paused', now, '事件原委托已撤回、过期或权限发生变化')
+        this.automations.cancelCheck(job.id)
+      }
+    }
+    const stopping: Promise<void>[] = []
+    for (const botId of this.store.enabledBots()) for (const task of this.store.viewTasks(botId)) {
+      if (!task.automationOccurrenceId || !(['queued', 'running', 'waiting_user'].includes(task.state) || task.state === 'completed' && task.review?.state === 'pending')) continue
+      const r = this.store.automations.occurrence(task.automationOccurrenceId)
+      if (!r || !this.store.automations.current(r) || !this.automationAuthorized(this.store.automations.get(botId, r.jobId))) {
+        if (r) this.automations.cancelCheck(r.jobId)
+        stopping.push(this.stopTask(botId, task.id, '事件已取消或原委托失效'))
+      }
+    }
+    await Promise.all(stopping)
+  }
+  private automationSource(bot: RuntimeBot, messages: RuntimeInbox[], workerMessage?: RuntimeReply, trigger?: RuntimeAutomationTrigger): AutomationSource {
+    if (messages.length) {
+      const last = messages.at(-1)!; this.store.requireBatch(last.id, messages.map(m => m.id))
+      const task = last.targetTaskId ? this.store.task(last.targetTaskId) : undefined
+      return { botId: bot.botId, groupId: bot.groupId, ownerId: bot.ownerPhoneId, memberId: last.memberId, inputIds: messages.map(m => m.id), text: messages.map(m => m.text).join('\n').slice(0, 8000), createdAt: (this.opts.automationNow ?? Date.now)(), depth: 0,
+        caseId: task?.caseId, taskId: task?.id, mandate: { ownerPhoneId: bot.ownerPhoneId, directory: bot.directory, policyRevision: bot.policyRevision, allowedOps: bot.workerAccessMode === 'full-access' ? [...FULL_ACCESS_OPERATIONS] : FULL_ACCESS_OPERATIONS.filter(op => bot.permissions[op] !== 'deny'), exclusions: [], mode: 'execute' } }
+    }
+    const task = workerMessage?.taskId ? this.store.task(workerMessage.taskId) : undefined
+    const occurrence = task?.automationOccurrenceId ? this.store.automations.occurrence(task.automationOccurrenceId) : undefined
+    const parent = trigger?.job ?? (occurrence ? this.store.automations.get(bot.botId, occurrence.jobId) : undefined)
+    if (parent) return { ...structuredClone(parent.source), parentJobId: parent.id, depth: parent.source.depth + 1, caseId: task?.caseId ?? parent.source.caseId, taskId: task?.id ?? parent.source.taskId }
+    if (!task) throw new Error('没有可建立待办的真实委托')
+    const inputIds = task.originInputIds ?? [task.originInputId]
+    return { botId: bot.botId, groupId: bot.groupId, ownerId: bot.ownerPhoneId, memberId: task.requesterMemberId, inputIds, text: task.goal, createdAt: this.store.inbox(inputIds[0])?.createdAt ?? task.createdAt,
+      mandate: structuredClone(task.mandate), caseId: task.caseId, taskId: task.id, parentJobId: `task:${task.id}`, depth: 1 }
+  }
+  private async automationTool(bot: RuntimeBot, args: Record<string, unknown>, messages: RuntimeInbox[], workerMessage?: RuntimeReply, trigger?: RuntimeAutomationTrigger): Promise<unknown> {
+    const p = parseAutomationArgs(args); const now = (this.opts.automationNow ?? Date.now)()
+    const source = this.automationSource(bot, messages, workerMessage, trigger)
+    const self = trigger?.job.id ?? (workerMessage?.automationOccurrenceId ? this.store.automations.occurrence(workerMessage.automationOccurrenceId)?.jobId : undefined)
+    if (!messages.length && p.action !== 'create' && (!self || !['inspect', 'pause', 'remove'].includes(p.action) || p.jobId !== self)) throw new Error('自动执行轮仅可查看、暂停或删除自身事件；后续检查需另建有限的一次性待办')
+    if (p.action === 'create') {
+      const schedule = p.definition!.schedule as Record<string, unknown> | undefined
+      if (schedule?.kind === 'event') {
+        const task = this.store.task(String(schedule.taskId))
+        if (!task || task.botId !== bot.botId) throw new Error('监听工单不存在或归属不匹配')
+      }
+      const key = `${messages.length ? source.inputIds.join(':') : trigger?.occurrence.id ?? workerMessage?.id}:create:${p.slot}`
+      const job = this.store.automations.create(source, p.definition!, key, now)
+      return { saved: true, job: automationSummary(job) }
+    }
+    if (p.action === 'list') {
+      const page = this.store.automations.list(bot.botId, p)
+      return { ...page, jobs: page.jobs.map(automationSummary) }
+    }
+    const job = this.store.automations.get(bot.botId, p.jobId!)
+    if (p.action === 'inspect') {
+      const page = this.store.automations.history(bot.botId, job.id, p)
+      return { job: { ...automationSummary(job), payload: job.payload, schedule: job.schedule, condition: job.condition, state: job.state, checks: job.checks, failures: job.failures, timeoutMs: job.timeoutMs, expiresAt: job.expiresAt, maxRuns: job.maxRuns },
+        runs: page.runs.map(r => ({ id: r.id, state: r.state, scheduledAt: r.scheduledAt, taskId: r.taskId, message: r.message.slice(0, 200), error: r.error?.slice(0, 200) })), ...(page.nextOffset !== undefined ? { nextOffset: page.nextOffset } : {}) }
+    }
+    if (p.action === 'run') {
+      const r = await this.automations.run(bot.botId, job.id, `${source.inputIds.join(':')}:${job.id}`)
+      return { saved: true, enqueued: !!r && ACTIVE_OCCURRENCE_STATES.includes(r.state), state: r?.state, occurrenceId: r?.id, conditionMet: !!r }
+    }
+    if ((p.action === 'resume' || p.action === 'update') && !this.automationAuthorized(job)) throw new Error('原事件授权已失效，请从新的用户委托重新建立')
+    const updated = p.action === 'update' ? this.store.automations.update(bot.botId, job.id, p.revision!, p.definition!, now)
+      : this.store.automations.setStatus(bot.botId, job.id, p.revision!, p.action === 'pause' ? 'paused' : p.action === 'remove' ? 'removed' : 'enabled', now)
+    this.automations.cancelCheck(job.id)
+    for (const r of this.store.automations.occurrences(bot.botId, job.id).filter(r => r.state === 'cancelled' && r.taskId)) {
+      this.store.cancelReplies(bot.botId, r.taskId)
+      const task = this.store.task(r.taskId!)
+      if (task && ['queued', 'running', 'waiting_user'].includes(task.state)) await this.stopTask(bot.botId, task.id, '事件已暂停、修改或删除')
+    }
+    return { saved: true, job: automationSummary(updated) }
+  }
   private tick(): void {
     if (this.stopped) return
+    void this.pollAutomations().catch(error => { for (const botId of this.store.enabledBots()) this.store.saveSettings({ ...this.store.settings(botId), error: `事件调度：${this.error(error)}` }) })
     for (const op of this.store.operations().filter(o => o.state === 'pending_approval' && (o.expiresAt ?? 0) <= Date.now())) this.store.saveOperation({ ...op, state: 'failed', error: '审批已过期，操作未执行' })
     for (const botId of this.store.enabledBots()) { this.resumeAfterStop(botId); this.nudgeFollowups(botId); this.sweepMemories(botId); this.runMemoryJobs(botId); void this.route(botId); void this.pump(botId); void this.flush(botId) }
   }
@@ -339,7 +471,7 @@ export class BotRuntimeService {
     const drain = Promise.resolve().then(() => this.drainRouter(botId)).finally(() => {
       this.routerBusy.delete(botId)
       // 收尾微任务之间也可能来新消息，不让它等下一次两秒轮询。
-      if (!this.routeTimers.has(botId) && !this.stopped && !this.quiescing.has(botId) && this.enabled(botId) && (this.store.pendingInbox(botId).length || this.nextWorkerReply(botId))) void this.route(botId)
+      if (!this.routeTimers.has(botId) && !this.stopped && !this.quiescing.has(botId) && this.enabled(botId) && (this.store.pendingInbox(botId).length || this.nextWorkerReply(botId) || this.automations.hasReady(botId))) void this.route(botId)
     })
     this.routerBusy.set(botId, drain)
     return drain
@@ -350,7 +482,8 @@ export class BotRuntimeService {
         if (this.stopped || this.quiescing.has(botId) || !this.enabled(botId)) break
         const pending = this.store.pendingInbox(botId)
         const workerMessage = this.nextWorkerReply(botId)
-        if (!pending.length && !workerMessage) break
+        const automationEvent = !pending.length && !workerMessage ? this.automations.claim(botId) : undefined
+        if (!pending.length && !workerMessage && !automationEvent) break
         const now = Date.now()
         // 停止、继续这类整句，以及确认卡里打字的回答，主人要的是立刻处理，不等安静期。
         const immediate = pending.some(m => m.targetTaskId !== undefined || isControlUtterance(m.text))
@@ -368,8 +501,9 @@ export class BotRuntimeService {
           messages.push(input); chars += input.text.length
         }
         const message = messages.at(-1)
-        // Worker 结果单独到来、且开工后主人没说过话：这一轮只压短，不提供查询工具。
-        const toolsLocked = !messages.length && !!workerMessage && !this.ownerSpokeSince(workerMessage)
+        const turnSourceId = message?.id ?? workerMessage?.id ?? automationEvent!.occurrence.id
+        // 验收默认只读摘要，必要时允许按需查询原话或附件片段。
+        const toolsLocked = false
         let committed = false
         let turnState: RouterSession['active']
         let session: RouterSession | undefined
@@ -386,7 +520,7 @@ export class BotRuntimeService {
             return typeof taskId === 'string' && allTasks.some(t => t.id === taskId) ? [taskId] : []
           }).at(-1)
           const lastResult = previousReplies.filter(r => r.taskId).at(-1)?.taskId
-          const relatedTaskIds = [...messages.flatMap(m => m.targetTaskId ? [m.targetTaskId] : []), ...(workerMessage?.taskId ? [workerMessage.taskId] : []), ...(previousWork ? [previousWork] : []), ...(lastResult ? [lastResult] : [])]
+          const relatedTaskIds = [...(automationEvent?.job.source.taskId ? [automationEvent.job.source.taskId] : []), ...messages.flatMap(m => m.targetTaskId ? [m.targetTaskId] : []), ...(workerMessage?.taskId ? [workerMessage.taskId] : []), ...(previousWork ? [previousWork] : []), ...(lastResult ? [lastResult] : [])]
           const visibleTasks = selectTasks(allTasks, relatedTaskIds)
           const visibleCases = selectCases(this.store.cases(botId), allTasks, artifacts, { query: messages.map(m => m.text).join('\n'), relatedTaskIds })
           // 记忆按渠道和对话角色分开取；只带规矩本身，不带完整原话。
@@ -395,9 +529,9 @@ export class BotRuntimeService {
           // 经验不分渠道和角色：用满次数的常驻，相关的候选补位；指纹不符的不进摘要。
           const experience = selectExperiences(this.store.experiences(botId), messages.map(m => m.text).join('\n'), this.workerFingerprint(bot))
           this.retireStaleExperiences(experience.stale)
-          const bindings: RouterBindings = { policyRevision: bot.policyRevision, currentInputIds: messages.map(m => m.id), workerReplyId: workerMessage?.id,
+          const bindings: RouterBindings = { policyRevision: bot.policyRevision, currentInputIds: messages.map(m => m.id), workerReplyId: workerMessage?.id, workerSource: { worker: !!workerMessage, files: !!workerMessage?.artifactIds?.length },
             tasks: new Map(visibleTasks.map(t => [t.id, { revision: t.revision, questionId: t.question?.id, caseId: t.caseId }])), cases: new Map(visibleCases.map(c => [c.id, { revision: c.revision ?? 1, scopeComplete: true }])) }
-          const context = routerContext({ bot, input: message, inputs: messages, workerMessage, workerRequest: workerMessage ? this.workerRequest(workerMessage) : undefined, workerArtifacts: workerMessage?.artifactIds?.flatMap(id => { const a = this.store.artifact(id); return a ? [{ id: a.id, name: a.name ?? a.title, mime: a.mime, size: a.size }] : [] }), pendingReplies: this.pausedRouterReplies(botId).map(r => ({ id: r.id, text: r.text })), profile: settings.profile, messages: recentMessages, cases: visibleCases, tasks: allTasks, artifacts, relatedTaskIds, experienceSummaries: experience.selected.map(experienceSummary), operations: this.store.operations(), previousReplies: previousReplies.map(r => ({ text: r.text, createdAt: r.sentAt ?? r.createdAt, taskId: r.taskId, caseId: r.taskId ? this.store.task(r.taskId)?.caseId : undefined })), toolsLocked,
+          const context = routerContext({ bot, automationEvent, input: message, inputs: messages, workerMessage, workerRequest: workerMessage ? this.workerRequest(workerMessage) : undefined, workerArtifacts: workerMessage?.artifactIds?.flatMap(id => { const a = this.store.artifact(id); return a ? [{ id: a.id, name: a.name ?? a.title, mime: a.mime, size: a.size }] : [] }), pendingReplies: this.pausedRouterReplies(botId).map(r => ({ id: r.id, text: r.text })), profile: settings.profile, messages: recentMessages, cases: visibleCases, tasks: allTasks, artifacts, relatedTaskIds, experienceSummaries: experience.selected.map(experienceSummary), operations: this.store.operations(), previousReplies: previousReplies.map(r => ({ text: r.text, createdAt: r.sentAt ?? r.createdAt, taskId: r.taskId, caseId: r.taskId ? this.store.task(r.taskId)?.caseId : undefined })), toolsLocked,
             memories: { long: selection.long.map(memorySummary), mid: selection.mid.map(memorySummary), overflow: selection.overflow } })
           const fingerprint = this.routerFingerprint(bot)
           session = this.routerClients.get(botId)
@@ -422,28 +556,56 @@ export class BotRuntimeService {
             session = fresh; this.routerClients.set(botId, session)
           }
           clearTimeout(session.idleTimer)
-          let reads = 0; let decisions = 0; let committing = false; let readBudget = 8000
+          let reads = 0; let writes = 0; let decisions = 0; let committing = false; let readBudget = 8000
           const boundedRead = (result: unknown): unknown => {
             const size = JSON.stringify(result).length
             if (size > Math.min(4000, readBudget)) throw new Error('查询结果超出本轮内容预算，请缩小关键词或读取条数；不要猜测未读内容')
             session!.contextChars += size
             readBudget -= size; return result
           }
-          const active: NonNullable<RouterSession['active']> = { inputIds: messages.map(m => m.id), workerReplyId: workerMessage?.id, superseded: false, committed: false, handler: async call => {
+          const active: NonNullable<RouterSession['active']> = { inputIds: messages.map(m => m.id), workerReplyId: workerMessage?.id, automationOccurrenceId: automationEvent?.occurrence.id, superseded: false, committed: false, handler: async call => {
             if (workerMessage && !this.replyCurrent(workerMessage)) active.superseded = true
+            if (automationEvent && (!this.store.automations.current(automationEvent.occurrence) || !this.automationAuthorized(automationEvent.job))) active.superseded = true
             if (active.superseded) return { superseded: true, instruction: '新消息已经到达，此轮未派工也未发送。立即结束本轮，宿主会重新提供完整批次。' }
             if (committed || committing) throw new Error('本条消息已提交，请结束本轮')
             if (call.tool === 'router_decide') {
               decisions++
               const decision = bindRouterDecision(call.arguments, this.opts.getBot(botId), bindings)
               committing = true; active.committed = true
-              try { await this.decide(messages, decision, workerMessage); committed = true; if (message) this.afterTurn(settings, message, selection.triggered, experience.selected.map(e => e.id)); return { accepted: true } }
+              try { await this.decide(messages, decision, workerMessage, automationEvent); committed = true; if (message) this.afterTurn(settings, message, selection.triggered, experience.selected.map(e => e.id)); return { accepted: true } }
               finally { committing = false; active.committed = committed }
+            }
+            if (call.tool === 'automation') {
+              const read = call.arguments.action === 'list' || call.arguments.action === 'inspect'
+              if (read ? ++reads > 4 : ++writes > 10) throw new Error('本轮事件工具预算已用尽')
+              const result = await this.automationTool(bot, call.arguments, messages, workerMessage, automationEvent)
+              return read ? boundedRead(result) : result
             }
             if (++reads > (toolsLocked ? 0 : 4)) throw new Error(toolsLocked ? '本轮只整理Worker结果，不提供查询工具；直接用replies表达，不要查询' : '本轮读取预算已用尽，请根据已有资料判断或作必要澄清')
             const args = call.arguments
-            if (call.tool === 'chat_recent') return boundedRead(this.conversation(botId, Math.min(20, Number(args.limit) || 12)))
-            if (call.tool === 'chat_search') { const q = boundedText(args.query, '关键词', 100); return boundedRead(this.conversation(botId, 100).filter(m => m.text.includes(q) || m.attachments?.some(a => a.name.includes(q))).slice(-5)) }
+            if (call.tool === 'chat_recent' || call.tool === 'chat_search') return boundedRead(this.store.chatHistory(botId, {
+              groupId: bot.groupId, query: args.query === undefined ? undefined : boundedText(args.query, '关键词', 100),
+              from: args.from as string | number | undefined, to: args.to as string | number | undefined,
+              limit: args.limit === undefined ? undefined : Number(args.limit), author: args.author as 'owner' | 'router' | undefined,
+              order: args.order as 'asc' | 'desc' | undefined, cursor: args.cursor === undefined ? undefined : boundedText(args.cursor, '游标', 1000), maxChars: Math.max(512, Math.min(3600, readBudget - 100)),
+            }))
+            if (call.tool === 'chat_read') return boundedRead(this.store.chatMessage(botId, {
+              groupId: bot.groupId, messageId: boundedText(args.messageId, '消息ID', 150), offset: args.offset === undefined ? undefined : Number(args.offset),
+              length: args.length === undefined ? 1600 : Math.min(2400, Number(args.length)), maxChars: Math.max(512, Math.min(3600, readBudget - 100)),
+            }) ?? { error: '消息不存在或已撤回' })
+            if (call.tool === 'artifact_read') {
+              const artifactId = boundedText(args.artifactId, '成果ID', 150)
+              if (!workerMessage?.artifactIds?.includes(artifactId)) throw new Error('只能抽查本轮Worker交付的附件')
+              const meta = this.store.artifact(artifactId)
+              if (!meta || meta.botId !== botId || meta.taskId !== workerMessage.taskId) throw new Error('成果归属不匹配')
+              if (!/^(text\/|application\/(json|xml|javascript))/.test(meta.mime)) return boundedRead({ artifactId, unsupported: true, instruction: '二进制附件请让Worker提供具体检查结果' })
+              const file = this.artifact(botId, bot.ownerPhoneId, artifactId)
+              const offset = args.offset === undefined ? 0 : Number(args.offset)
+              const length = args.length === undefined ? 1200 : Number(args.length)
+              if (!Number.isInteger(offset) || offset < 0 || offset > file.content.length || !Number.isInteger(length) || length < 1 || length > 2000) throw new Error('附件读取范围无效')
+              const text = file.content.slice(offset, offset + length)
+              return boundedRead({ artifactId, hash: meta.hash, revision: meta.revision, text, offset, nextOffset: offset + text.length, hasMore: offset + text.length < file.content.length })
+            }
             if (call.tool === 'case_search') {
               const taskId = args.taskId === undefined ? undefined : boundedText(args.taskId, '工单ID', 200)
               const artifactId = args.artifactId === undefined ? undefined : boundedText(args.artifactId, '成果ID', 200)
@@ -462,7 +624,7 @@ export class BotRuntimeService {
               for (const c of summaries) bindings.cases.set(c.id, { revision: c.revision, scopeComplete: true })
               return result
             }
-            if (call.tool === 'task_inspect') { const task = this.requireTask(botId, String(args.taskId)); const dossier = this.store.case(task.caseId)!; const result = boundedRead({ dossier: { id: dossier.id, title: dossier.title, goal: dossier.goal.slice(0, 200), goalTruncated: dossier.goal.length > 200, revision: dossier.revision ?? 1 }, id: task.id, caseId: task.caseId, goal: task.goal.slice(0, 500), state: task.state, revision: task.revision, summary: task.summary.slice(0, 500), summaryUpdatedAt: task.summaryUpdatedAt ?? null, observedAt: Date.now(), activeOperations: activeOperationStatus(this.store.operations(task.id)), question: task.question, directory: task.mandate.directory, policyRevision: task.mandate.policyRevision, directoryChanged: task.mandate.directory !== bot.directory, allowedOps: task.mandate.allowedOps, inputs: this.store.inputs(task.id).filter(i => !i.resolution).slice(-3).map(i => ({ id: i.id, kind: i.kind, text: i.text.slice(0, 500), delivery: i.delivery, revision: i.revision, consumedAt: i.consumedAt })) }); bindings.tasks.set(task.id, { revision: task.revision, questionId: task.question?.id, caseId: task.caseId }); bindings.cases.set(dossier.id, { revision: dossier.revision ?? 1, scopeComplete: dossier.goal.length <= 200 || (bindings.cases.get(dossier.id)?.revision === (dossier.revision ?? 1) && bindings.cases.get(dossier.id)?.scopeComplete === true) }); return result }
+            if (call.tool === 'task_inspect') { const task = this.requireTask(botId, String(args.taskId)); const dossier = this.store.case(task.caseId)!; const result = boundedRead({ dossier: { id: dossier.id, title: dossier.title, goal: dossier.goal.slice(0, 200), goalTruncated: dossier.goal.length > 200, revision: dossier.revision ?? 1 }, id: task.id, caseId: task.caseId, goal: task.goal.slice(0, 500), state: task.state, revision: task.revision, review: task.review, executionGuidance: task.executionGuidance, acceptance: task.acceptance, summary: task.summary.slice(0, 500), summaryUpdatedAt: task.summaryUpdatedAt ?? null, observedAt: Date.now(), activeOperations: activeOperationStatus(this.store.operations(task.id)), question: task.question, directory: task.mandate.directory, policyRevision: task.mandate.policyRevision, directoryChanged: task.mandate.directory !== bot.directory, allowedOps: task.mandate.allowedOps, inputs: this.store.inputs(task.id).filter(i => !i.resolution).slice(-3).map(i => ({ id: i.id, kind: i.kind, text: i.text.slice(0, 500), delivery: i.delivery, revision: i.revision, consumedAt: i.consumedAt })) }); bindings.tasks.set(task.id, { revision: task.revision, questionId: task.question?.id, caseId: task.caseId }); bindings.cases.set(dossier.id, { revision: dossier.revision ?? 1, scopeComplete: dossier.goal.length <= 200 || (bindings.cases.get(dossier.id)?.revision === (dossier.revision ?? 1) && bindings.cases.get(dossier.id)?.scopeComplete === true) }); return result }
             if (call.tool === 'experience_read') {
               const item = this.store.experience(String(args.experienceId))
               if (!item || item.state !== 'active') return boundedRead({ error: '经验不存在或已失效' })
@@ -477,7 +639,7 @@ export class BotRuntimeService {
           session.threadId ??= await session.client.startThread({ instructions: ROUTER_INSTRUCTIONS, tools: ROUTER_TOOLS, ephemeral: true })
           if (session.closing || session.active !== active) throw new Error('前台已停止')
           session.turns++; session.contextChars += context.length
-          active.turn = session.client.startTurn(session.threadId, context, message?.id ?? workerMessage!.id)
+          active.turn = session.client.startTurn(session.threadId, context, turnSourceId)
           const turn = await active.turn
           const result = await turn.done
           if (active.superseded) continue
@@ -490,6 +652,7 @@ export class BotRuntimeService {
             // 主人话和 Worker 结果都带的轮次分不清哪句归谁；提交被驳回后改说的正文也不算数。这两种都走下面的提醒。
             const said = lastAgentText(result)
             const spoken = decisions !== 0 ? undefined : message && !workerMessage ? { decision: { action: 'reply' }, feasibility: 'can', replies: said ? [said] : [] }
+              : !message && automationEvent && said ? { decision: { action: 'reply' }, feasibility: 'can', replies: [said] }
               : !message && workerMessage && said ? { decision: { action: 'reply' }, feasibility: 'can', replies: [said], workerReplyIndexes: [0] } : undefined
             if (spoken) {
               try { await active.handler({ tool: 'router_decide', threadId: turn.threadId, turnId: turn.turnId, callId: `${turn.turnId}:host`, arguments: spoken }) }
@@ -499,7 +662,7 @@ export class BotRuntimeService {
               clearTimeout(timeout)
               timeout = setTimeout(() => { void this.closeRouter(botId, current).catch(() => undefined) }, this.opts.routerTurnTimeoutMs ?? ROUTER_TURN_TIMEOUT_MS)
               session.turns++; session.contextChars += ROUTER_UNDECIDED_NUDGE.length
-              active.turn = session.client.startTurn(session.threadId!, ROUTER_UNDECIDED_NUDGE, `${message?.id ?? workerMessage!.id}:nudge`)
+              active.turn = session.client.startTurn(session.threadId!, ROUTER_UNDECIDED_NUDGE, `${turnSourceId}:nudge`)
               const again = await (await active.turn).done
               if (active.superseded) continue
               if (again.status !== 'completed') throw new Error(again.error?.message ?? '前台轮次未正常完成，请重试')
@@ -512,10 +675,12 @@ export class BotRuntimeService {
           // 决策已经提交落库：之后的收尾超时或进程关闭不影响结果，不当成失败，也不让主人重试。
           if (!committed && !turnState?.superseded) {
             if (workerMessage) this.store.deferWorkerReply(workerMessage.id, this.error(error))
+            if (automationEvent) this.automations.fail(automationEvent.occurrence.id, this.error(error))
             for (const input of messages) if (this.store.inbox(input.id)?.state === 'pending') this.store.markInput(input.id, 'failed', undefined, this.error(error))
             this.store.saveSettings({ ...this.store.settings(botId), error: this.error(error) })
           }
         } finally {
+          if (automationEvent && !committed) this.automations.release(automationEvent.occurrence.id)
           clearTimeout(timeout)
           if (session) { session.active = undefined; this.idleRouter(botId, session) }
         }
@@ -526,11 +691,6 @@ export class BotRuntimeService {
   }
   private pausedRouterReplies(botId: string): RuntimeReply[] {
     return this.store.pendingReplies(botId).filter(r => r.author === 'router' && r.attemptedAt === undefined)
-  }
-  /** Worker 开工之后主人是否说过话，含确认卡里打字的回答。 */
-  private ownerSpokeSince(reply: RuntimeReply): boolean {
-    const since = this.store.run(reply.runId ?? '')?.createdAt ?? reply.createdAt
-    return this.store.messages(reply.botId, 50).some(m => (m.receivedAt ?? m.createdAt) > since)
   }
   private workerRequest(reply: RuntimeReply): string {
     const task = reply.taskId ? this.store.task(reply.taskId) : undefined
@@ -547,14 +707,20 @@ export class BotRuntimeService {
     const priority = (r: RuntimeReply) => r.purpose === 'question' ? 0 : r.purpose === 'answer' ? 1 : 2
     return pending.sort((a, b) => priority(a) - priority(b))[0]
   }
-  private async decide(messages: RuntimeInbox[], d: RouterDecision, workerMessage?: RuntimeReply): Promise<void> {
+  private async decide(messages: RuntimeInbox[], d: RouterDecision, workerMessage?: RuntimeReply, automationEvent?: RuntimeAutomationTrigger): Promise<void> {
     const message = messages.at(-1); const inputIds = messages.map(m => m.id)
-    const botId = message?.botId ?? workerMessage!.botId
+    const botId = message?.botId ?? workerMessage?.botId ?? automationEvent!.job.botId
     let bot = this.owner(botId, message?.senderId ?? this.opts.getBot(botId).ownerPhoneId)
     if (d.workerReplyId !== workerMessage?.id) throw new Error('必须准确关联本轮Worker结果workerReplyId')
     if (message && workerMessage && !d.workerReplyIndexes) throw new Error('混合处理用户输入和Worker结果时，必须用workerReplyIndexes注明每个气泡的归属')
     if (d.workerReplyIndexes && (!workerMessage || !message && d.workerReplyIndexes.length !== d.replies.length)) throw new Error('没有用户输入时所有气泡都须关联Worker结果')
-    if (!message && d.action !== 'reply') throw new Error('内部Worker结果不能代替用户发起新任务或控制操作')
+    if (!message && !automationEvent && d.action !== 'reply' && d.action !== 'revise') throw new Error('内部Worker结果不能代替用户发起新任务或控制操作')
+    if (automationEvent) {
+      if (!this.store.automations.current(automationEvent.occurrence) || !this.automationAuthorized(automationEvent.job)) throw new Error('事件委托或触发已失效')
+      if (!['reply', 'start'].includes(d.action) || automationEvent.occurrence.diagnostic && d.action !== 'reply') throw new Error('事件轮只能回复或在原委托内派工')
+      if (d.allowedOps.some(op => !automationEvent.job.source.mandate.allowedOps.includes(op))) throw new Error('事件不能扩大原委托权限')
+    }
+    if (d.action === 'revise' && (!workerMessage || workerMessage.purpose !== 'result' || workerMessage.taskId !== d.taskId || d.workerReplyIndexes?.length)) throw new Error('返工必须准确关联本轮交付结果，不能同时交付旧结果')
     if (workerMessage && !this.replyCurrent(workerMessage)) throw new Error('Worker结果已失效，请按最新状态处理')
     if (this.stopped || this.quiescing.has(bot.botId) || !this.enabled(bot.botId) || bot.policyRevision !== d.policyRevision) throw new Error('运行模式或权限已改变')
     if (message) this.store.requireBatch(message.id, inputIds)
@@ -566,15 +732,23 @@ export class BotRuntimeService {
       d = { ...d, policyRevision: bot.policyRevision }
     }
     let addition: RuntimeTaskInput | undefined
-    const userReply: Omit<RuntimeReply, 'id' | 'createdAt' | 'state' | 'text'> = { botId, groupId: bot.groupId, inputId: message?.id, author: 'router', purpose: 'chat', key: `${message?.id}:router`, policyRevision: d.policyRevision }
+    const userReply: Omit<RuntimeReply, 'id' | 'createdAt' | 'state' | 'text'> = { botId, groupId: bot.groupId, inputId: message?.id, automationOccurrenceId: automationEvent?.occurrence.id, author: 'router', purpose: 'chat', key: `${message?.id ?? workerMessage?.id ?? automationEvent!.occurrence.id}:router`, policyRevision: d.policyRevision }
     this.store.transaction(() => {
       // stop 可能等待 Worker 退出，期间权限或原消息状态仍可能被控制面改变。
       if (this.stopped || this.quiescing.has(bot.botId) || !this.enabled(bot.botId) || this.opts.getBot(bot.botId).policyRevision !== d.policyRevision) throw new Error('运行模式或权限已改变')
       if (message) this.store.requireBatch(message.id, inputIds)
-      if (d.action === 'start') {
+      if (d.action === 'revise') {
+        const task = this.requireTask(botId, d.taskId!)
+        if (task.mandate.policyRevision !== bot.policyRevision) throw new Error('原工单授权已失效')
+        addition = this.store.reviseWorkerResult(botId, workerMessage!.id, task.id, d.expectedRevision!, d.feedback!, d.executionGuidance, d.delivery)
+        this.store.routerBubbles(userReply, d.replies)
+        for (const m of messages) this.store.markInput(m.id, 'routed', { ...d, inputIds })
+      } else if (d.action === 'start') {
         if (d.newCase && messages.some(m => m.targetTaskId)) throw new Error('消息已明确关联原任务，请在其卷宗中继续，不能另建卷宗')
         const policy = bot.workerAccessMode === 'full-access' ? workerExecutionPolicy(bot.directory) : undefined
-        const task = this.store.acceptWork({ inputId: message!.id, inputIds, caseId: d.caseId, caseUpdate: d.caseUpdate, caseDecision: d.caseDecision, newCase: d.newCase, goal: d.goal!, acceptance: d.acceptance, sourceInputIds: d.sourceInputIds, delivery: d.delivery, mandate: { ownerPhoneId: bot.ownerPhoneId, policyRevision: bot.policyRevision, directory: bot.directory, allowedOps: policy ? [...FULL_ACCESS_OPERATIONS] : d.allowedOps, exclusions: d.exclusions, mode: d.feasibility === 'assess' ? 'assess' : 'execute', ...(policy ? { executionMode: policy.mode, directoryIsolation: policy.isolation, safetyInstructions: policy.instructions } : {}) }, replies: workerMessage ? [] : d.replies })
+        const mandate: RuntimeTask['mandate'] = { ownerPhoneId: bot.ownerPhoneId, policyRevision: bot.policyRevision, directory: bot.directory, allowedOps: automationEvent ? (policy ? automationEvent.job.source.mandate.allowedOps : d.allowedOps) : policy ? [...FULL_ACCESS_OPERATIONS] : d.allowedOps, exclusions: [...new Set([...(automationEvent?.job.source.mandate.exclusions ?? []), ...d.exclusions])], mode: d.feasibility === 'assess' ? 'assess' : 'execute', ...(policy ? { executionMode: policy.mode, directoryIsolation: policy.isolation, safetyInstructions: policy.instructions } : {}) }
+        const common = { caseId: d.caseId, caseUpdate: d.caseUpdate, caseDecision: d.caseDecision, newCase: d.newCase, goal: d.goal!, acceptance: d.acceptance, delivery: d.delivery, executionGuidance: d.executionGuidance, mandate, replies: workerMessage ? [] : d.replies }
+        const task = automationEvent ? this.store.acceptAutomationWork({ ...common, occurrenceId: automationEvent.occurrence.id }) : this.store.acceptWork({ ...common, inputId: message!.id, inputIds, sourceInputIds: d.sourceInputIds })
         Object.assign(userReply, { taskId: task.id, taskRevision: task.revision, purpose: 'ack' })
       } else if (['append', 'ask_worker', 'answer'].includes(d.action)) {
         const task = this.requireTask(bot.botId, d.taskId!)
@@ -582,14 +756,24 @@ export class BotRuntimeService {
         if (d.action === 'answer' && task.question?.id !== d.questionId) throw new Error('必要问题已改变，请核对用户回答对应的问题')
         if (d.caseUpdate && d.caseId !== task.caseId) throw new Error('卷宗更新与任务归属不匹配')
         this.store.updateCase(botId, task.caseId, d.caseUpdate)
-        addition = this.store.acceptInput({ inputId: message!.id, inputIds, taskId: task.id, expectedRevision: d.expectedRevision!, kind: d.action as RuntimeTaskInput['kind'], replies: workerMessage ? [] : d.replies, sourceInputIds: d.sourceInputIds, delivery: d.delivery })
+        addition = this.store.acceptInput({ inputId: message!.id, inputIds, taskId: task.id, expectedRevision: d.expectedRevision!, kind: d.action as RuntimeTaskInput['kind'], replies: workerMessage ? [] : d.replies, sourceInputIds: d.sourceInputIds, delivery: d.delivery, executionGuidance: d.executionGuidance })
         Object.assign(userReply, { taskId: task.id, taskRevision: addition.revision, purpose: 'ack' })
+      } else if (automationEvent) {
+        this.store.routerBubbles(userReply, d.replies)
+        if (d.replies.length) this.store.automations.transition(automationEvent.occurrence.id, 'delivery_pending', (this.opts.automationNow ?? Date.now)())
+        else this.automations.complete(automationEvent.occurrence.id)
       } else if (message) {
         if (!workerMessage) this.store.routerBubbles({ botId: message.botId, groupId: message.groupId, inputId: message!.id, author: 'router', purpose: 'chat', key: `${message.id}:router`, policyRevision: d.policyRevision }, d.replies)
         for (const m of messages) this.store.markInput(m.id, 'routed', { ...d, inputIds })
       }
-      if (workerMessage) {
-        if (this.replyCurrent(workerMessage)) this.store.presentWorkerReply(bot.botId, workerMessage.id, d.replies, d.basis, message ? { indexes: d.workerReplyIndexes!, user: userReply } : undefined)
+      if (workerMessage && d.action !== 'revise') {
+        if (this.replyCurrent(workerMessage)) {
+          this.store.presentWorkerReply(bot.botId, workerMessage.id, d.replies, d.basis, message ? { indexes: d.workerReplyIndexes!, user: userReply } : undefined)
+          if (workerMessage.purpose === 'result' && workerMessage.taskId && workerMessage.checks) {
+            const accepted = this.requireTask(botId, workerMessage.taskId)
+            this.store.saveExperience(experienceCandidate(accepted, this.store.case(accepted.caseId)!, workerMessage.text, workerMessage.checks, bot.platform, this.workerFingerprint(bot)))
+          }
+        }
         else {
           this.store.cancelReply(workerMessage.id, '用户已处理或停止关联任务，内部结果不再需要发出')
           if (message) this.store.routerBubbles(userReply, d.replies.filter((_, i) => !d.workerReplyIndexes?.includes(i)))
@@ -602,7 +786,7 @@ export class BotRuntimeService {
       if (d.action === 'answer' && active?.run.taskId === addition.taskId && !active.stopping && active.run.state !== 'draining') {
         active.writable = true; this.store.updateTask(addition.taskId, { state: 'running' })
       }
-      void this.deliver(addition)
+      if (d.action !== 'revise') void this.deliver(addition)
     }
     void this.flush(bot.botId); void this.pump(bot.botId)
   }
@@ -615,6 +799,10 @@ export class BotRuntimeService {
     if (this.stopped || this.quiescing.has(worker.bot.botId) || this.active.get(worker.bot.botId) !== worker || worker.stopping) throw new Error('旧执行已停止，操作失效')
     const bot = this.opts.getBot(worker.bot.botId)
     const task = this.requireTask(bot.botId, worker.run.taskId)
+    if (task.automationOccurrenceId) {
+      const r = this.store.automations.occurrence(task.automationOccurrenceId)
+      if (!r || !this.store.automations.current(r) || !this.automationAuthorized(this.store.automations.get(bot.botId, r.jobId))) throw new Error('事件委托已取消或失效')
+    }
     if (task.latestRunId !== worker.run.id || task.mandate.policyRevision !== bot.policyRevision || task.mandate.directory !== bot.directory || !this.enabled(bot.botId)) throw new Error('执行身份或权限已改变')
     if (!['running', 'waiting_user'].includes(task.state)) throw new Error('本次任务已不处于活动状态')
     if (project && (!worker.writable || task.state !== 'running')) throw new Error('任务当前不能执行项目操作')
@@ -638,8 +826,12 @@ export class BotRuntimeService {
       if (this.locked(bot.directory) || this.store.tasks(botId).some(t => ['recovering', 'stopping'].includes(t.state))) return
       const task = this.store.tasks(botId).find(t => t.state === 'queued')
       if (!task) return
+      if (task.automationOccurrenceId) {
+        const r = this.store.automations.occurrence(task.automationOccurrenceId)
+        if (!r || !this.store.automations.current(r) || !this.automationAuthorized(this.store.automations.get(botId, r.jobId))) { this.store.updateTask(task.id, { state: 'stopped', error: '事件委托已取消或失效' }); return }
+      }
       if (task.mandate.policyRevision !== bot.policyRevision || task.mandate.directory !== bot.directory) { this.store.updateTask(task.id, { state: 'waiting_user', error: '权限或目录已改变，请重新确认工作范围' }); return }
-      if (bot.workerAccessMode === 'full-access') {
+      if (bot.workerAccessMode === 'full-access' && !task.automationOccurrenceId) {
         const policy = workerExecutionPolicy(bot.directory)
         this.store.updateTask(task.id, { mandate: { ...task.mandate, executionMode: policy.mode, directoryIsolation: policy.isolation, safetyInstructions: policy.instructions, allowedOps: [...FULL_ACCESS_OPERATIONS] } })
       }
@@ -648,7 +840,9 @@ export class BotRuntimeService {
       const client = this.client('worker', bot, call => this.workerTool(worker, call))
       worker = { run, bot, client, writable: true, stopping: false, grants: new Map(), tools: 0 }
       this.active.set(botId, worker); this.store.saveRun(run); this.store.updateTask(task.id, { state: 'running', latestRunId: run.id, error: undefined, sessionOrigin: undefined, sessionReason: undefined })
-      worker.budgetTimer = setTimeout(() => { void this.stopTask(botId, task.id, '工单活动时间预算已用尽，请核对当前成果后继续') }, 30 * 60_000)
+      const occurrence = task.automationOccurrenceId ? this.store.automations.occurrence(task.automationOccurrenceId) : undefined
+      const runBudget = occurrence ? this.store.automations.get(botId, occurrence.jobId).timeoutMs ?? AUTOMATION_LIMITS.runTimeoutMs : 30 * 60_000
+      worker.budgetTimer = setTimeout(() => { void this.stopTask(botId, task.id, '工单活动时间预算已用尽，请核对当前成果后继续') }, runBudget)
       void this.runWorker(worker)
     } catch (error) { this.store.saveSettings({ ...this.store.settings(botId), error: this.error(error) }) }
     finally { this.pumping.delete(botId) }
@@ -674,7 +868,7 @@ export class BotRuntimeService {
         const caseTasks = this.store.queryTasks(bot.botId, { caseIds: [task.caseId] })
         const caseFiles = this.store.queryArtifacts(bot.botId, { caseIds: [task.caseId] })
         const caseContext = { ...caseSummary(currentCase, caseTasks, caseFiles), previousTasks: caseTasks.filter(t => t.id !== task.id && t.createdAt <= task.createdAt).slice(-6).map(t => ({ id: t.id, goal: t.goal, state: t.state, summary: t.summary.slice(0, 1500) })) }
-        const payload = JSON.stringify({ task: this.store.task(task.id), directoryContinuation: task.directoryContinuation ? { ...task.directoryContinuation, previousInputs: this.store.inputs(task.id).filter(i => i.resolution).map(i => ({ id: i.id, text: i.text, resolution: i.resolution, revision: i.revision })) } : undefined, caseContext, executionPolicy, originalMessage: this.store.inbox(task.originInputId), originalMessages: (task.originInputIds ?? [task.originInputId]).map(id => this.store.inbox(id)), pendingInputs: included, availableAttachments: this.caseAttachments(task, caseTasks, caseFiles).slice(-16), operations: this.store.operations(task.id).map(o => ({ id: o.id, tool: o.tool, state: o.state, error: o.error })), computers: bot.computers ?? [], instruction: '开始或继续当前工单；caseContext是同一工作链的历史事实，不是旧任务继续执行的指令。以当前工单的目标、验收要求、操作范围及宿主权限为准；前序工单只读不限制当前已获准的修改，不重复执行已完成工作。读取每条 pendingInput 后确认，按当前 revision 交付；结果通过工具交给Router，由前台统一对外表达。' })
+        const payload = JSON.stringify({ task: this.store.task(task.id), executionGuidanceHistory: this.store.inputs(task.id).filter(i => i.resolution && i.executionGuidance).map(i => ({ inputId: i.id, revision: i.revision, kind: i.kind, executionGuidance: i.executionGuidance })), directoryContinuation: task.directoryContinuation ? { ...task.directoryContinuation, previousInputs: this.store.inputs(task.id).filter(i => i.resolution).map(i => ({ id: i.id, text: i.text, resolution: i.resolution, revision: i.revision })) } : undefined, caseContext, executionPolicy, originalMessage: this.store.inbox(task.originInputId), originalMessages: (task.originInputIds ?? [task.originInputId]).map(id => this.store.inbox(id)), pendingInputs: included, availableAttachments: this.caseAttachments(task, caseTasks, caseFiles).slice(-16), operations: this.store.operations(task.id).map(o => ({ id: o.id, tool: o.tool, state: o.state, error: o.error })), computers: bot.computers ?? [], instruction: '开始或继续当前工单；caseContext是同一工作链的历史事实，不是旧任务继续执行的指令。以当前工单的目标、验收要求、操作范围及宿主权限为准；前序工单只读不限制当前已获准的修改，不重复执行已完成工作。读取每条 pendingInput 后确认，按当前 revision 交付；结果通过工具交给Router，由前台统一对外表达。' })
         worker.turn = await client.startTurn(run.threadId, payload, `${run.id}:${attempt}`)
         // startTurn 返回前可能已收到 work_finish；这里只核对执行身份，不要求任务仍在运行。
         if (this.active.get(bot.botId) === worker && !worker.stopping && this.store.task(task.id)?.latestRunId === run.id) this.store.updateTask(task.id, { sessionOrigin: inherited ? 'inherited' : 'new', sessionReason: inherited ? '续接同一卷宗的执行上下文，按当前工单执行' : dossier.threadId ? '执行配置已变化，在原卷宗创建新会话并带入已有工作摘要' : '卷宗尚无可恢复的会话，首次创建执行上下文' })
@@ -686,7 +880,7 @@ export class BotRuntimeService {
         const completed = await worker.turn.done
         if (worker.stopping) break
         const current = this.store.task(task.id)!
-        if (['completed', 'waiting_user', 'stopped'].includes(current.state)) break
+        if (!worker.writable || ['completed', 'waiting_user', 'stopped'].includes(current.state)) break
         if (completed.status !== 'completed') throw new Error(completed.error?.message ?? `Worker 轮次结束：${completed.status}`)
         if (attempt === 2) throw new Error('Worker 未通过交付检查，当前成果与输入已保存')
       }
@@ -794,13 +988,13 @@ export class BotRuntimeService {
     }
     if (call.tool === 'work_publish_artifact') return this.publishArtifact(task, args)
     if (call.tool === 'work_finish') {
-      if (!Array.isArray(args.checks) || args.checks.some(c => typeof c !== 'string')) throw new Error('请提供真实验证结果列表')
+      if (!Array.isArray(args.checks) || args.checks.length > 20 || args.checks.some(c => typeof c !== 'string' || c.length > 1000)) throw new Error('请提供真实验证结果列表')
       const artifacts = Array.isArray(args.artifactIds) ? args.artifactIds.map(String) : []
-      const done = this.store.finishTask(task.id, Number(args.revision), String(args.text), artifacts, worker.run.id)
+      if (artifacts.length && !Array.isArray(args.artifactSummaries)) throw new Error('文件交付必须逐一提交artifactSummaries摘要')
+      const done = this.store.finishTask(task.id, Number(args.revision), String(args.text), artifacts, worker.run.id, (args.artifactSummaries ?? []) as RuntimeArtifactSummaryInput[], args.checks as string[])
       worker.writable = false
       const dossier = this.store.case(task.caseId)!; this.store.saveCase({ ...dossier, summary: `${done.summary}\n验证：${args.checks.join('；')}`.slice(0, 3000), updatedAt: Date.now() })
-      // 任务完成后自动留一条经验候选，不调模型；用满次数才进常驻摘要。
-      this.store.saveExperience(experienceCandidate(task, dossier, String(args.text), args.checks as string[], worker.bot.platform, this.workerFingerprint(worker.bot)))
+      // 仅通过Router验收的最终版本进入经验，退回的初稿不学习。
       void this.flush(task.botId); return { completed: true, instruction: '结束本轮，不再操作项目' }
     }
     throw new Error('未知 Worker 工具')
@@ -967,6 +1161,15 @@ export class BotRuntimeService {
       return this.view(bot.botId, actor)
     }
     if (p.action === 'stop') {
+      // Direct composer control fences uncommitted inference before interrupting the Worker.
+      // Router's own stop decision already owns its inbox transaction and must finish normally.
+      const direct = confirmationInputIds === undefined
+      if (direct) {
+        const active = this.routerClients.get(botId)?.active
+        if (active && !active.committed) active.superseded = true
+        clearTimeout(this.routeTimers.get(botId)); this.routeTimers.delete(botId)
+        for (const input of this.store.pendingInbox(botId)) this.store.markInput(input.id, 'failed', undefined, '已停止；尚未提交的派工已取消，可明确重试')
+      }
       await this.stopTask(bot.botId, task.id)
       this.store.control(bot.botId, p.requestId, () => ({ stopped: true }))
     }
@@ -990,7 +1193,7 @@ export class BotRuntimeService {
       this.store.control(bot.botId, p.requestId, () => {
         if (op) this.store.saveOperation({ ...op, state: 'reconciled', error: `owner 已核对：${note}。原操作未自动重放；继续前先读取当前文件。`, reconciliation: { actor, at: Date.now(), note, confirmedStopped: true } })
         for (const run of unknownRuns) this.store.saveRun({ ...run, state: 'exited', updatedAt: Date.now(), reconciliation: { actor, at: Date.now(), note, confirmedStopped: true } })
-        if (!this.store.operations(task.id).some(o => o.state === 'unknown')) this.store.updateTask(task.id, { state: 'queued', error: undefined, question: undefined, summary: `owner 核对：${note}。继续前先读取当前文件，不得直接重放旧操作。` })
+        if (!this.store.operations(task.id).some(o => o.state === 'unknown')) this.store.updateTask(task.id, { state: 'queued', automationOccurrenceId: undefined, error: undefined, question: undefined, summary: `owner 核对：${note}。继续前先读取当前文件，不得直接重放旧操作。` })
         return { reconciled: true }
       })
       void this.pump(bot.botId)
@@ -1045,7 +1248,8 @@ export class BotRuntimeService {
     const runs = this.store.runs(bot.botId).filter(r => r.taskId === task.id)
     if (operations.some(o => o.state === 'unknown') || runs.some(r => r.state === 'unknown')) throw new Error('旧操作/执行结果未知，请先核对旧执行与项目结果，不能直接重跑')
     const changed = task.mandate.policyRevision !== bot.policyRevision || task.mandate.directory !== bot.directory
-    const patch: Partial<RuntimeTask> = { state: 'queued', error: undefined, resumeIntent: undefined }
+    // Explicit owner continuation becomes ordinary work; never resurrect a cancelled occurrence.
+    const patch: Partial<RuntimeTask> = { state: 'queued', error: undefined, resumeIntent: undefined, automationOccurrenceId: undefined }
     if (changed) {
       if (task.mandate.ownerPhoneId !== bot.ownerPhoneId || task.groupId !== bot.groupId || task.mandate.directory === bot.directory || task.mandate.policyRevision >= bot.policyRevision || task.mandate.executionMode !== 'full-access' || bot.workerAccessMode !== 'full-access' || !['stopped', 'failed'].includes(task.state)) throw new Error('原任务授权已改变，不能直接恢复；请按当前权限重新确认工作范围')
       if (this.active.has(bot.botId) || runs.some(r => r.state !== 'exited') || operations.some(o => ['pending_approval', 'approved', 'running'].includes(o.state))) throw new Error('旧执行或操作尚未结束，请先核对并停止后继续')
@@ -1066,6 +1270,9 @@ export class BotRuntimeService {
     }); void this.pump(bot.botId)
   }
   private async stopTask(botId: string, taskId: string, reason?: string): Promise<void> {
+    const occurrenceId = this.store.task(taskId)?.automationOccurrenceId
+    const occurrence = occurrenceId ? this.store.automations.occurrence(occurrenceId) : undefined
+    if (occurrence && ACTIVE_OCCURRENCE_STATES.includes(occurrence.state)) this.store.automations.transition(occurrence.id, 'cancelled', (this.opts.automationNow ?? Date.now)(), { error: reason ?? '本次任务已停止；下次周期不变' })
     const worker = this.active.get(botId)
     if (worker?.run.taskId !== taskId && this.store.runs(botId).some(r => r.taskId === taskId && r.state === 'unknown')) {
       this.store.cancelReplies(botId, taskId)
@@ -1090,12 +1297,14 @@ export class BotRuntimeService {
     const approval = this.directoryApprovals.get(botId)
     if (approval) approval.cancelled = true
     this.quiescing.set(botId, (this.quiescing.get(botId) ?? 0) + 1)
+    this.automations.cancelChecks(botId)
+    for (const job of this.store.automations.jobs(botId)) this.store.automations.cancelJob(job.id, (this.opts.automationNow ?? Date.now)(), '数字人已停止或权限已变化')
     try {
     clearTimeout(this.routeTimers.get(botId)); this.routeTimers.delete(botId)
     clearTimeout(this.replyTimers.get(botId)); this.replyTimers.delete(botId)
     await this.initializationClients.get(botId)?.close()
     await this.closeRouter(botId)
-    for (const task of this.store.tasks(botId).filter(t => ['queued', 'running', 'waiting_user', 'stopping'].includes(t.state))) await this.stopTask(botId, task.id)
+    for (const task of this.store.tasks(botId).filter(t => ['queued', 'running', 'waiting_user', 'stopping'].includes(t.state) || t.state === 'completed' && t.review?.state === 'pending')) await this.stopTask(botId, task.id)
     for (const input of this.store.pendingInbox(botId)) this.store.markInput(input.id, 'failed', undefined, 'Bot 已停止或权限已改变，此消息未派工')
     this.store.cancelReplies(botId)
     } finally { this.releaseQuiescing(botId) }
@@ -1119,9 +1328,15 @@ export class BotRuntimeService {
     if (this.stopped || this.quiescing.has(reply.botId) || !this.enabled(reply.botId) || !this.store.pendingReplies(reply.botId).some(r => r.id === reply.id)) return false
     const bot = this.opts.getBot(reply.botId)
     if (reply.policyRevision !== bot.policyRevision || reply.groupId !== bot.groupId) return false
+    const automationId = reply.automationOccurrenceId ?? (reply.taskId ? this.store.task(reply.taskId)?.automationOccurrenceId : undefined)
+    if (automationId) {
+      const r = this.store.automations.occurrence(automationId)
+      if (!r || !this.store.automations.current(r) || !this.automationAuthorized(this.store.automations.get(reply.botId, r.jobId))) return false
+    }
     if (!reply.taskId) return true
     const task = this.store.task(reply.taskId)
     return !!task && task.botId === reply.botId && !['stopping', 'stopped', 'recovering'].includes(task.state) && (!reply.runId || task.latestRunId === reply.runId)
+      && (reply.purpose !== 'result' || reply.taskRevision === undefined || reply.taskRevision === task.revision)
       && (reply.purpose !== 'question' || task.question?.id === (reply.questionId ?? reply.key) || task.followup?.questionId === (reply.questionId ?? reply.key))
   }
   /** Worker 不阻塞的提问没人答：主人安静满一段时间后最多再提一次。 */
@@ -1303,6 +1518,7 @@ export class BotRuntimeService {
       }
       this.store.applyMemoryOps(ops, logs)
     })
+    void this.cancelInvalidAutomationWork().catch(error => this.store.saveSettings({ ...this.store.settings(botId), error: `撤回事件委托：${this.error(error)}` }))
   }
   /** 主人对记忆或经验的管理：压下、取消压下、作废。模型没有任何删除能力。 */
   async memoryControl(botId: string, actor: string, c: RuntimeMemoryControl): Promise<RuntimeView> {
@@ -1331,6 +1547,7 @@ export class BotRuntimeService {
   async close(): Promise<void> {
     if (this.stopped) return
     this.stopped = true; clearInterval(this.timer)
+    await this.automations.stop()
     for (const timer of [...this.routeTimers.values(), ...this.replyTimers.values()]) clearTimeout(timer)
     this.routeTimers.clear(); this.replyTimers.clear()
     await Promise.allSettled([...this.initializationClients.values()].map(c => c.close()).concat([...this.routerClients.keys()].map(botId => this.closeRouter(botId))))

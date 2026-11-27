@@ -1,0 +1,30 @@
+{
+  "repository": "https://github.com/openclaw/openclaw",
+  "commit": "2ab7b31a13d95bbbb62596679b130445c4c9d3d1",
+  "license": "MIT",
+  "files": [
+    {
+      "upstream": "src/cron/retry-hint.ts",
+      "destination": "src/cli/bot-runtime/automation/openclaw-retry-hint.ts",
+      "upstreamSha256": "dfc62c78802299340b57eae06a6acf77bb2dbe815354a93e0f7f658dc9115a36",
+      "localSha256": "324c97b25901c194f3d3328bb9881bc315ea8478a5b7623759ae590360c938ae",
+      "changes": [
+        "Added provenance header",
+        "Replaced type-only FailoverReason import with string; runtime logic unchanged"
+      ]
+    },
+    {
+      "upstream": "src/cron/schedule.ts",
+      "destination": "src/cli/bot-runtime/automation/schedule.ts",
+      "upstreamSha256": "9c4a2ff203313bcabc7c9619e69a774ecb65dd8d5c28543b2bdcc48016352a3b",
+      "localSha256": "9e9aaaf8d18a76dd44347f85ffa477fe7835b3f5167e029505499e3d688dae11",
+      "changes": [
+        "Retain core next/previous cron occurrence algorithms and DST correction",
+        "Use CE schedule union and timezone field",
+        "Replace upstream normalization, timestamp, bounded-map and zoned wall-time helpers with local implementations",
+        "Omit unsupported stream/on-exit kinds",
+        "Add strict CE creation validation including no-future cron rejection"
+      ]
+    }
+  ]
+}

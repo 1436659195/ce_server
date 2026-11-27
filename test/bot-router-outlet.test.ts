@@ -21,10 +21,17 @@ function fixture(seed?: (path: string) => void, bubbleGapMs = 0) {
   store.saveSettings({...store.settings('b'),mode:'router-worker',revision:1,profile:'负责运维，跟用户自然聊天。'})
   const sent: RuntimeReply[]=[]
   const turns: Array<{context:any; call:(tool:string,args:Record<string,unknown>)=>Promise<any>; decide:(args:Record<string,unknown>)=>Promise<any>;finish:(status?:string)=>void}>=[]
+  const workerContexts: any[]=[]
   let offline=false
   const service = new BotRuntimeService({store,rootDir:dir,routerQuietMs:0,bubbleGapMs,getBot:()=>bot,
     sendReply:async r=>{if(offline) throw new Error('offline');sent.push(r)},checkAccess:async()=>{throw new Error('no work')},openTools:()=>{throw new Error('no work')},
     createClient:(role,options)=>{
+      if(role==='worker') {
+        let finish: ((v:CodexTurn)=>void)|undefined
+        return {initialize:async()=>{},startThread:async()=> 'worker-thread',resumeThread:async id=>id,
+          startTurn:async(threadId,text)=>{workerContexts.push(JSON.parse(text));return{threadId,turnId:'worker-turn',done:new Promise<CodexTurn>(resolve=>{finish=resolve})}},
+          steer:async()=>'',interrupt:async()=>{finish?.({id:'worker-turn',status:'interrupted'})},close:async()=>{finish?.({id:'worker-turn',status:'interrupted'})}}
+      }
       expect(role).toBe('router'); let finish:((v:CodexTurn)=>void)|undefined
       return {initialize:async()=>{},startThread:async()=> 'thread',resumeThread:async id=>id,
         startTurn:async(threadId,text)=>{
@@ -38,9 +45,12 @@ function fixture(seed?: (path: string) => void, bubbleGapMs = 0) {
   const origin=store.receive({botId:'b',groupId:'dm',seq:++seq,text:'示例引擎是什么，和示例控制台什么关系',senderId:'owner',memberId:'om',createdAt:Date.now()})
   const task=store.acceptWork({inputId:origin.id,newCase:{title:'产品关系',object:'示例引擎',goal:'理解产品'},goal:origin.text,acceptance:[],replies:[],mandate:{ownerPhoneId:'owner',policyRevision:1,directory:dir,allowedOps:['read'],exclusions:[],mode:'execute'}})
   store.updateTask(task.id,{state:'running'})
-  const output=(text='示例引擎是语义引擎，示例控制台是管理平台。来源：内部资料§3.4。',extra:Partial<RuntimeReply>={})=>store.reply({botId:'b',groupId:'dm',author:'worker',purpose:'answer',text,policyRevision:1,inputId:origin.id,taskId:task.id,taskRevision:1,key:crypto.randomUUID(),...extra})
+  const output=(text='示例引擎是语义引擎，示例控制台是管理平台。来源：内部资料§3.4。',extra:Partial<RuntimeReply>={})=>{
+    if(extra.purpose==='result') store.updateTask(task.id,{state:'completed',review:{state:'pending',rounds:store.task(task.id)?.review?.rounds??0}})
+    return store.reply({botId:'b',groupId:'dm',author:'worker',purpose:'answer',text,policyRevision:1,inputId:origin.id,taskId:task.id,taskRevision:store.task(task.id)!.revision,key:crypto.randomUUID(),...extra})
+  }
   cleanups.push(async()=>{await service.close();store.close();rmSync(dir,{recursive:true,force:true})})
-  return{store,bot,task,origin,service,sent,turns,send,output,setOffline:(v:boolean)=>{offline=v}}
+  return{store,bot,task,origin,service,sent,turns,workerContexts,send,output,setOffline:(v:boolean)=>{offline=v}}
 }
 
 test('Worker内部原文不能直发，必须经同一个Router生成对外回复',async()=>{
@@ -62,10 +72,14 @@ test('文件引用由宿主绑定到前台输出，模型不能用空气泡吞�
   const source=f.output('报告已完成，实际文件已导出。',{purpose:'result',artifactIds:['artifact-a']})
   await f.service.flush('b');await until(()=>f.turns.length===1)
   await expect(f.turns[0].decide({workerReplyId:source.id,replies:[]})).rejects.toThrow(/文件|附件/)
+  await expect(f.turns[0].decide({workerReplyId:source.id,replies:['字'.repeat(101)]})).rejects.toThrow(/100/)
+  await expect(f.turns[0].decide({workerReplyId:source.id,replies:['**请查看附件**']})).rejects.toThrow(/纯文本/)
   await f.turns[0].decide({workerReplyId:source.id,replies:['报告好了。','文件在这里。']});f.turns[0].finish()
   await until(()=>f.sent.length===2)
   expect(f.sent.flatMap(r=>r.artifactIds??[])).toEqual(['artifact-a'])
   expect(f.sent.every(r=>r.author==='router'&&r.sourceReplyId===source.id)).toBe(true)
+  expect(f.sent.every(r=>r.format==='plain')).toBe(true)
+  expect(f.store.task(f.task.id)?.review?.state).toBe('approved')
 })
 
 test('必要问题必须由前台提出并保留questionId，不能静默丢弃',async()=>{
@@ -152,14 +166,59 @@ test('新话不能取消尚未送出的必要问题与文件气泡',async()=>{
   expect(f.store.pendingReplies('b').some(r=>r.id===delivery.id)).toBe(true)
 })
 
-test('内部长结果保留证据，前台仍必须把完整回复控制在100字内',async()=>{
+test('内部长结果保留证据，前台Worker文字允许500字Markdown且不能拆泡突破额度',async()=>{
   const f=fixture();const source=f.output('事实及证据。'.repeat(50))
   await f.service.flush('b');await until(()=>f.turns.length===1)
   expect(f.turns[0].context.workerMessage.text).toBe(source.text)
-  await expect(f.turns[0].decide({workerReplyId:source.id,replies:['字'.repeat(101)]})).rejects.toThrow(/100/)
+  await expect(f.turns[0].decide({workerReplyId:source.id,replies:['字'.repeat(501)]})).rejects.toThrow(/500/)
+  await expect(f.turns[0].decide({workerReplyId:source.id,replies:['字'.repeat(300),'字'.repeat(201)]})).rejects.toThrow(/500/)
   expect(()=>f.output('字'.repeat(4001))).toThrow(/4000/)
-  await f.turns[0].decide({workerReplyId:source.id,replies:['已经核对，结论成立。']});f.turns[0].finish()
+  const text='**结论**\n\n'+'字'.repeat(450)
+  await f.turns[0].decide({workerReplyId:source.id,replies:[text]});f.turns[0].finish()
   await until(()=>f.sent.length===1)
+  expect(f.sent[0]).toMatchObject({text,format:'markdown',sourceReplyId:source.id})
+})
+
+test('上一轮使用过Worker不会给当前普通聊天放宽字数或Markdown权限',async()=>{
+  const f=fixture();const source=f.output()
+  await f.service.flush('b');await until(()=>f.turns.length===1)
+  await f.turns[0].decide({workerReplyId:source.id,replies:['**结论**\n示例控制台使用示例引擎。']});f.turns[0].finish()
+  await until(()=>f.sent.length===1)
+  const input=f.send('谢谢，你还在吗');await until(()=>f.turns.length===2)
+  expect(f.turns[1].context.workerMessage).toBeNull()
+  await expect(f.turns[1].decide({replies:['字'.repeat(101)]})).rejects.toThrow(/100/)
+  await expect(f.turns[1].decide({replies:['**在的**']})).rejects.toThrow(/纯文本/)
+  await f.turns[1].decide({replies:['在的。']});f.turns[1].finish()
+  await until(()=>f.sent.length===2)
+  expect(f.sent[1]).toMatchObject({text:'在的。',format:'plain',inputId:input.id})
+  expect(f.sent[1].sourceReplyId).toBeUndefined()
+})
+
+test('Router可在无新用户消息时返工当前交付，保留原目标并给Worker传递具体修正与执行约束',async()=>{
+  const f=fixture();const source=f.output('只解释了示例引擎。',{purpose:'result'})
+  await f.service.flush('b');await until(()=>f.turns.length===1)
+  const feedback='补充示例引擎与示例控制台的关系，并说明依据。'
+  const executionGuidance='引用资料时保留原始引文；不要把内部资料标识当作面向用户的结论。'
+  await f.turns[0].decide({action:'revise',taskId:f.task.id,feedback,executionGuidance,delivery:'files',replies:[]});f.turns[0].finish()
+  await until(()=>f.workerContexts.length===1)
+  const task=f.store.task(f.task.id)!
+  expect(f.store.tasks('b')).toHaveLength(1)
+  expect(f.store.cases('b')).toHaveLength(1)
+  expect(task).toMatchObject({caseId:f.task.caseId,goal:f.origin.text,revision:2,delivery:'files',review:{state:'changes_requested',rounds:1,feedback}})
+  expect(f.store.replies('b').find(r=>r.id===source.id)?.state).toBe('cancelled')
+  expect(f.store.inputs(task.id)[0]).toMatchObject({kind:'correction',text:feedback,executionGuidance,revision:2,inboxId:`review:${source.id}`})
+  expect(f.workerContexts[0].pendingInputs[0]).toMatchObject({text:feedback,executionGuidance,revision:2})
+  expect(f.store.messages('b')).toHaveLength(1)
+  expect(f.sent).toEqual([])
+})
+
+test('普通Worker回答不具有交付返工资格，Router不能把它当自主派工入口',async()=>{
+  const f=fixture();const source=f.output()
+  await f.service.flush('b');await until(()=>f.turns.length===1)
+  await expect(f.turns[0].decide({action:'revise',taskId:f.task.id,feedback:'做一点别的工作',replies:[]})).rejects.toThrow(/返工|交付/)
+  expect(f.store.task(f.task.id)?.revision).toBe(1)
+  expect(f.store.replies('b').find(r=>r.id===source.id)?.state).toBe('pending')
+  expect(f.store.inputs(f.task.id)).toHaveLength(0)
 })
 
 
@@ -211,10 +270,12 @@ test('宿主绑定已见版本而非提交时最新版本，重新查询后才�
   expect(f.store.inputs(f.task.id).find(i=>i.inboxId===current.id)).toMatchObject({kind:'ask_worker',revision:3})
 })
 
-test('Worker结果单独到来：这一轮只压短，查询工具被拒，读取预算为0',async()=>{
+test('Worker结果单独到来：Router可按需查询原需求再验收',async()=>{
   const f=fixture();const source=f.output();await f.service.flush('b');await until(()=>f.turns.length===1)
-  expect(f.turns[0].context.toolsLocked).toBe(true)
-  await expect(f.turns[0].call('chat_recent',{})).rejects.toThrow(/不提供查询/)
+  expect(f.turns[0].context.toolsLocked).toBeUndefined()
+  const history=await f.turns[0].call('chat_recent',{limit:1})
+  expect(history.messages).toHaveLength(1)
+  expect(history.messages[0]).toMatchObject({id:f.origin.id,author:'owner',text:f.origin.text})
   await f.turns[0].decide({workerReplyId:source.id,replies:['示例引擎是语义引擎，示例控制台是管理平台。']});f.turns[0].finish()
   await until(()=>f.sent.length===1);expect(f.sent[0].text).not.toContain('来源')
 })
@@ -229,7 +290,7 @@ test('Worker开工后主人说过话：结果那一轮保留查询工具',async(
   await until(()=>f.sent.length===1)
   const source=f.output('结果如下',{runId:'run-1'});await f.service.flush('b');await until(()=>f.turns.length===2)
   expect(f.turns[1].context.toolsLocked).toBeUndefined()
-  expect(await f.turns[1].call('chat_recent',{})).toBeInstanceOf(Array)
+  expect((await f.turns[1].call('chat_recent',{})).messages).toBeInstanceOf(Array)
   await f.turns[1].decide({workerReplyId:source.id,replies:['示例引擎是语义引擎，示例控制台是管理平台。']});f.turns[1].finish()
   await until(()=>f.sent.length===2)
 })
@@ -240,6 +301,19 @@ test('任务停止后待整理的结果被取消，不再进入前台',async()=>
   expect(await f.turns[0].decide({workerReplyId:source.id,replies:['旧结果']})).toMatchObject({superseded:true});f.turns[0].finish()
   await until(()=>f.store.replies('b').find(r=>r.id===source.id)?.state==='cancelled')
   await Bun.sleep(30);expect(f.turns).toHaveLength(1);expect(f.sent).toHaveLength(0)
+})
+
+test('输入框直接停止会作废尚未提交的Router派工，旧推理不能另起任务',async()=>{
+  const f=fixture();const input=f.send('另外调查对象B');await until(()=>f.turns.length===1)
+  await f.service.control('b','owner',{action:'stop',taskId:f.task.id,expectedRevision:1,requestId:'composer-stop-in-flight'})
+  const stale=await f.turns[0].decide({action:'start',delivery:'chat',goal:'调查对象B',newCase:{title:'对象B',object:'对象B',goal:'调查对象B'},allowedOps:['read'],replies:['开始调查。']})
+  expect(stale).toMatchObject({superseded:true});f.turns[0].finish()
+  await f.service.flush('b');await Bun.sleep(30)
+  expect(f.store.task(f.task.id)?.state).toBe('stopped')
+  expect(f.store.tasks('b')).toHaveLength(1)
+  expect(f.store.inbox(input.id)).toMatchObject({state:'failed',error:expect.stringContaining('已停止')})
+  expect(f.workerContexts).toEqual([])
+  expect(f.sent).toEqual([])
 })
 
 test('决策提交后的收尾超时不算失败：不写错误，回复照发，不重跑',async()=>{

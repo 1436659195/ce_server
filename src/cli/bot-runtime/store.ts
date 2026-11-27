@@ -5,7 +5,11 @@ import { dirname } from 'node:path'
 import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload, RuntimeRemoteOp } from './types'
 import { EXPERIENCE_ESTABLISHED_USES } from './experience'
 import { relevance } from './cases'
+import { validateRouterReply } from './reply-policy'
+import { queryChatHistory, readChatMessage } from './history'
+import type { RuntimeArtifactSummaryInput } from './types'
 import type { RuntimeCaseUpdate, RuntimeCaseDecision } from './types'
+import { AutomationStore } from './automation/store'
 
 type Table = 'settings' | 'inbox' | 'cases' | 'tasks' | 'task_inputs' | 'runs' | 'tool_operations' | 'outbox' | 'artifacts' | 'controls' | 'uploads' | 'memories' | 'memory_log' | 'experiences' | 'remote_ops'
 const tables: Table[] = ['settings', 'inbox', 'cases', 'tasks', 'task_inputs', 'runs', 'tool_operations', 'outbox', 'artifacts', 'controls', 'uploads', 'memories', 'memory_log', 'experiences', 'remote_ops']
@@ -26,6 +30,7 @@ function validateWorkerText(value: unknown): string {
 
 /** 小型本地账本；JSON 是记录正文，SQL 表达式索引负责唯一性。所有业务写入经本类事务。 */
 export class BotRuntimeStore {
+  readonly automations: AutomationStore
   private db: Database
   private closed = false
   constructor(readonly path: string) {
@@ -66,6 +71,12 @@ export class BotRuntimeStore {
         this.db.exec('PRAGMA user_version=3')
       }
     })
+    this.automations = this.transaction(() => {
+      const automations = new AutomationStore(this.db)
+      const version = (this.db.query('PRAGMA user_version').get() as { user_version: number }).user_version
+      if (version < 4) this.db.exec('PRAGMA user_version=4')
+      return automations
+    })
   }
   close(): void { if (!this.closed) { this.closed = true; this.db.close() } }
   private get<T>(table: Table, key: string): T | undefined {
@@ -92,7 +103,7 @@ export class BotRuntimeStore {
   viewTasks(botId: string): RuntimeTask[] {
     const rows = this.db.query(`SELECT body FROM tasks WHERE rowid IN (
       SELECT rowid FROM (SELECT rowid FROM tasks WHERE bot_id=? ORDER BY rowid DESC LIMIT 30)
-      UNION SELECT rowid FROM tasks WHERE bot_id=? AND json_extract(body,'$.state') IN ('queued','running','waiting_user','stopping','recovering')
+      UNION SELECT rowid FROM tasks WHERE bot_id=? AND (json_extract(body,'$.state') IN ('queued','running','waiting_user','stopping','recovering') OR (json_extract(body,'$.state')='completed' AND json_extract(body,'$.review.state')='pending'))
     ) ORDER BY rowid`).all(botId, botId) as { body: string }[]
     return rows.map(row => JSON.parse(row.body))
   }
@@ -212,7 +223,7 @@ export class BotRuntimeStore {
   }
   tasks(botId?: string): RuntimeTask[] { return this.all('tasks', botId) }
   task(taskId: string): RuntimeTask | undefined { return this.get('tasks', taskId) }
-  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason' | 'revision' | 'directoryContinuation'>>): RuntimeTask {
+  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason' | 'revision' | 'directoryContinuation' | 'executionGuidance' | 'review' | 'delivery' | 'automationOccurrenceId'>>): RuntimeTask {
     const task = this.task(taskId); if (!task) throw new Error('工单不存在')
     const now = Date.now()
     const next = { ...task, ...patch, ...(patch.summary !== undefined ? { summaryUpdatedAt: now } : {}), updatedAt: now }
@@ -240,12 +251,11 @@ export class BotRuntimeStore {
     return batch
   }
   routerBubbles(p: Omit<RuntimeReply, 'id' | 'createdAt' | 'state' | 'text'>, replies: string[]): void {
-    if (replies.length > 3) throw new Error('一次最多 3 个语义气泡')
-    const texts = replies.map(validateChatText)
-    if (texts.length) validateChatText(texts.join(''))
-    for (const [index, text] of texts.entries()) this.reply({ ...p, ...(index ? { artifactIds: undefined } : {}), text, key: index ? `${p.key}:${index}` : p.key, replyGroupId: p.key, bubbleIndex: index })
+    const format = validateRouterReply(replies)
+    const texts = replies.map(t => t.trim())
+    for (const [index, text] of texts.entries()) this.reply({ ...p, ...(index ? { artifactIds: undefined } : {}), text, format, key: index ? `${p.key}:${index}` : p.key, replyGroupId: p.key, bubbleIndex: index })
   }
-  acceptWork(p: { inputId: string; inputIds?: string[]; caseId?: string; caseUpdate?: RuntimeCaseUpdate; caseDecision?: RuntimeCaseDecision; newCase?: { title: string; object: string; goal: string }; goal: string; acceptance: string[]; mandate: RuntimeMandate; replyText?: string; replies?: string[]; sourceInputIds?: string[]; delivery?: RuntimeTask['delivery'] }): RuntimeTask {
+  acceptWork(p: { inputId: string; inputIds?: string[]; caseId?: string; caseUpdate?: RuntimeCaseUpdate; caseDecision?: RuntimeCaseDecision; newCase?: { title: string; object: string; goal: string }; goal: string; acceptance: string[]; mandate: RuntimeMandate; replyText?: string; replies?: string[]; sourceInputIds?: string[]; delivery?: RuntimeTask['delivery']; executionGuidance?: string }): RuntimeTask {
     return this.transaction(() => {
       const batch = this.requireBatch(p.inputId, p.inputIds); const input = batch.at(-1)!
       if (input.senderId !== p.mandate.ownerPhoneId) throw new Error('原消息与授权 owner 不一致')
@@ -263,6 +273,7 @@ export class BotRuntimeStore {
       task.originInputIds = batch.map(m => m.id)
       task.attachmentInputIds = attachmentInputIds
       task.delivery = p.delivery
+      task.executionGuidance = p.executionGuidance
       task.caseDecision = p.caseDecision
       this.put('tasks', task)
       this.routerBubbles({ botId: input.botId, groupId: input.groupId, inputId: input.id, taskId: task.id, taskRevision: task.revision, author: 'router', purpose: 'ack', key: `${input.id}:router`, policyRevision: p.mandate.policyRevision }, p.replies ?? [p.replyText!])
@@ -270,7 +281,31 @@ export class BotRuntimeStore {
       return task
     })
   }
-  acceptInput(p: { inputId: string; inputIds?: string[]; taskId: string; expectedRevision: number; kind: RuntimeTaskInput['kind']; replyText?: string; replies?: string[]; sourceInputIds?: string[]; delivery?: RuntimeTask['delivery'] }): RuntimeTaskInput {
+  acceptAutomationWork(p: { occurrenceId: string; caseId?: string; caseUpdate?: RuntimeCaseUpdate; caseDecision?: RuntimeCaseDecision; newCase?: { title: string; object: string; goal: string }; goal: string; acceptance: string[]; mandate: RuntimeMandate; replies: string[]; delivery?: RuntimeTask['delivery']; executionGuidance?: string }): RuntimeTask {
+    return this.transaction(() => {
+      const occurrence = this.automations.occurrence(p.occurrenceId)
+      if (!occurrence || occurrence.state !== 'routing' || !this.automations.current(occurrence)) throw new Error('事件触发已消费或状态失效')
+      const job = this.automations.get(occurrence.botId, occurrence.jobId); const source = job.source
+      if (occurrence.diagnostic) throw new Error('监测异常只能通知，不能代替用户派工')
+      if (p.mandate.ownerPhoneId !== source.ownerId || p.mandate.policyRevision !== source.mandate.policyRevision || p.mandate.directory !== source.mandate.directory || p.mandate.allowedOps.some(op => !source.mandate.allowedOps.includes(op))) throw new Error('事件工单不能扩大源委托授权权限')
+      const inputs = source.inputIds.map(id => this.requireInbox(id))
+      if (inputs.some(m => m.revokedAt || m.botId !== job.botId || m.groupId !== source.groupId || m.senderId !== source.ownerId)) throw new Error('事件原委托已失效')
+      if (Boolean(p.caseId) === Boolean(p.newCase)) throw new Error('已有卷宗和新卷宗必须二选一')
+      let dossier = p.caseId ? this.case(p.caseId) : undefined
+      if (p.caseId && (!dossier || dossier.botId !== job.botId)) throw new Error('卷宗归属不匹配')
+      if (dossier) dossier = this.updateCase(job.botId, dossier.id, p.caseUpdate)
+      if (!dossier) { dossier = { ...p.newCase!, id: id('case'), botId: job.botId, summary: '', revision: 1, aliases: [], createdAt: Date.now(), updatedAt: Date.now() }; this.saveCase(dossier) }
+      const task: RuntimeTask = { id: id('task'), botId: job.botId, caseId: dossier.id, originInputId: source.inputIds.at(-1)!, originInputIds: source.inputIds,
+        automationOccurrenceId: occurrence.id, attachmentInputIds: inputs.filter(m => m.attachments?.length).map(m => m.id), groupId: job.groupId, requesterMemberId: source.memberId, goal: p.goal, acceptance: p.acceptance,
+        mandate: structuredClone(p.mandate), state: 'queued', revision: 1, summary: '', createdAt: Date.now(), updatedAt: Date.now(), delivery: p.delivery, executionGuidance: p.executionGuidance, caseDecision: p.caseDecision }
+      this.put('tasks', task)
+      this.automations.transition(occurrence.id, 'working', Date.now(), { taskId: task.id })
+      if (!job.source.caseId) this.automations.saveJob({ ...job, source: { ...job.source, caseId: dossier.id } })
+      this.routerBubbles({ botId: job.botId, groupId: job.groupId, taskId: task.id, taskRevision: task.revision, automationOccurrenceId: occurrence.id, author: 'router', purpose: 'ack', key: `${occurrence.id}:router`, policyRevision: p.mandate.policyRevision }, p.replies)
+      return task
+    })
+  }
+  acceptInput(p: { inputId: string; inputIds?: string[]; taskId: string; expectedRevision: number; kind: RuntimeTaskInput['kind']; replyText?: string; replies?: string[]; sourceInputIds?: string[]; delivery?: RuntimeTask['delivery']; executionGuidance?: string }): RuntimeTaskInput {
     return this.transaction(() => {
       const batch = this.requireBatch(p.inputId, p.inputIds); const input = batch.at(-1)!; const task = this.task(p.taskId)
       if (!task || task.botId !== input.botId || task.groupId !== input.groupId || task.mandate.ownerPhoneId !== input.senderId) throw new Error('工单与消息归属不匹配')
@@ -278,7 +313,7 @@ export class BotRuntimeStore {
       if (task.revision !== p.expectedRevision) throw new Error('工单版本已改变，请重新读取')
       const revision = task.revision + 1
       const attachments = [...batch.flatMap(m => m.attachments ?? []), ...this.attachmentSources(input, p.sourceInputIds).flatMap(source => source.attachments ?? [])].filter((a, i, all) => all.findIndex(b => b.id === a.id) === i)
-      const addition: RuntimeTaskInput = { id: id('input'), botId: task.botId, taskId: task.id, inboxId: input.id, inboxIds: batch.map(m => m.id), kind: p.kind, text: batch.map(m => m.text).join('\n'), ...(attachments.length ? { attachments } : {}), revision, delivery: 'pending', createdAt: Date.now() }
+      const addition: RuntimeTaskInput = { id: id('input'), botId: task.botId, taskId: task.id, inboxId: input.id, inboxIds: batch.map(m => m.id), kind: p.kind, executionGuidance: p.executionGuidance, text: batch.map(m => m.text).join('\n'), ...(attachments.length ? { attachments } : {}), revision, delivery: 'pending', createdAt: Date.now() }
       this.put('task_inputs', addition)
       this.put('tasks', { ...task, revision, ...(p.delivery === 'files' ? { delivery: 'files' } : {}), ...(p.kind === 'answer' ? { state: task.state === 'waiting_user' ? 'queued' : task.state, question: undefined, followup: undefined } : {}), updatedAt: Date.now() })
       this.routerBubbles({ botId: input.botId, groupId: input.groupId, inputId: input.id, taskId: task.id, taskRevision: revision, author: 'router', purpose: 'ack', key: `${input.id}:router`, policyRevision: task.mandate.policyRevision }, p.replies ?? [p.replyText!])
@@ -309,7 +344,7 @@ export class BotRuntimeStore {
     if (!resolution.trim()) throw new Error('处理结论不能为空')
     this.put('task_inputs', { ...input, resolution })
   }
-  finishTask(taskId: string, revision: number, text: string, artifactIds: string[], runId?: string): RuntimeTask {
+  finishTask(taskId: string, revision: number, text: string, artifactIds: string[], runId?: string, summaries?: RuntimeArtifactSummaryInput[], checks?: string[]): RuntimeTask {
     return this.transaction(() => {
       const task = this.task(taskId); if (!task || task.state !== 'running') throw new Error('工单不处于执行状态')
       if (task.revision !== revision) throw new Error('需求版本已变化，请先处理新输入')
@@ -319,10 +354,42 @@ export class BotRuntimeStore {
       if (artifactIds.length > 4) throw new Error('一次交付最多 4 个附件，请整理交付成果')
       if (task.delivery === 'files' && !artifactIds.length) throw new Error('本任务要求文件交付，必须导出并附上实际附件，不能只说写好了')
       if (!artifactIds.length && this.artifacts(task.botId).some(a => a.taskId === task.id)) throw new Error('已生成交付附件，必须在 artifactIds 中引用，不能只说写好了')
-      this.reply({ botId: task.botId, groupId: task.groupId, inputId: task.originInputId, taskId, taskRevision: revision, runId, author: 'worker', purpose: 'result', text, artifactIds, key: `${task.id}:result:${revision}`, policyRevision: task.mandate.policyRevision })
-      return this.updateTask(taskId, { state: 'completed', summary: text, question: undefined })
+      const artifactSummaries = this.bindArtifactSummaries(taskId, artifactIds, summaries)
+      this.reply({ botId: task.botId, groupId: task.groupId, inputId: task.originInputId, taskId, taskRevision: revision, runId, author: 'worker', purpose: 'result', text, artifactIds, artifactSummaries, checks, key: `${task.id}:result:${revision}`, policyRevision: task.mandate.policyRevision })
+      return this.updateTask(taskId, { state: 'completed', summary: text, question: undefined, review: { state: 'pending', rounds: task.review?.rounds ?? 0 } })
     })
   }
+  private bindArtifactSummaries(taskId: string, artifactIds: string[], summaries?: RuntimeArtifactSummaryInput[]) {
+    // Legacy in-process callers may omit summaries. New Worker tool submissions always provide this array.
+    if (summaries === undefined) return undefined
+    if (!Array.isArray(summaries) || summaries.length !== artifactIds.length || new Set(artifactIds).size !== artifactIds.length) throw new Error('每个交付附件必须有且只有一份摘要')
+    const text = (v: unknown, max: number) => typeof v === 'string' && !!v.trim() && v.length <= max
+    const list = (v: unknown) => Array.isArray(v) && v.length <= 12 && v.every(s => text(s, 400))
+    if (JSON.stringify(summaries).length > 8000) throw new Error('文件摘要合计最多8000字符，请精炼内容')
+    const seen = new Set<string>()
+    return summaries.map(s => {
+      const artifact = this.artifact(s.artifactId)
+      if (!artifact || artifact.taskId !== taskId || !artifactIds.includes(s.artifactId) || seen.has(s.artifactId) || !text(s.summary, 1200) || !list(s.requirements) || !list(s.checks) || !list(s.limitations)) throw new Error('文件摘要内容或关联无效')
+      seen.add(s.artifactId)
+      return { artifactId: s.artifactId, summary: s.summary.trim(), requirements: s.requirements, checks: s.checks, limitations: s.limitations, hash: artifact.hash, revision: artifact.revision }
+    })
+  }
+  reviseWorkerResult(botId: string, replyId: string, taskId: string, expectedRevision: number, feedback: string, executionGuidance?: string, delivery?: RuntimeTask['delivery']): RuntimeTaskInput {
+    return this.transaction(() => {
+      const source = this.get<RuntimeReply>('outbox', replyId); const task = this.task(taskId)
+      if (!source || source.botId !== botId || source.taskId !== taskId || source.author !== 'worker' || source.purpose !== 'result' || source.state !== 'pending' || source.attemptedAt !== undefined || !task || task.botId !== botId || task.state !== 'completed' || task.revision !== expectedRevision || source.taskRevision !== task.revision) throw new Error('只能返工当前待验收的Worker结果')
+      if ((task.review?.rounds ?? 0) >= 3) throw new Error('已达三轮返工上限，请向用户说明尚未解决的问题，不能继续自动返工')
+      if (!feedback.trim() || feedback.length > 2000) throw new Error('请提供明确、有限的返工意见')
+      const revision = task.revision + 1
+      const input: RuntimeTaskInput = { id: id('input'), botId, taskId, inboxId: `review:${source.id}`, kind: 'correction', text: feedback.trim(), executionGuidance, revision, delivery: 'pending', createdAt: Date.now() }
+      this.put('task_inputs', input)
+      this.cancelReplies(botId, taskId)
+      this.updateTask(taskId, { state: 'queued', revision, error: undefined, ...(delivery === 'files' ? { delivery: 'files' } : {}), review: { state: 'changes_requested', rounds: (task.review?.rounds ?? 0) + 1, feedback: feedback.trim() } })
+      return input
+    })
+  }
+  chatHistory(botId: string, options: Parameters<typeof queryChatHistory>[2]) { return queryChatHistory(this.db, botId, options) }
+  chatMessage(botId: string, options: Parameters<typeof readChatMessage>[2]) { return readChatMessage(this.db, botId, options) }
   saveRun(run: RuntimeRun): void { this.put('runs', run) }
   run(runId: string): RuntimeRun | undefined { return this.get('runs', runId) }
   runs(botId?: string): RuntimeRun[] { return this.all('runs', botId) }
@@ -330,7 +397,16 @@ export class BotRuntimeStore {
   operations(taskId?: string): RuntimeOperation[] { return this.all<RuntimeOperation>('tool_operations').filter(o => !taskId || o.taskId === taskId) }
   saveOperation(operation: RuntimeOperation): void { this.put('tool_operations', operation) }
   reply(p: Omit<RuntimeReply, 'id' | 'createdAt' | 'state'>): RuntimeReply {
-    const text = p.author === 'worker' ? validateWorkerText(p.text) : validateChatText(p.text)
+    const occurrenceId = p.taskId ? this.task(p.taskId)?.automationOccurrenceId : undefined
+    if (occurrenceId) p = { ...p, automationOccurrenceId: occurrenceId }
+    let text: string
+    if (p.author === 'worker') text = validateWorkerText(p.text)
+    else {
+      const source = p.sourceReplyId ? this.get<RuntimeReply>('outbox', p.sourceReplyId) : undefined
+      const worker = !!source && source.botId === p.botId && source.author === 'worker' && source.state === 'pending'
+      const format = validateRouterReply([p.text], { worker, files: worker && !!source.artifactIds?.length })
+      p = { ...p, format }; text = p.text.trim()
+    }
     const row = this.db.query("SELECT body FROM outbox WHERE bot_id=? AND json_extract(body,'$.key')=?").get(p.botId, p.key) as { body: string } | null
     if (row) return JSON.parse(row.body)
     const reply: RuntimeReply = { ...p, text, id: id('reply'), createdAt: Date.now(), state: 'pending' }
@@ -349,8 +425,8 @@ export class BotRuntimeStore {
       if (!source || source.botId !== botId || source.author !== 'worker' || source.state !== 'pending' || source.attemptedAt !== undefined) throw new Error('Worker结果已处理或归属不匹配')
       const indexes = mixed?.indexes ?? texts.map((_, i) => i)
       if (texts.length > 3 || indexes.some(i => !Number.isInteger(i) || i < 0 || i >= texts.length) || new Set(indexes).size !== indexes.length) throw new Error('气泡索引无效')
-      const validated = texts.map(validateChatText)
-      if (validated.length) validateChatText(validated.join(''))
+      const format = validateRouterReply(texts, { worker: indexes.length > 0, files: indexes.length > 0 && !!source.artifactIds?.length })
+      const validated = texts.map(t => t.trim())
       if (!indexes.length && source.purpose === 'question' && !source.followupReminder) throw new Error('必要问题不能被前台静默丢弃')
       if (!indexes.length && source.artifactIds?.length) throw new Error('文件交付必须保留附件，不能静默丢弃')
       if (!indexes.length && !basis.trim()) throw new Error('省略Worker结果需要说明依据')
@@ -359,7 +435,12 @@ export class BotRuntimeStore {
       for (const [i, text] of validated.entries()) {
         const belongsToWorker = indexes.includes(i)
         this.reply({ ...(belongsToWorker ? { ...metadata, sourceReplyId: source.id, artifactIds: i === Math.min(...indexes) ? source.artifactIds : undefined } : mixed!.user),
-          author: 'router', key: i ? `${group}:${i}` : group, replyGroupId: group, bubbleIndex: i, text })
+          author: 'router', format, key: i ? `${group}:${i}` : group, replyGroupId: group, bubbleIndex: i, text })
+      }
+      if (source.purpose === 'result' && source.taskId) {
+        const task = this.task(source.taskId)
+        if (!task || task.state !== 'completed' || source.taskRevision !== task.revision) throw new Error('Worker交付版本已失效')
+        this.updateTask(task.id, { review: { state: 'approved', rounds: task.review?.rounds ?? 0 } })
       }
       this.put('outbox', { ...source, state: 'routed', routingBasis: basis.slice(0, 1000), routingError: undefined, nextRoutingAt: undefined })
     })

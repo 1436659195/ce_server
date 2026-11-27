@@ -130,7 +130,7 @@ export interface GroupAttachment {
   id: string; kind: 'upload' | 'artifact'; botId: string; name: string; mime: string; size: number; hash: string;
 }
 export type GroupPlaintext =
-  | { kind: 'text'; text: string; attachments?: GroupAttachment[] }
+  | { kind: 'text'; text: string; attachments?: GroupAttachment[]; format?: 'plain' | 'markdown' }
   | { kind: 'system'; text: string } // relay 侧通知(如 xx 加入)不需要——走 group-meta;此档留给手机端本地系统提示
   | { kind: string; [k: string]: unknown };
 

@@ -157,9 +157,13 @@ export interface RuntimeMandate {
 }
 export type RuntimeTaskState = 'queued' | 'running' | 'waiting_user' | 'completed' | 'stopping' | 'stopped' | 'recovering' | 'failed'
 export interface RuntimeTask {
+  /** A scheduled task references its actual source message and a separately persisted trigger. */
+  automationOccurrenceId?: string
   id: string; botId: string; caseId: string; originInputId: string; groupId: string; requesterMemberId: string
   goal: string; acceptance: string[]; mandate: RuntimeMandate; state: RuntimeTaskState; revision: number
   summary: string; createdAt: number; updatedAt: number; latestRunId?: string; error?: string
+  executionGuidance?: string
+  review?: { state: 'pending' | 'approved' | 'changes_requested'; rounds: number; feedback?: string }
   caseDecision?: RuntimeCaseDecision
   sessionOrigin?: 'inherited' | 'new'; sessionReason?: string
   /** owner 明确继续后更新目录授权；旧工单内容保留，首次执行必须新建 Session。 */
@@ -187,6 +191,7 @@ export interface RuntimeTaskInput {
   text: string; revision: number; delivery: 'pending' | 'accepted' | 'unknown'; consumedAt?: number
   resolution?: string; createdAt: number
   inboxIds?: string[]
+  executionGuidance?: string
   attachments?: RuntimeAttachment[]
 }
 export interface RuntimeRun {
@@ -202,9 +207,10 @@ export interface RuntimeOperation {
   reconciliation?: { actor: string; at: number; note: string; confirmedStopped: true }
 }
 export interface RuntimeReply {
+  automationOccurrenceId?: string
   id: string; key: string; botId: string; groupId: string; inputId?: string; taskId?: string; runId?: string
   author: 'router' | 'worker'; purpose: 'chat' | 'ack' | 'answer' | 'question' | 'result' | 'unable'
-  text: string; artifactIds?: string[]; policyRevision: number; state: 'pending' | 'routed' | 'sent' | 'cancelled'; createdAt: number
+  text: string; format?: 'plain' | 'markdown'; artifactIds?: string[]; artifactSummaries?: RuntimeArtifactSummary[]; checks?: string[]; policyRevision: number; state: 'pending' | 'routed' | 'sent' | 'cancelled'; createdAt: number
   taskRevision?: number; questionId?: string
   /** 发送已开始但没有成功回执时，保留同一 ID 重试，不假定从未发出。 */
   attemptedAt?: number; sentAt?: number; sentOrder?: number
@@ -220,6 +226,11 @@ export interface RuntimeReply {
   /** 不阻塞提问的再次提醒：前台可以决定不再提（0 个气泡并写依据）。 */
   followupReminder?: true
 }
+export interface RuntimeArtifactSummaryInput {
+  artifactId: string; summary: string; requirements: string[]; checks: string[]; limitations: string[]
+}
+/** 摘要关联宿主保存的不可变文件版本，不能使用模型自报的 hash。 */
+export interface RuntimeArtifactSummary extends RuntimeArtifactSummaryInput { hash: string; revision: number }
 export interface RuntimeArtifact {
   id: string; botId: string; caseId: string; taskId: string; title: string; mime: string
   path: string; size: number; hash: string; revision: number; createdAt: number
