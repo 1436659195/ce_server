@@ -199,3 +199,15 @@ test('failure of a pinned old version does not mark an independently corrected l
   expect(f.lib.get('b', e.id)).toMatchObject({ state: 'active', version: 2, steps: ['已修正的新步骤'] })
   expect(f.lib.usage('b', e.id)[0]).toMatchObject({ version: 1, status: 'failed', successful: false })
 })
+
+test('blank check strings do not validate a lesson or count successful adoption', () => {
+  const f = fixture(); const e = save(f); const ref = { experienceId: e.id, version: 1 }
+  const report = { ...ref, status: 'applied' as const, appliedSteps: ['动态读端口'], result: '执行过但尚未提供检查证据' }
+  f.lib.recordUsage('b', f.task.id, [report], [ref])
+  const reply = f.store.reply({ botId: 'b', groupId: 'dm-b', author: 'worker', purpose: 'result', text: '完成', key: 'blank-check', taskId: f.task.id, taskRevision: 1, policyRevision: 1, checks: ['  '], experienceUsage: [report] })
+  f.store.updateTask(f.task.id, { state: 'completed', review: { state: 'approved', rounds: 0 } }); f.store.presentWorkerReply('b', reply.id, ['完成。'], '')
+  const next = f.lib.save('b', command(content('未验证的另一个经验')), { taskId: f.task.id, replyId: reply.id })
+  expect(f.lib.get('b', next.id)?.verified).toBe(false)
+  f.lib.acceptUsage('b', f.task.id, reply.id)
+  expect(f.lib.get('b', e.id)?.stats).toMatchObject({ adopted: 1, succeeded: 0 })
+})
