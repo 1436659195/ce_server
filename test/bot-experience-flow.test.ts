@@ -118,6 +118,20 @@ test('Worker 不能声称采用没有被派发的经验，校验失败不完成�
   expect(f.store.tasks('b')[0].state).toBe('running')
 })
 
+for (const statuses of [['applied', 'failed'], ['failed', 'applied']]) test(`同次交付拒绝同一经验的重复反馈 ${statuses.join('/')}，修改后可正常交付`, async () => {
+  const f = fixture(); const saved = f.seed(); const ref = { experienceId: saved.id, version: 1 }
+  const worker = await startTask(f, [ref])
+  const report = { ...ref, status: 'failed', appliedSteps: ['执行旧步骤'], result: '旧步骤失效' }
+  await expect(worker.call('work_finish', { revision: 1, text: '完成', artifactIds: [], checks: ['检查完成'],
+    experienceUsage: statuses.map(status => ({ ...report, status })) })).rejects.toThrow(/经验|重复/)
+  expect(f.store.tasks('b')[0].state).toBe('running')
+  expect(f.store.experienceLibrary.get('b', saved.id)).toMatchObject({ version: 1, state: 'active', stats: { adopted: 0, succeeded: 0 } })
+  expect(f.store.experienceLibrary.usageHistory('b', f.store.tasks('b')[0].id)).toHaveLength(0)
+  await finishTask(f, { experienceUsage: [report] }); await acceptResult(f)
+  expect(f.store.experienceLibrary.usage('b', saved.id)[0]).toMatchObject({ status: 'failed', successful: false })
+  expect(f.store.experienceLibrary.get('b', saved.id)?.stats).toMatchObject({ adopted: 1, succeeded: 0 })
+})
+
 test('更新经验后，已开始的 Worker 仍读取派发时的旧版本', async () => {
   const f = fixture(); const receipt = f.seed(); const worker = await startTask(f, [{ experienceId: receipt.id, version: 1 }])
   const s = f.source()

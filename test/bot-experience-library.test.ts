@@ -184,6 +184,60 @@ test('accepted result without its own usage report cannot turn an earlier feedba
   expect(f.lib.get('b', e.id)?.stats).toMatchObject({ adopted: 1, succeeded: 0 })
 })
 
+test('duplicate usage IDs are rejected even across versions before any counters or history change', () => {
+  const f = fixture(); const e = save(f)
+  f.lib.save('b', command(content(), { id: e.id, expectedVersion: 1 }), { inboxId: f.msg.id })
+  const refs = [1, 2].map(version => ({ experienceId: e.id, version }))
+  const reports = refs.map(ref => ({ ...ref, status: 'applied' as const, appliedSteps: ['读取动态端口'], result: '端口已确认' }))
+  expect(() => f.lib.recordUsage('b', f.task.id, reports, refs)).toThrow(/经验|重复/)
+  expect(f.lib.get('b', e.id)?.stats).toMatchObject({ adopted: 0, succeeded: 0 })
+  expect(f.lib.usageHistory('b', f.task.id)).toHaveLength(0)
+})
+
+test('accepted legacy duplicate reports cannot credit the stored failed adoption as success', () => {
+  const f = fixture(); const e = save(f); const ref = { experienceId: e.id, version: 1 }
+  const failed = { ...ref, status: 'failed' as const, appliedSteps: ['旧步骤'], result: '步骤已失效' }
+  f.lib.recordUsage('b', f.task.id, [failed], [ref])
+  const reply = f.store.reply({ botId: 'b', groupId: 'dm-b', author: 'worker', purpose: 'result', text: '完成', key: 'legacy-duplicates', taskId: f.task.id, taskRevision: 1, policyRevision: 1, checks: ['核实完成'], experienceUsage: [{ ...failed, status: 'applied' }, failed] })
+  f.store.updateTask(f.task.id, { state: 'completed', review: { state: 'approved', rounds: 0 } }); f.store.presentWorkerReply('b', reply.id, ['完成。'], '')
+  expect(() => f.lib.acceptUsage('b', f.task.id, reply.id)).toThrow(/经验|重复/)
+  expect(f.lib.usage('b', e.id)[0]).toMatchObject({ status: 'failed', successful: false })
+  expect(f.lib.get('b', e.id)?.stats?.succeeded).toBe(0)
+})
+
+test('success requires the accepted report to match the recorded adoption, not only its ID and version', () => {
+  const f = fixture(); const e = save(f); const ref = { experienceId: e.id, version: 1 }
+  const applied = { ...ref, status: 'applied' as const, appliedSteps: ['读取动态端口'], result: '初次执行通过' }
+  f.lib.recordUsage('b', f.task.id, [{ ...applied, status: 'failed', result: '后续核实失败' }], [ref])
+  const reply = f.store.reply({ botId: 'b', groupId: 'dm-b', author: 'worker', purpose: 'result', text: '完成', key: 'mismatched-usage', taskId: f.task.id, taskRevision: 1, policyRevision: 1, checks: ['核实完成'], experienceUsage: [applied] })
+  f.store.updateTask(f.task.id, { state: 'completed', review: { state: 'approved', rounds: 0 } }); f.store.presentWorkerReply('b', reply.id, ['完成。'], '')
+  f.lib.acceptUsage('b', f.task.id, reply.id)
+  expect(f.lib.usage('b', e.id)[0]).toMatchObject({ status: 'failed', successful: false })
+  expect(f.lib.get('b', e.id)?.stats?.succeeded).toBe(0)
+})
+
+test('matching normalized adapted feedback still counts success once after acceptance', () => {
+  const f = fixture(); const e = save(f); const ref = { experienceId: e.id, version: 1 }
+  const report = { ...ref, status: 'adapted' as const, appliedSteps: ['  按新接口读取动态端口  '], result: '  按目标版本调整后验证通过  ' }
+  f.lib.recordUsage('b', f.task.id, [report], [ref])
+  const reply = f.store.reply({ botId: 'b', groupId: 'dm-b', author: 'worker', purpose: 'result', text: '完成', key: 'adapted-usage', taskId: f.task.id, taskRevision: 1, policyRevision: 1, checks: ['新接口验证通过'], experienceUsage: [report] })
+  f.store.updateTask(f.task.id, { state: 'completed', review: { state: 'approved', rounds: 0 } }); f.store.presentWorkerReply('b', reply.id, ['完成。'], '')
+  f.lib.acceptUsage('b', f.task.id, reply.id); f.lib.acceptUsage('b', f.task.id, reply.id)
+  expect(f.lib.usage('b', e.id)[0]).toMatchObject({ status: 'adapted', successful: true })
+  expect(f.lib.get('b', e.id)?.stats).toMatchObject({ adopted: 1, succeeded: 1 })
+})
+
+test('an accepted older applied report cannot validate a different applied result for the same version', () => {
+  const f = fixture(); const e = save(f); const ref = { experienceId: e.id, version: 1 }
+  const report = { ...ref, status: 'applied' as const, appliedSteps: ['读取动态端口'], result: '尚未检查的新结果' }
+  f.lib.recordUsage('b', f.task.id, [report], [ref])
+  const reply = f.store.reply({ botId: 'b', groupId: 'dm-b', author: 'worker', purpose: 'result', text: '完成', key: 'older-applied-usage', taskId: f.task.id, taskRevision: 1, policyRevision: 1, checks: ['旧结果验证通过'], experienceUsage: [{ ...report, result: '旧结果' }] })
+  f.store.updateTask(f.task.id, { state: 'completed', review: { state: 'approved', rounds: 0 } }); f.store.presentWorkerReply('b', reply.id, ['完成。'], '')
+  f.lib.acceptUsage('b', f.task.id, reply.id)
+  expect(f.lib.usage('b', e.id)[0]).toMatchObject({ status: 'applied', successful: false })
+  expect(f.lib.get('b', e.id)?.stats?.succeeded).toBe(0)
+})
+
 test('numeric version ranges and OS aliases are checked while unknown versions remain candidates', () => {
   const f = fixture(); save(f, content('支持版本一', { scope: { os: 'win32', versionRange: '>=1.2.0 <2.0.0' } }))
   expect(f.lib.search('b', { scope: { os: 'windows', version: '1.5.0' } }).items).toHaveLength(1)
@@ -240,6 +294,21 @@ test('abbreviated version ranges are unknown rather than padded into exact numer
   }
   const exact = save(f, content('完整精确版本', { scope: { versionRange: '=1.2.0' } }))
   expect(f.lib.search('b', { scope: { version: '1.2.9' } }).items.some(e => e.id === exact.id)).toBe(false)
+})
+
+test('incomplete current versions stay unknown for both ranges and exact numeric scopes', () => {
+  const f = fixture()
+  const ranged = save(f, content('完整范围', { scope: { versionRange: '>=1.2.1 <2.0.0' } }))
+  const exact = save(f, content('精确补丁版本', { scope: { version: '1.2.9' } }))
+  for (const version of ['1', '1.2', 'v1.2']) {
+    const found = f.lib.search('b', { scope: { version } }).items
+    expect(found.find(e => e.id === ranged.id)?.warnings).toContain('versionRange 未核实')
+    expect(found.find(e => e.id === exact.id)?.warnings).toContain('version 未核实')
+  }
+  expect(f.lib.search('b', { scope: { version: '1.2.0' } }).items).toHaveLength(0)
+  expect(f.lib.search('b', { scope: { version: '1.2.9' } }).items.map(e => e.id)).toEqual(expect.arrayContaining([ranged.id, exact.id]))
+  const partial = save(f, content('待核实的精确版本', { scope: { version: '1.2' } }))
+  expect(f.lib.search('b', { scope: { version: '1.2.9' } }).items.find(e => e.id === partial.id)?.warnings).toContain('version 未核实')
 })
 
 test('exact version scopes exclude known mismatches and retain unknown versions with explicit warnings', () => {

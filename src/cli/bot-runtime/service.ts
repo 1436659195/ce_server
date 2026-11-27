@@ -849,7 +849,7 @@ export class BotRuntimeService {
         if (this.replyCurrent(workerMessage)) {
           this.store.presentWorkerReply(bot.botId, workerMessage.id, d.replies, d.basis, message ? { indexes: d.workerReplyIndexes!, user: userReply } : undefined)
           if (workerMessage.purpose === 'result' && workerMessage.taskId) {
-            this.store.experienceLibrary.acceptUsage(botId, workerMessage.taskId, workerMessage.id, workerMessage.experienceUsage ?? [])
+            this.store.experienceLibrary.acceptUsage(botId, workerMessage.taskId, workerMessage.id)
             if (d.acceptLesson && workerMessage.lesson) {
               experienceReceipt = this.store.experienceLibrary.acceptLesson(botId, workerMessage.id)
             }
@@ -1094,7 +1094,7 @@ export class BotRuntimeService {
       if (proposal && !proposal.success) throw new Error('经验草稿格式无效，请提供主题、适用条件、具体步骤和依据')
       if (proposal?.success && proposal.data.id && !(task.experienceRefs ?? []).some(r => r.experienceId === proposal.data.id && r.version === proposal.data.expectedVersion)) throw new Error('只能补充本工单已派发版本的经验')
       const usage = EXPERIENCE_USAGE_SCHEMA.safeParse(args.experienceUsage ?? [])
-      if (!usage.success) throw new Error('经验采用反馈格式无效')
+      if (!usage.success) throw new Error('经验采用反馈格式无效；同一经验编号每次只能报告一次')
       const artifacts = Array.isArray(args.artifactIds) ? args.artifactIds.map(String) : []
       if (artifacts.length && !Array.isArray(args.artifactSummaries)) throw new Error('文件交付必须逐一提交artifactSummaries摘要')
       const done = this.store.transaction(() => {

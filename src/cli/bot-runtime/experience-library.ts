@@ -12,6 +12,8 @@ export const EXPERIENCE_CONTENT_SCHEMA = z.strictObject({
 })
 export const EXPERIENCE_SAVE_SCHEMA = z.strictObject({ requestId: text(200), id: text(150).optional(), expectedVersion: z.number().int().min(1).optional(), content: EXPERIENCE_CONTENT_SCHEMA, changeSummary: text(1000) }).refine(v => !!v.id === (v.expectedVersion !== undefined), '更新需要经验编号和当前版本')
 export const EXPERIENCE_USAGE_SCHEMA = z.array(z.strictObject({ experienceId: text(150), version: z.number().int().min(1), status: z.enum(['applied', 'adapted', 'skipped', 'failed']), appliedSteps: texts(), result: text(1000) })).max(3)
+  .refine(reports => new Set(reports.map(r => r.experienceId)).size === reports.length, '同一经验编号每次只能报告一次')
+  .describe('每次交付每个经验编号只能提交一条最终反馈，不同版本也不能重复。')
 export interface ExperienceReceipt { id: string; version: number; created: boolean; duplicate?: true }
 export interface ExperienceSearchItem { id: string; version: number; title: string; approach: string; applicability: string; scope: ExperienceScope; verified: boolean; warnings: string[] }
 export interface ExperienceSearchResult { items: ExperienceSearchItem[]; total: number; nextOffset?: number; mode: 'catalog' | 'keyword' }
@@ -34,7 +36,7 @@ function normalizeScope(scope: ExperienceScope = {}): ExperienceScope {
   return value
 }
 function versionMatches(version: string, range: string): boolean | undefined {
-  const parse = (v: string) => { const m = /^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(v); return m ? [+m[1], +(m[2] ?? 0), +(m[3] ?? 0)] : undefined }
+  const parse = (v: string) => { const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(v); return m ? [+m[1], +m[2], +m[3]] : undefined }
   const current = parse(version); if (!current) return undefined
   const cmp = (a: number[], b: number[]) => { for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return Math.sign(a[i] - b[i]); return 0 }
   let unknown = false
@@ -43,7 +45,7 @@ function versionMatches(version: string, range: string): boolean | undefined {
     for (const part of parts) {
       const m = /^(>=|<=|>|<|=|~|\^)?(v?\d+(?:\.\d+){0,2})$/.exec(part); const target = m && parse(m[2])
       // Every range operand must be a full numeric version; never infer shorthand semantics.
-      if (!m || !target || m[2].replace(/^v/, '').split('.').length !== 3) { unknown = true; match = false; break }
+      if (!m || !target) { unknown = true; match = false; break }
       const n = cmp(current, target); const op = m[1] ?? '='
       if (!(op === '>=' ? n >= 0 : op === '<=' ? n <= 0 : op === '>' ? n > 0 : op === '<' ? n < 0 : op === '~' ? n >= 0 && current[0] === target[0] && current[1] === target[1] : op === '^' ? n >= 0 && (target[0] ? current[0] === target[0] : target[1] ? current[0] === 0 && current[1] === target[1] : current[0] === 0 && current[1] === 0 && current[2] === target[2]) : n === 0)) match = false
     }
@@ -62,7 +64,8 @@ function scopeMatch(required: ExperienceScope = {}, actual: ExperienceScope = {}
   if (r.version) {
     // Strip only the conventional numeric v prefix; opaque build IDs still require exact equality.
     const exact = (version: string) => version.replace(/^v(?=\d+\.\d+\.\d+$)/, '')
-    if (!a.version) warnings.push('version 未核实')
+    const incomplete = (version: string) => /^v?\d+(?:\.\d+)?$/.test(version)
+    if (!a.version || incomplete(a.version) || incomplete(r.version)) warnings.push('version 未核实')
     else if (exact(r.version) !== exact(a.version)) return { compatible: false, warnings, specificity }
     else specificity++
   }
@@ -229,7 +232,7 @@ export class ExperienceLibrary {
     } })
   }
   recordUsage(botId: string, taskId: string, reports: ExperienceUsageReport[], selectedRefs: ExperienceRef[]): void {
-    const parsed = EXPERIENCE_USAGE_SCHEMA.safeParse(reports); if (!parsed.success) throw new Error('经验采用反馈格式无效')
+    const parsed = EXPERIENCE_USAGE_SCHEMA.safeParse(reports); if (!parsed.success) throw new Error('经验采用反馈格式无效；同一经验编号每次只能报告一次')
     const task = this.row<RuntimeTask>('tasks', taskId); if (!task || task.botId !== botId) throw new Error('经验采用工单归属不匹配')
     this.atomic(() => { for (const report of parsed.data) {
       if (!selectedRefs.some(r => r.experienceId === report.experienceId && r.version === report.version)) throw new Error('只能反馈当前任务已选定关联的经验版本')
@@ -248,15 +251,16 @@ export class ExperienceLibrary {
       }
     } })
   }
-  acceptUsage(botId: string, taskId: string, replyId: string, reports?: ExperienceUsageReport[]): void {
+  acceptUsage(botId: string, taskId: string, replyId: string): void {
     this.atomic(() => {
       const source = this.source(botId, { taskId, replyId }); if (!source.verified) return
-      const actual = reports ?? source.reply?.experienceUsage
+      const actual = EXPERIENCE_USAGE_SCHEMA.safeParse(source.reply?.experienceUsage ?? [])
+      if (!actual.success) throw new Error('验收的经验采用反馈格式无效；同一经验编号每次只能报告一次')
       const entries = this.db.query('SELECT experience_id,body FROM experience_usage WHERE bot_id=? AND task_id=?').all(botId, taskId) as { experience_id: string; body: string }[]
       for (const row of entries) {
         const entry = JSON.parse(row.body) as { report: ExperienceUsageReport; adopted: boolean; succeeded: boolean }
-        const report = actual?.find(r => r.experienceId === row.experience_id && r.version === entry.report.version)
-        if (!report || !['applied', 'adapted'].includes(report.status) || entry.succeeded || !entry.adopted) continue
+        const report = actual.data.find(r => r.experienceId === row.experience_id && r.version === entry.report.version)
+        if (!report || !['applied', 'adapted'].includes(report.status) || hash(report) !== hash(entry.report) || entry.succeeded || !entry.adopted) continue
         const item = this.get(botId, row.experience_id); if (!item) continue
         entry.succeeded = true; this.db.query('UPDATE experience_usage SET body=? WHERE bot_id=? AND task_id=? AND experience_id=?').run(JSON.stringify(entry), botId, taskId, item.id)
         this.put({ ...item, stats: { ...(item.stats ?? zeroStats()), succeeded: (item.stats?.succeeded ?? 0) + 1 } }, false)
