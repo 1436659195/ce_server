@@ -1,6 +1,6 @@
 import { routerCall } from './helpers/router-decision'
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BotRuntimeService } from '../src/cli/bot-runtime/service'
@@ -20,7 +20,7 @@ function fixture() {
   store.saveSettings({ ...store.settings('b'), mode: 'router-worker', revision: 1, profile: '负责运维，跟用户自然聊天。' })
   const sent: RuntimeReply[] = []
   // modelText 是模型这一轮最后说的话，空串表示它什么都没说就结束了；提醒那一轮的输入是纯文本，不是上下文 JSON。
-  const turns: Array<{ context: any; decide: (args: Record<string, unknown>) => Promise<any>; finish: (modelText?: string) => void }> = []
+  const turns: Array<{ context: any; decide: (args: Record<string, unknown>) => Promise<any>; call: (tool: string, args: Record<string, unknown>) => Promise<unknown>; finish: (modelText?: string, status?: string, error?: string) => void }> = []
   const service = new BotRuntimeService({ store, rootDir: dir, routerQuietMs: 0, bubbleGapMs: 0, getBot: () => bot,
     sendReply: async r => { sent.push(r) }, checkAccess: async () => { throw new Error('no work') }, openTools: () => { throw new Error('no work') },
     createClient: (role, options) => {
@@ -28,8 +28,9 @@ function fixture() {
       return { initialize: async () => {}, startThread: async () => 'thread', resumeThread: async id => id,
         startTurn: async (threadId, text) => {
           const turnId = `turn-${turns.length}`; const done = new Promise<CodexTurn>(r => { finish = r }); const resolve = finish!
-          turns.push({ context: text.startsWith('{') ? JSON.parse(text) : text, decide: args => options.onToolCall({ threadId, turnId, callId: turnId, tool: 'router_decide', arguments: routerCall({ action: 'reply', feasibility: 'can', ...args }) }),
-            finish: (modelText = '') => resolve({ id: turnId, status: 'completed', ...(modelText ? { items: [{ type: 'agentMessage', text: modelText }] } : {}) }) })
+          const call = (tool: string, args: Record<string, unknown>) => options.onToolCall({ threadId, turnId, callId: turnId, tool, arguments: args })
+          turns.push({ context: text.startsWith('{') ? JSON.parse(text) : text, call, decide: args => call('router_decide', routerCall({ action: 'reply', feasibility: 'can', ...args })),
+            finish: (modelText = '', status = 'completed', error) => resolve({ id: turnId, status, ...(error ? { error: { message: error } } : {}), ...(modelText ? { items: [{ type: 'agentMessage', text: modelText }] } : {}) }) })
           return { threadId, turnId, done }
         }, steer: async () => '', interrupt: async () => {}, close: async () => { finish?.({ id: 'closed', status: 'interrupted' }) } }
     } })
@@ -43,8 +44,126 @@ function fixture() {
     return store.reply({ botId: 'b', groupId: 'dm', author: 'worker', purpose: 'answer', text, policyRevision: 1, inputId: origin.id, taskId: task.id, taskRevision: store.task(task.id)!.revision, key: crypto.randomUUID(), ...extra })
   }
   cleanups.push(async () => { await service.close(); store.close(); rmSync(dir, { recursive: true, force: true }) })
-  return { store, service, bot, task, sent, turns, send, output }
+  return { dir, store, service, bot, task, sent, turns, send, output }
 }
+
+const diagnosticPath = (dir: string) => join(dir, 'bot-runtime', 'router-diagnostics.jsonl')
+const diagnostics = (dir: string) => readFileSync(diagnosticPath(dir), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+
+test('决策被拒绝后保存具体原因、关联消息与轮次，补交提醒携带校验原因', async () => {
+  const f = fixture(); const message = f.send('啥意思？'); await until(() => f.turns.length === 1)
+  const privateReply = '保密回答不要落日志'.repeat(20)
+  await expect(f.turns[0].decide({ replies: [privateReply] })).rejects.toThrow(/100/)
+  f.turns[0].finish('内部正文不应落日志'); await until(() => f.turns.length === 2)
+  expect(f.turns[1].context).toContain('100')
+  f.turns[1].finish()
+  await until(() => f.store.inbox(message.id)?.state === 'failed')
+  const [trace] = diagnostics(f.dir)
+  expect(trace).toMatchObject({ botId: 'b', inputIds: [message.id], outcome: 'failed', nudged: true })
+  expect(trace.decisions).toMatchObject([{ phase: 'initial', origin: 'model', stage: 'validation', accepted: false, action: 'reply', replyCount: 1, replyChars: [privateReply.length], reason: expect.stringContaining('100') }])
+  expect(trace.turns).toMatchObject([{ phase: 'initial', status: 'completed', textChars: '内部正文不应落日志'.length }, { phase: 'nudge', status: 'completed', textChars: 0 }])
+  expect(JSON.stringify(trace)).not.toContain('保密回答')
+  expect(JSON.stringify(trace)).not.toContain('内部正文')
+  expect(JSON.stringify(trace)).not.toContain('啥意思')
+  expect(statSync(diagnosticPath(f.dir)).mode & 0o777).toBe(0o600)
+})
+
+test('宿主代交失败后模型修正成功仍保留恢复诊断，不改变原消息处理结果', async () => {
+  const f = fixture(); const message = f.send('解释一下'); await until(() => f.turns.length === 1)
+  f.turns[0].finish('长'.repeat(120)); await until(() => f.turns.length === 2)
+  await f.turns[1].decide({ replies: ['已经解释清楚。'] }); f.turns[1].finish()
+  await until(() => f.store.inbox(message.id)?.state === 'routed')
+  await until(() => existsSync(diagnosticPath(f.dir)))
+  const [trace] = diagnostics(f.dir)
+  expect(trace.outcome).toBe('recovered')
+  expect(trace.decisions).toMatchObject([{ origin: 'host', accepted: false, reason: expect.stringContaining('100') }, { phase: 'nudge', origin: 'model', accepted: true }])
+  expect(f.sent.map(r => r.text)).toEqual(['已经解释清楚。'])
+  expect(f.store.settings('b').error).toBeUndefined()
+})
+
+test('结构错误保留字段路径，不记录未知字段内的敏感值', async () => {
+  const f = fixture(); const message = f.send('解释一下'); await until(() => f.turns.length === 1)
+  await expect(f.turns[0].call('router_decide', { decision: { action: 'reply' }, feasibility: 'can', replies: '不能记录的原始回答', 'private-token-should-not-log': 'secret-value-should-not-log' })).rejects.toThrow(/决策参数格式错误/)
+  f.turns[0].finish(); await until(() => f.turns.length === 2); f.turns[1].finish()
+  await until(() => f.store.inbox(message.id)?.state === 'failed')
+  const [trace] = diagnostics(f.dir)
+  expect(trace.decisions[0].reason).toContain('replies')
+  expect(trace.decisions[0].reason).toContain('决策参数格式错误')
+  expect(JSON.stringify(trace)).not.toContain('private-token-should-not-log')
+  expect(JSON.stringify(trace)).not.toContain('secret-value-should-not-log')
+  expect(JSON.stringify(trace)).not.toContain('不能记录的原始回答')
+})
+
+test('模型运行失败记录分类，不复制原始账号诊断或完整输出', async () => {
+  const f = fixture(); const message = f.send('在吗'); await until(() => f.turns.length === 1)
+  f.turns[0].finish('不得记录的模型输出', 'failed', '401 unauthorized bearer super-secret-test-token')
+  await until(() => f.store.inbox(message.id)?.state === 'failed')
+  const [trace] = diagnostics(f.dir)
+  expect(trace.outcome).toBe('failed')
+  expect(trace.reason).toContain('认证')
+  expect(trace.turns).toMatchObject([{ phase: 'initial', status: 'failed' }])
+  expect(JSON.stringify(trace)).not.toContain('super-secret-test-token')
+  expect(JSON.stringify(trace)).not.toContain('不得记录的模型输出')
+})
+
+test('未知字段名包含引号和分隔符时，日志和补交提醒都不保留字段名内容', async () => {
+  const f = fixture(); const message = f.send('解释一下'); await until(() => f.turns.length === 1)
+  const unknown = 'prefix"PRIVATE_KEY_CONTENT"suffix；ANOTHER_PRIVATE_KEY'
+  await expect(f.turns[0].call('router_decide', { decision: { action: 'reply' }, feasibility: 'can', replies: ['说明。'], [unknown]: 'value' })).rejects.toThrow(/决策参数格式错误/)
+  f.turns[0].finish(); await until(() => f.turns.length === 2)
+  expect(f.turns[1].context).not.toContain('PRIVATE_KEY_CONTENT')
+  expect(f.turns[1].context).not.toContain('ANOTHER_PRIVATE_KEY')
+  f.turns[1].finish(); await until(() => f.store.inbox(message.id)?.state === 'failed')
+  const [trace] = diagnostics(f.dir)
+  expect(trace.decisions[0].reason).toContain('决策参数格式错误')
+  expect(JSON.stringify(trace)).not.toContain('PRIVATE_KEY_CONTENT')
+  expect(JSON.stringify(trace)).not.toContain('ANOTHER_PRIVATE_KEY')
+})
+
+test('通过参数校验但被派工与来源校验拒绝时，记录提交阶段的具体原因', async () => {
+  const f = fixture(); const message = f.send('解释一下'); await until(() => f.turns.length === 1)
+  await expect(f.turns[0].decide({ replies: ['说明。'], workerReplyIndexes: [0] })).rejects.toThrow(/Worker/)
+  f.turns[0].finish(); await until(() => f.turns.length === 2); f.turns[1].finish()
+  await until(() => f.store.inbox(message.id)?.state === 'failed')
+  const [trace] = diagnostics(f.dir)
+  expect(trace.decisions[0]).toMatchObject({ stage: 'commit', accepted: false, reason: expect.stringContaining('Worker') })
+  expect(f.sent).toHaveLength(0)
+})
+
+test('一轮反复提交只保留最近八次诊断及丢弃计数，正常回复不产生诊断日志', async () => {
+  const f = fixture(); const message = f.send('解释一下'); await until(() => f.turns.length === 1)
+  for (let i = 0; i < 12; i++) await expect(f.turns[0].decide({ replies: ['长'.repeat(120)] })).rejects.toThrow(/100/)
+  await f.turns[0].decide({ replies: ['已说明。'] }); f.turns[0].finish()
+  await until(() => existsSync(diagnosticPath(f.dir)))
+  const [trace] = diagnostics(f.dir)
+  expect(trace).toMatchObject({ outcome: 'recovered', droppedDecisions: 5, nudged: false })
+  expect(trace.decisions).toHaveLength(8)
+  expect(f.store.inbox(message.id)?.state).toBe('routed')
+
+  const ordinary = fixture(); ordinary.send('在吗'); await until(() => ordinary.turns.length === 1)
+  await ordinary.turns[0].decide({ replies: ['在。'] }); ordinary.turns[0].finish()
+  await until(() => ordinary.sent.length === 1)
+  expect(existsSync(diagnosticPath(ordinary.dir))).toBe(false)
+})
+
+test('诊断日志轮转保留完整JSON行，日志不可写不影响正常处理', async () => {
+  const f = fixture(); mkdirSync(join(f.dir, 'bot-runtime'), { recursive: true })
+  writeFileSync(diagnosticPath(f.dir), 'x'.repeat(1_100_000))
+  const message = f.send('解释一下'); await until(() => f.turns.length === 1)
+  f.turns[0].finish('长'.repeat(120)); await until(() => f.turns.length === 2)
+  await f.turns[1].decide({ replies: ['已说明。'] }); f.turns[1].finish()
+  await until(() => f.store.inbox(message.id)?.state === 'routed')
+  await until(() => existsSync(diagnosticPath(f.dir) + '.1'))
+  expect(diagnostics(f.dir)).toHaveLength(1)
+
+  const blocked = fixture(); writeFileSync(join(blocked.dir, 'bot-runtime'), 'blocked')
+  const next = blocked.send('解释一下'); await until(() => blocked.turns.length === 1)
+  blocked.turns[0].finish('长'.repeat(120)); await until(() => blocked.turns.length === 2)
+  await blocked.turns[1].decide({ replies: ['仍能正常说明。'] }); blocked.turns[1].finish()
+  await until(() => blocked.store.inbox(next.id)?.state === 'routed')
+  expect(blocked.sent.map(r => r.text)).toEqual(['仍能正常说明。'])
+  expect(blocked.store.settings('b').error).toBeUndefined()
+})
 
 test('前台只说了正文、没提交决策：宿主代为提交，正文照发，不留未处理', async () => {
   const f = fixture(); const message = f.send('解决了，感谢感谢')

@@ -5,6 +5,7 @@ import { BOT_TOOLS, BOT_EXPORT_TOOL } from '../bot-tools'
 import { operationMode, type BotApproval, type BotOperation, type BotPermissions } from '../bot-permissions'
 import { ClaudeRuntime } from './claude'
 import { CodexAppServer, CodexToolOutput, type CodexActiveTurn, type CodexToolCall, type CodexToolSpec, type CodexTurn } from './codex'
+import { RouterDiagnostics } from './router-diagnostics'
 import { artifactReference, attachmentMime, attachmentName, ATTACHMENT_MAX_BYTES, BotAttachmentFiles } from './attachments'
 import { activeOperationStatus, bindRouterDecision, boundedText, isControlUtterance, routerContext, REMOTE_COMPUTER_INSTRUCTIONS, ROUTER_INSTRUCTIONS, ROUTER_TOOLS, tool, WORKER_INSTRUCTIONS, type RouterBindings, type RouterDecision } from './router'
 import { experienceCandidate, experienceFingerprint, experienceSummary, selectExperiences } from './experience'
@@ -77,7 +78,7 @@ export const ROUTER_MAX_WAIT_MS = 12_000
 export const RESUME_INTENT_MS = 60_000
 const RESUME_TIMEOUT = '等待停止超时，未能自动恢复；请再说一次继续'
 /** 前台一轮正常结束却没有提交决策时，在同一会话里提醒一次。 */
-const ROUTER_UNDECIDED_NUDGE = '上一轮已经结束，但你没有调用 router_decide 提交决策；宿主不会把未经提交的正文发给用户。请现在提交一次 router_decide：要回话就把刚才想说的话写进 replies，不必回话就提交空数组；带 Worker 结果时照常关联结果并回应文件交付。'
+const ROUTER_UNDECIDED_NUDGE = '上一轮已经结束，但没有成功提交有效的 router_decide 决策；宿主不会把未经提交的正文发给用户。请现在提交一次 router_decide：要回话就把刚才想说的话写进 replies，不必回话就提交空数组；带 Worker 结果时照常关联结果并回应文件交付。'
 /** 前台这一轮最后说给用户听的一句；只认模型正文，不把工具结果当话。 */
 function lastAgentText(turn: CodexTurn): string {
   const last = [...(turn.items ?? [])].reverse().find(item => item.type === 'agentMessage')
@@ -504,6 +505,8 @@ export class BotRuntimeService {
         const turnSourceId = message?.id ?? workerMessage?.id ?? automationEvent!.occurrence.id
         // 验收默认只读摘要，必要时允许按需查询原话或附件片段。
         const toolsLocked = false
+        const diagnostic = new RouterDiagnostics({ botId, inputIds: messages.map(m => m.id), workerReplyId: workerMessage?.id, automationOccurrenceId: automationEvent?.occurrence.id })
+        let decisionOrigin: 'model' | 'host' = 'model'
         let committed = false
         let turnState: RouterSession['active']
         let session: RouterSession | undefined
@@ -570,9 +573,17 @@ export class BotRuntimeService {
             if (committed || committing) throw new Error('本条消息已提交，请结束本轮')
             if (call.tool === 'router_decide') {
               decisions++
-              const decision = bindRouterDecision(call.arguments, this.opts.getBot(botId), bindings)
+              let decision: RouterDecision
+              try { decision = bindRouterDecision(call.arguments, this.opts.getBot(botId), bindings) }
+              catch (error) { diagnostic.decision(call.arguments, decisionOrigin, 'validation', false, error); throw error }
               committing = true; active.committed = true
-              try { await this.decide(messages, decision, workerMessage, automationEvent); committed = true; if (message) this.afterTurn(settings, message, selection.triggered, experience.selected.map(e => e.id)); return { accepted: true } }
+              try {
+                await this.decide(messages, decision, workerMessage, automationEvent); committed = true
+                diagnostic.decision(call.arguments, decisionOrigin, 'commit', true)
+                if (message) this.afterTurn(settings, message, selection.triggered, experience.selected.map(e => e.id))
+                return { accepted: true }
+              }
+              catch (error) { if (!committed) diagnostic.decision(call.arguments, decisionOrigin, 'commit', false, error); throw error }
               finally { committing = false; active.committed = committed }
             }
             if (call.tool === 'automation') {
@@ -642,6 +653,7 @@ export class BotRuntimeService {
           active.turn = session.client.startTurn(session.threadId, context, turnSourceId)
           const turn = await active.turn
           const result = await turn.done
+          diagnostic.turn(result)
           if (active.superseded) continue
           if (result.status !== 'completed') throw new Error(result.error?.message ?? '前台轮次未正常完成，请重试')
           if (!committed) {
@@ -655,15 +667,19 @@ export class BotRuntimeService {
               : !message && automationEvent && said ? { decision: { action: 'reply' }, feasibility: 'can', replies: [said] }
               : !message && workerMessage && said ? { decision: { action: 'reply' }, feasibility: 'can', replies: [said], workerReplyIndexes: [0] } : undefined
             if (spoken) {
+              decisionOrigin = 'host'
               try { await active.handler({ tool: 'router_decide', threadId: turn.threadId, turnId: turn.turnId, callId: `${turn.turnId}:host`, arguments: spoken }) }
               catch { /* 正文不合气泡规则：下面提醒它自己重写。 */ }
+              finally { decisionOrigin = 'model' }
             }
             if (!committed) {
               clearTimeout(timeout)
               timeout = setTimeout(() => { void this.closeRouter(botId, current).catch(() => undefined) }, this.opts.routerTurnTimeoutMs ?? ROUTER_TURN_TIMEOUT_MS)
-              session.turns++; session.contextChars += ROUTER_UNDECIDED_NUDGE.length
-              active.turn = session.client.startTurn(session.threadId!, ROUTER_UNDECIDED_NUDGE, `${turnSourceId}:nudge`)
+              const nudge = ROUTER_UNDECIDED_NUDGE + diagnostic.nudge()
+              session.turns++; session.contextChars += nudge.length
+              active.turn = session.client.startTurn(session.threadId!, nudge, `${turnSourceId}:nudge`)
               const again = await (await active.turn).done
+              diagnostic.turn(again)
               if (active.superseded) continue
               if (again.status !== 'completed') throw new Error(again.error?.message ?? '前台轮次未正常完成，请重试')
             }
@@ -674,12 +690,14 @@ export class BotRuntimeService {
           await this.closeRouter(botId, session)
           // 决策已经提交落库：之后的收尾超时或进程关闭不影响结果，不当成失败，也不让主人重试。
           if (!committed && !turnState?.superseded) {
+            diagnostic.failed(error)
             if (workerMessage) this.store.deferWorkerReply(workerMessage.id, this.error(error))
             if (automationEvent) this.automations.fail(automationEvent.occurrence.id, this.error(error))
             for (const input of messages) if (this.store.inbox(input.id)?.state === 'pending') this.store.markInput(input.id, 'failed', undefined, this.error(error))
             this.store.saveSettings({ ...this.store.settings(botId), error: this.error(error) })
           }
         } finally {
+          diagnostic.write(this.opts.rootDir, committed, !!turnState?.superseded)
           if (automationEvent && !committed) this.automations.release(automationEvent.occurrence.id)
           clearTimeout(timeout)
           if (session) { session.active = undefined; this.idleRouter(botId, session) }

@@ -124,6 +124,18 @@ bun run src/relay/main.ts --rotate    # 重置所有 token 后退出
 | 老手机「PIN 变了」连不上 | ce 重启没带 `--pin`(随机了) | 已配对的免 PIN;新人从 ce 日志读新 PIN |
 | `relay-state.json` 损坏 | 磁盘/手动改坏 | 删它(代价:所有手机重扫) |
 | ce 日志 `拒绝配对…PIN 错/缺` | 手机没带 PIN 或 PIN 错 | 确认 ce 当前 PIN(pin 模式新人首次要) |
+| Bot 提示“前台未提交有效决策” | Router 未成功提交，需区分参数校验、来源/工单校验、未补交或模型运行失败 | 按 Bot ID 或消息 ID 查询下面的 Router 诊断日志 |
+
+### Router 回复诊断
+
+本机 `~/.ce/bot-runtime/router-diagnostics.jsonl` 按行保存异常轮次；修正后成功的轮次也记录为 `recovered`，新输入使旧轮次失效则标记 `superseded`。普通成功回复不写日志。无需修改数据库结构或安装新版 APK。
+
+- `botId`、`inputIds`、`workerReplyId`、`automationOccurrenceId`：关联数字人和本轮真实来源。
+- `decisions`：最近 8 次**宿主收到的**决策提交，记录初始/提醒阶段、模型/宿主代交、动作类型、原文长度、是否接受，以及参数校验或提交阶段的拒绝原因；更早提交只保留丢弃计数。
+- `turns`：模型轮次结束状态和最终正文的 UTF-16 长度（不是 Markdown 可见字数），不记录正文。模型认证、网络等错误只保存分类说明，不复制原始 SDK 诊断。
+- 提醒模型补交时会带上最近一次拒绝原因，帮助它修正；原有次数、权限、来源关联和字数限制继续生效。
+
+日志文件权限为 `0600`，不保存聊天正文、文件内容或工具参数值。当前日志达到约 1 MB 后轮转为 `.1`，只保留一份备份；写入失败不阻塞回复与派工。旧版本未记录的失败细节无法追溯补出，后续重现时才有此记录。CLI/SDK 在到达宿主回调前拒绝的调用不会记作已收到的决策。
 
 ## 关键文件
 
@@ -134,6 +146,7 @@ bun run src/relay/main.ts --rotate    # 重置所有 token 后退出
 | `~/.ce/connection-code.json` | 配对码 r/s/k/t(ce 打印/落盘) |
 | `~/.ce/authorized-phones.json` | pin 白名单(phoneId 数组) |
 | `relay.log` / ce 启动重定向 | 运行日志 |
+| `~/.ce/bot-runtime/router-diagnostics.jsonl` / `.jsonl.1` | Router 异常轮次与修正恢复诊断，按 Bot/消息 ID 关联 |
 
 ## 后置强化(部署期,非纯代码层)
 
