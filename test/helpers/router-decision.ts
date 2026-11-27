@@ -11,6 +11,7 @@ export function routerCall(p: Record<string, any>): Record<string, unknown> {
   if (['append', 'ask_worker', 'answer'].includes(action) && p.caseUpdate) decision.caseUpdate = p.caseUpdate
   if (['start', 'append', 'ask_worker', 'answer'].includes(action) && p.sourceInputIds) decision.priorAttachmentMessageIds = p.sourceInputIds
   if (['start', 'append', 'ask_worker', 'answer', 'revise'].includes(action) && p.executionGuidance !== undefined) decision.executionGuidance = p.executionGuidance
+  if (['start', 'append', 'ask_worker', 'answer', 'revise'].includes(action) && p.experienceRefs !== undefined) decision.experienceRefs = p.experienceRefs
   if (action === 'revise') decision.feedback = p.feedback
-  return { decision, feasibility, replies: replies ?? (replyText ? [replyText] : []), basis, cancelReplyIds, workerReplyIndexes }
+  return { decision, feasibility, replies: replies ?? (replyText ? [replyText] : []), basis, cancelReplyIds, workerReplyIndexes, ...(p.acceptLesson !== undefined ? { acceptLesson: p.acceptLesson } : {}) }
 }

@@ -48,7 +48,7 @@ test('数据库分页、旧活动任务、关联隔离及全历史搜索保持�
       for (const [table, body] of [
         ['inbox', { id: `in${i}`, botId: 'b', text: '失败消息', memoryJob: { state: 'failed' } }],
         ['memories', { id: `m${i}`, botId: 'b', status: i < 10 ? 'retired' : 'active', needsReview: i === 10 }],
-        ['experiences', { id: `e${i}`, botId: 'b' }],
+        ['experiences', { id: `e${i}`, botId: 'b', state: 'active', object: '历史任务', goal: `报告${i}`, approach: '核对结果', detail: '完成普通任务', checks: [], verified: false, sourceTaskId: `t${i}`, sourceCaseId: `c${i}`, uses: 0, platform: 'codex', toolFingerprint: 'legacy', createdAt: i, updatedAt: i }],
       ] as const) db.query(`INSERT INTO ${table} VALUES(?,?,?)`).run(body.id, 'b', JSON.stringify(body))
     }
     expect(store.failedMemoryJobs('b').map(i => i.id)).toEqual(Array.from({ length: 10 }, (_, i) => `in${70 + i}`))

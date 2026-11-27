@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod/v4'
-import type { ExperienceMaterial, ExperienceRef, ExperienceSaveCommand, ExperienceScope, ExperienceSource, ExperienceStats, ExperienceUsageReport, RuntimeArtifact, RuntimeExperience, RuntimeInbox, RuntimeReply, RuntimeTask } from './types'
+import type { ExperienceMaterial, ExperienceRef, ExperienceSaveCommand, ExperienceScope, ExperienceSource, ExperienceStats, ExperienceUsageReport, RuntimeArtifact, RuntimeBot, RuntimeExperience, RuntimeInbox, RuntimeReply, RuntimeTask } from './types'
 
 const text = (max: number) => z.string().trim().min(1).max(max)
 const texts = (max = 20) => z.array(text(500)).max(max)
@@ -175,10 +175,19 @@ export class ExperienceLibrary {
     return { items, total: candidates.length, ...(offset + items.length < candidates.length ? { nextOffset: offset + items.length } : {}), mode }
   }
   changeState(botId: string, args: { requestId: string; id: string; expectedVersion: number; state: RuntimeExperience['state']; reason: string }, source: ExperienceSource): ExperienceReceipt {
+    return this.applyState(botId, args, source, () => { this.source(botId, source) })
+  }
+  /** Authenticated host settings action; never exposed as a model tool or content evidence. */
+  changeStateByOwner(bot: Pick<RuntimeBot, 'botId' | 'ownerPhoneId'>, actor: string, args: { requestId: string; id: string; expectedVersion: number; state: RuntimeExperience['state']; reason: string }): ExperienceReceipt {
+    if (!actor || actor !== bot.ownerPhoneId) throw new Error('只有主人身份可以管理经验')
+    const source: ExperienceSource = { ownerControl: { actorId: actor, requestId: args.requestId } }
+    return this.applyState(bot.botId, args, source, () => {})
+  }
+  private applyState(botId: string, args: { requestId: string; id: string; expectedVersion: number; state: RuntimeExperience['state']; reason: string }, source: ExperienceSource, authorize: () => void): ExperienceReceipt {
     const schema = z.strictObject({ requestId: text(200), id: text(150), expectedVersion: z.number().int().min(1), state: z.enum(['active', 'needs_review', 'retired']), reason: text(1000) }); const parsed = schema.safeParse(args)
     if (!parsed.success) throw new Error('经验状态参数无效')
     return this.atomic(() => this.receipt(botId, args.requestId, { args, source }, () => {
-      this.source(botId, source); const previous = this.get(botId, args.id)
+      authorize(); const previous = this.get(botId, args.id)
       if (!previous || previous.kind !== 'lesson' || previous.version !== args.expectedVersion) throw new Error('经验不存在或版本已变化')
       const item = { ...previous, state: args.state, version: previous.version + 1, changeSummary: args.reason, source, updatedAt: Date.now() }
       this.put(item); this.snapshot(item); return { id: item.id, version: item.version, created: false }

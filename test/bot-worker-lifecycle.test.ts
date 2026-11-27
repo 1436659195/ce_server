@@ -971,26 +971,29 @@ test('Router 查工单只披露有限未处理输入，不把已处理长历史�
   expect(JSON.stringify(inspected)).not.toContain('历史详细结论')
 })
 
-test('Router 渐进式经验查询既限制单次内容，也限制本轮累计内容', async () => {
-  const results: unknown[] = []; const errors: string[] = []
+test('Router 经验读取分页、累计预算和调用次数独立于普通查询预算', async () => {
+  const results: unknown[] = []; const errors: string[] = []; let experienceId = ''
   const f = fixture([{ action: 'reply', replyText: '我会根据已读取的经验判断。' }], {
     seed: (store, bot) => {
-      const base = { botId: bot.botId, state: 'active' as const, object: '经验', goal: '摘要', approach: '摘要', checks: [], verified: false, sourceTaskId: '', sourceCaseId: '', uses: 3, platform: '', toolFingerprint: 'legacy', migrated: true as const, createdAt: 1, updatedAt: 1 }
-      store.saveExperience({ ...base, id: 'small', detail: '验'.repeat(2900) })
-      store.saveExperience({ ...base, id: 'large', detail: '验'.repeat(5000) })
+      const source = store.receive({ botId: bot.botId, groupId: bot.groupId, seq: 100, text: '保存经验', senderId: bot.ownerPhoneId, memberId: 'member-owner', createdAt: Date.now() })
+      const saved = store.experienceLibrary.save(bot.botId, { requestId: 'budget-seed', content: { title: '经验预算', object: '维护', goal: '查询', applicability: '需要查询时', pitfalls: Array(20).fill('坑'.repeat(500)), steps: Array(20).fill('步'.repeat(500)), verification: Array(20).fill('验'.repeat(500)), detail: '详'.repeat(12000) }, changeSummary: '预算边界' }, { inboxId: source.id })
+      experienceId = saved.id; store.markInput(source.id, 'routed', { action: 'reply' })
     },
     routerReads: async call => {
-      for (const experienceId of ['large', 'small', 'small', 'small']) {
+      for (let i = 0; i < 4; i++) await call('chat_recent', { limit: 1 })
+      results.push(await call('experience_read', { experienceId, section: 'detail', length: 12000 }))
+      for (let i = 0; i < 8; i++) {
         try { results.push(await call('experience_read', { experienceId })) }
         catch (error) { errors.push((error as Error).message) }
       }
     },
   })
   f.send(1, '以前有类似经验吗？'); await waitFor(() => f.sent.length === 1)
-  expect(results).toHaveLength(2)
-  expect(errors).toHaveLength(2)
-  expect(errors.every(error => error.includes('内容预算'))).toBe(true)
-  expect(results.reduce<number>((sum, value) => sum + JSON.stringify(value).length, 0)).toBeLessThanOrEqual(8000)
+  expect((results[0] as { text: string }).text).toHaveLength(2400)
+  expect(results.length).toBeGreaterThan(2); expect(results.length).toBeLessThan(8)
+  expect(errors.some(error => error.includes('内容预算'))).toBe(true)
+  expect(errors.some(error => error.includes('读取预算'))).toBe(true)
+  expect(results.reduce<number>((sum, value) => sum + JSON.stringify(value).length, 0)).toBeLessThanOrEqual(32000)
 })
 
 test('聊天里说继续：恢复最近停下的任务并重开 Worker，原话有处理记录', async () => {
@@ -1193,7 +1196,7 @@ test('Router验收返工复用原卷宗会话，旧Worker退出后才启动修�
   expect(f.store.task(task.id)?.review).toEqual({state:'approved',rounds:1})
   await waitFor(()=>f.sent.includes('修正报告完成'))
   expect(f.sent).not.toContain('初稿完成')
-  expect(f.store.experiences(f.bot.botId)).toMatchObject([{detail:'修正报告完成',checks:['核对引用及局限']}])
+  expect(f.store.experiences(f.bot.botId)).toEqual([])
 })
 
 test('切换模式或权限时停止待验收任务，避免永久核对中', async () => {

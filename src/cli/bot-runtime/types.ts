@@ -35,7 +35,7 @@ export interface ExperienceContent {
 export interface ExperienceSaveCommand {
   requestId: string; id?: string; expectedVersion?: number; content: ExperienceContent; changeSummary: string
 }
-export interface ExperienceSource { taskId?: string; inboxId?: string; replyId?: string }
+export interface ExperienceSource { taskId?: string; inboxId?: string; replyId?: string; ownerControl?: { actorId: string; requestId: string } }
 export interface ExperienceUsageReport extends ExperienceRef {
   status: 'applied' | 'adapted' | 'skipped' | 'failed'; appliedSteps: string[]; result: string
 }

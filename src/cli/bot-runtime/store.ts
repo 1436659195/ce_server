@@ -2,7 +2,7 @@ import { Database } from 'bun:sqlite'
 import { randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload, RuntimeRemoteOp } from './types'
+import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload, RuntimeRemoteOp, ExperienceRef } from './types'
 import { EXPERIENCE_ESTABLISHED_USES } from './experience'
 import { ExperienceLibrary } from './experience-library'
 import { relevance } from './cases'
@@ -226,7 +226,7 @@ export class BotRuntimeStore {
   }
   tasks(botId?: string): RuntimeTask[] { return this.all('tasks', botId) }
   task(taskId: string): RuntimeTask | undefined { return this.get('tasks', taskId) }
-  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason' | 'revision' | 'directoryContinuation' | 'executionGuidance' | 'review' | 'delivery' | 'automationOccurrenceId'>>): RuntimeTask {
+  updateTask(taskId: string, patch: Partial<Pick<RuntimeTask, 'state' | 'summary' | 'error' | 'question' | 'latestRunId' | 'mandate' | 'resumeIntent' | 'followup' | 'sessionOrigin' | 'sessionReason' | 'revision' | 'directoryContinuation' | 'executionGuidance' | 'review' | 'delivery' | 'automationOccurrenceId' | 'experienceRefs'>>): RuntimeTask {
     const task = this.task(taskId); if (!task) throw new Error('工单不存在')
     const now = Date.now()
     const next = { ...task, ...patch, ...(patch.summary !== undefined ? { summaryUpdatedAt: now } : {}), updatedAt: now }
@@ -335,6 +335,10 @@ export class BotRuntimeStore {
     this.put('task_inputs', { id: id('input'), botId: task.botId, taskId: task.id, inboxId, inboxIds: inputIds, kind: 'correction', text: batch.map(m => m.text).join('\n'), attachments: batch.flatMap(m => m.attachments ?? []), revision: task.revision, delivery: 'pending', createdAt: Date.now() } satisfies RuntimeTaskInput)
   }
   input(inputId: string): RuntimeTaskInput | undefined { return this.get('task_inputs', inputId) }
+  setInputExperiences(inputId: string, refs: ExperienceRef[]): void {
+    const input = this.input(inputId); if (!input) throw new Error('任务输入不存在')
+    this.put('task_inputs', { ...input, experienceRefs: refs })
+  }
   delivered(inputId: string, delivery: RuntimeTaskInput['delivery']): void {
     const input = this.input(inputId); if (!input) throw new Error('补充不存在'); this.put('task_inputs', { ...input, delivery })
   }
@@ -347,7 +351,7 @@ export class BotRuntimeStore {
     if (!resolution.trim()) throw new Error('处理结论不能为空')
     this.put('task_inputs', { ...input, resolution })
   }
-  finishTask(taskId: string, revision: number, text: string, artifactIds: string[], runId?: string, summaries?: RuntimeArtifactSummaryInput[], checks?: string[]): RuntimeTask {
+  finishTask(taskId: string, revision: number, text: string, artifactIds: string[], runId?: string, summaries?: RuntimeArtifactSummaryInput[], checks?: string[], knowledge?: Pick<RuntimeReply, 'lesson' | 'experienceUsage'>): RuntimeTask {
     return this.transaction(() => {
       const task = this.task(taskId); if (!task || task.state !== 'running') throw new Error('工单不处于执行状态')
       if (task.revision !== revision) throw new Error('需求版本已变化，请先处理新输入')
@@ -358,7 +362,7 @@ export class BotRuntimeStore {
       if (task.delivery === 'files' && !artifactIds.length) throw new Error('本任务要求文件交付，必须导出并附上实际附件，不能只说写好了')
       if (!artifactIds.length && this.artifacts(task.botId).some(a => a.taskId === task.id)) throw new Error('已生成交付附件，必须在 artifactIds 中引用，不能只说写好了')
       const artifactSummaries = this.bindArtifactSummaries(taskId, artifactIds, summaries)
-      this.reply({ botId: task.botId, groupId: task.groupId, inputId: task.originInputId, taskId, taskRevision: revision, runId, author: 'worker', purpose: 'result', text, artifactIds, artifactSummaries, checks, key: `${task.id}:result:${revision}`, policyRevision: task.mandate.policyRevision })
+      this.reply({ botId: task.botId, groupId: task.groupId, inputId: task.originInputId, taskId, taskRevision: revision, runId, author: 'worker', purpose: 'result', text, artifactIds, artifactSummaries, checks, ...knowledge, key: `${task.id}:result:${revision}`, policyRevision: task.mandate.policyRevision })
       return this.updateTask(taskId, { state: 'completed', summary: text, question: undefined, review: { state: 'pending', rounds: task.review?.rounds ?? 0 } })
     })
   }
@@ -433,7 +437,7 @@ export class BotRuntimeStore {
       if (!indexes.length && source.purpose === 'question' && !source.followupReminder) throw new Error('必要问题不能被前台静默丢弃')
       if (!indexes.length && source.artifactIds?.length) throw new Error('文件交付必须保留附件，不能静默丢弃')
       if (!indexes.length && !basis.trim()) throw new Error('省略Worker结果需要说明依据')
-      const { id: _id, createdAt: _created, state: _state, text: _text, routingAttempts: _attempts, nextRoutingAt: _next, routingError: _error, ...metadata } = source
+      const { id: _id, createdAt: _created, state: _state, text: _text, routingAttempts: _attempts, nextRoutingAt: _next, routingError: _error, lesson: _lesson, experienceUsage: _usage, ...metadata } = source
       const group = `${source.id}:router`
       for (const [i, text] of validated.entries()) {
         const belongsToWorker = indexes.includes(i)
