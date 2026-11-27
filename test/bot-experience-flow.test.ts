@@ -134,6 +134,55 @@ test('Router 不批准草稿时交付照常完成，经验不发布', async () =
   expect(f.store.tasks('b')[0].review?.state).toBe('approved')
 })
 
+test('同次失败反馈和修复草稿不会自造版本冲突，验收后发布修正版并保留失败历史', async () => {
+  const f = fixture(); const saved = f.seed(); const ref = { experienceId: saved.id, version: 1 }
+  await startTask(f, [ref])
+  await finishTask(f, { lesson: { ...draft(), id: saved.id, expectedVersion: 1, content: { ...content, steps: ['使用新版接口重建会话'] } },
+    experienceUsage: [{ ...ref, status: 'failed', appliedSteps: ['尝试旧版会话接口'], result: '旧接口失效，已换新版接口并验证' }] })
+  expect(f.store.experienceLibrary.get('b', saved.id)).toMatchObject({ state: 'needs_review', version: 2 })
+  const reply = f.store.replies('b').find(r => r.author === 'worker' && r.purpose === 'result')!
+  expect(() => f.store.experienceLibrary.acceptLesson('b', reply.id)).toThrow(/验收/)
+  const receipt = await acceptResult(f, { acceptLesson: true })
+  expect(receipt.experienceReceipt).toMatchObject({ id: saved.id, version: 3, created: false })
+  expect(f.store.experienceLibrary.acceptLesson('b', reply.id)).toEqual(receipt.experienceReceipt)
+  expect(f.store.tasks('b')[0].review?.state).toBe('approved')
+  expect(f.store.experienceLibrary.get('b', saved.id)).toMatchObject({ state: 'active', verified: true, steps: ['使用新版接口重建会话'] })
+  expect(f.store.experienceLibrary.history('b', saved.id).map(e => [e.version, e.state])).toEqual([[1, 'active'], [2, 'needs_review'], [3, 'active']])
+  expect(f.store.experienceLibrary.usage('b', saved.id)[0]).toMatchObject({ version: 1, status: 'failed', successful: false })
+})
+
+test('失败反馈后的独立更新仍受版本保护，不能被旧修复草稿覆盖', async () => {
+  const f = fixture(); const saved = f.seed(); const ref = { experienceId: saved.id, version: 1 }
+  await startTask(f, [ref])
+  await finishTask(f, { lesson: { ...draft(), id: saved.id, expectedVersion: 1 },
+    experienceUsage: [{ ...ref, status: 'failed', appliedSteps: ['执行旧步骤'], result: '旧步骤已失效' }] })
+  const source = f.source()
+  f.store.experienceLibrary.save('b', { requestId: 'independent-fix', id: saved.id, expectedVersion: 2, ...draft(), content: { ...content, steps: ['独立修正的新步骤'] } }, { inboxId: source.id })
+  await expect(acceptResult(f, { acceptLesson: true })).rejects.toThrow(/版本/)
+  expect(f.store.experienceLibrary.get('b', saved.id)).toMatchObject({ version: 3, steps: ['独立修正的新步骤'] })
+  await acceptResult(f, { acceptLesson: false })
+})
+
+test('人工状态更新不能被当成本工单的自动失败标记跳过', async () => {
+  const f = fixture(); const saved = f.seed(); const ref = { experienceId: saved.id, version: 1 }
+  await startTask(f, [ref]); const task = f.store.tasks('b')[0]
+  f.store.experienceLibrary.changeState('b', { requestId: 'manual-review', id: saved.id, expectedVersion: 1, state: 'needs_review', reason: '需要额外人工核查' }, { taskId: task.id })
+  await finishTask(f, { lesson: { ...draft(), id: saved.id, expectedVersion: 1 },
+    experienceUsage: [{ ...ref, status: 'failed', appliedSteps: ['执行旧步骤'], result: '旧步骤失效' }] })
+  await expect(acceptResult(f, { acceptLesson: true })).rejects.toThrow(/版本/)
+  expect(f.store.experienceLibrary.get('b', saved.id)).toMatchObject({ version: 2, state: 'needs_review', changeSummary: '需要额外人工核查' })
+  await acceptResult(f, { acceptLesson: false })
+})
+
+test('没有验证依据的修复草稿可保存但保持待复核', async () => {
+  const f = fixture(); const saved = f.seed(); const ref = { experienceId: saved.id, version: 1 }
+  await startTask(f, [ref])
+  await finishTask(f, { checks: [], lesson: { ...draft(), id: saved.id, expectedVersion: 1 },
+    experienceUsage: [{ ...ref, status: 'failed', appliedSteps: ['执行旧步骤'], result: '失效，提出待验证改法' }] })
+  await acceptResult(f, { acceptLesson: true })
+  expect(f.store.experienceLibrary.get('b', saved.id)).toMatchObject({ version: 3, state: 'needs_review', verified: false })
+})
+
 test('没有本轮用户委托时，不能用直接保存绕过 Worker 草稿验收', async () => {
   const f = fixture(); await startTask(f); await finishTask(f, { lesson: draft() })
   await expect(f.routers[1].call('experience_save', { requestId: 'bypass', ...draft() })).rejects.toThrow(/验收|用户|委托|草稿/)

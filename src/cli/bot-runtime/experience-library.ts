@@ -42,8 +42,8 @@ function versionMatches(version: string, range: string): boolean | undefined {
     const parts = group.trim().replace(/([<>]=?|=|~|\^)\s+/g, '$1').split(/\s+/); let match = true
     for (const part of parts) {
       const m = /^(>=|<=|>|<|=|~|\^)?(v?\d+(?:\.\d+){0,2})$/.exec(part); const target = m && parse(m[2])
-      // Only numeric full-version caret/tilde ranges are interpreted; npm shorthand is not inferred.
-      if (!m || !target || ((m[1] === '~' || m[1] === '^') && m[2].replace(/^v/, '').split('.').length !== 3)) { unknown = true; match = false; break }
+      // Every range operand must be a full numeric version; never infer shorthand semantics.
+      if (!m || !target || m[2].replace(/^v/, '').split('.').length !== 3) { unknown = true; match = false; break }
       const n = cmp(current, target); const op = m[1] ?? '='
       if (!(op === '>=' ? n >= 0 : op === '<=' ? n <= 0 : op === '>' ? n > 0 : op === '<' ? n < 0 : op === '~' ? n >= 0 && current[0] === target[0] && current[1] === target[1] : op === '^' ? n >= 0 && (target[0] ? current[0] === target[0] : target[1] ? current[0] === 0 && current[1] === target[1] : current[0] === 0 && current[1] === 0 && current[2] === target[2]) : n === 0)) match = false
     }
@@ -132,6 +132,17 @@ export class ExperienceLibrary {
     const result = run(); this.db.query('INSERT INTO experience_receipts(bot_id,request_id,digest,body) VALUES(?,?,?,?)').run(botId, requestId, digest, JSON.stringify(result)); return result
   }
   save(botId: string, args: ExperienceSaveCommand, source: ExperienceSource): ExperienceReceipt {
+    return this.saveVersion(botId, args, source)
+  }
+  /** Publish the stored, accepted proposal; callers cannot supply a replacement draft or source. */
+  acceptLesson(botId: string, replyId: string): ExperienceReceipt {
+    return this.atomic(() => {
+      const reply = this.row<RuntimeReply>('outbox', replyId)
+      if (!reply || reply.botId !== botId || reply.author !== 'worker' || reply.purpose !== 'result' || !reply.taskId || !reply.lesson) throw new Error('经验来源结果或草稿不存在')
+      return this.saveVersion(botId, { ...reply.lesson, requestId: `lesson:${reply.id}` }, { taskId: reply.taskId, replyId }, true)
+    })
+  }
+  private saveVersion(botId: string, args: ExperienceSaveCommand, source: ExperienceSource, acceptedProposal = false): ExperienceReceipt {
     const parsed = EXPERIENCE_SAVE_SCHEMA.safeParse(args)
     if (!parsed.success) throw new Error(`经验参数格式错误：${parsed.error.issues.map(i => `${i.path.join('.')}: ${i.code}`).join('；')}`)
     const cmd = parsed.data
@@ -139,7 +150,15 @@ export class ExperienceLibrary {
       const evidence = this.source(botId, source)
       const materials = (cmd.content.artifactIds ?? []).map(id => { const a = this.row<RuntimeArtifact>('artifacts', id); if (!a || a.botId !== botId) throw new Error('经验材料成果不存在或归属不匹配'); return this.material(a) })
       const previous = cmd.id ? this.get(botId, cmd.id) : undefined
-      if (cmd.id && (!previous || previous.version !== cmd.expectedVersion)) throw new Error('经验不存在或版本已变化，请读取后重试')
+      // Only this task's automatic quarantine may sit between its pinned version and repair.
+      // Any independent content/status update still conflicts, including another task's failure.
+      let ownFailureReview = false
+      if (acceptedProposal && cmd.id && previous?.state === 'needs_review' && previous.version === cmd.expectedVersion! + 1 && evidence.task && previous.source?.taskId === evidence.task.id) {
+        const row = this.db.query('SELECT body FROM experience_receipts WHERE bot_id=? AND request_id=?').get(botId, `usage-failed:${evidence.task.id}:${cmd.id}:${cmd.expectedVersion}`) as { body: string } | null
+        const receipt = row ? JSON.parse(row.body) as ExperienceReceipt : undefined
+        ownFailureReview = receipt?.id === cmd.id && receipt?.version === previous.version
+      }
+      if (cmd.id && (!previous || (previous.version !== cmd.expectedVersion && !ownFailureReview))) throw new Error('经验不存在或版本已变化，请读取后重试')
       const key = (e: { title?: string; object?: string; goal?: string; applicability?: string; scope?: ExperienceScope }) => canonical([normalized(e.title ?? ''), normalized(e.object ?? ''), normalized(e.goal ?? ''), normalized(e.applicability ?? ''), normalizeScope(e.scope)])
       const duplicate = this.rows<RuntimeExperience>('SELECT body FROM experiences WHERE bot_id=?', botId).find(e => e.kind === 'lesson' && e.id !== cmd.id && key(e) === key(cmd.content))
       if (duplicate) {
@@ -147,7 +166,7 @@ export class ExperienceLibrary {
         return { id: duplicate.id, version: duplicate.version!, created: false, duplicate: true }
       }
       const now = Date.now(), c = cmd.content
-      const item: RuntimeExperience = { id: previous?.id ?? `exp_${randomUUID()}`, botId, format: 2, kind: 'lesson', state: previous?.state ?? 'active', version: (previous?.version ?? 0) + 1,
+      const item: RuntimeExperience = { id: previous?.id ?? `exp_${randomUUID()}`, botId, format: 2, kind: 'lesson', state: ownFailureReview && evidence.verified ? 'active' : previous?.state ?? 'active', version: (previous?.version ?? 0) + 1,
         title: c.title, object: c.object, goal: c.goal, applicability: c.applicability, scope: normalizeScope(c.scope), pitfalls: c.pitfalls, steps: c.steps, verification: c.verification, detail: c.detail ?? '', materials,
         approach: c.steps[0].slice(0, 200), checks: evidence.reply?.checks ?? [], verified: evidence.verified, sourceTaskId: evidence.task?.id ?? '', sourceCaseId: evidence.task?.caseId ?? '',
         uses: previous?.uses ?? 0, stats: previous?.stats ?? zeroStats(), platform: previous?.platform ?? '', toolFingerprint: previous?.toolFingerprint ?? '', createdAt: previous?.createdAt ?? now, updatedAt: now, changeSummary: cmd.changeSummary, source }

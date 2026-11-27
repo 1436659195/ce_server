@@ -230,6 +230,18 @@ test('ambiguous abbreviated caret and tilde ranges warn instead of falsely exclu
   expect(found.items[0].warnings).toContain('versionRange 未核实')
 })
 
+test('abbreviated version ranges are unknown rather than padded into exact numeric versions', () => {
+  const f = fixture()
+  for (const [range, version] of [['1', '1.5.0'], ['1.2', '1.2.9'], ['=1.2', '1.2.9'], ['>=1.2', '1.2.9'], ['^0', '0.5.0']]) {
+    const saved = save(f, content(`简写范围 ${range}`, { scope: { versionRange: range } }))
+    const found = f.lib.search('b', { scope: { version } }).items.find(e => e.id === saved.id)
+    expect(found).toBeDefined()
+    expect(found?.warnings).toContain('versionRange 未核实')
+  }
+  const exact = save(f, content('完整精确版本', { scope: { versionRange: '=1.2.0' } }))
+  expect(f.lib.search('b', { scope: { version: '1.2.9' } }).items.some(e => e.id === exact.id)).toBe(false)
+})
+
 test('exact version scopes exclude known mismatches and retain unknown versions with explicit warnings', () => {
   const f = fixture(); const exact = save(f, content('仅适用一个版本', { scope: { version: 'v1.0.0' } }))
   expect(f.lib.search('b', { scope: { version: '2.0.0' } }).items).toHaveLength(0)

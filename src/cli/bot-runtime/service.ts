@@ -851,7 +851,7 @@ export class BotRuntimeService {
           if (workerMessage.purpose === 'result' && workerMessage.taskId) {
             this.store.experienceLibrary.acceptUsage(botId, workerMessage.taskId, workerMessage.id, workerMessage.experienceUsage ?? [])
             if (d.acceptLesson && workerMessage.lesson) {
-              experienceReceipt = this.store.experienceLibrary.save(botId, { ...workerMessage.lesson, requestId: `lesson:${workerMessage.id}` }, { taskId: workerMessage.taskId, replyId: workerMessage.id })
+              experienceReceipt = this.store.experienceLibrary.acceptLesson(botId, workerMessage.id)
             }
           }
         }
