@@ -229,3 +229,25 @@ test('ambiguous abbreviated caret and tilde ranges warn instead of falsely exclu
   expect(found.items).toHaveLength(1)
   expect(found.items[0].warnings).toContain('versionRange 未核实')
 })
+
+test('exact version scopes exclude known mismatches and retain unknown versions with explicit warnings', () => {
+  const f = fixture(); const exact = save(f, content('仅适用一个版本', { scope: { version: 'v1.0.0' } }))
+  expect(f.lib.search('b', { scope: { version: '2.0.0' } }).items).toHaveLength(0)
+  const match = f.lib.search('b', { scope: { version: '1.0.0' } }).items
+  expect(match.map(e => e.id)).toEqual([exact.id]); expect(match[0]?.warnings).toEqual([])
+  const unknown = f.lib.search('b', {}).items
+  expect(unknown.map(e => e.id)).toEqual([exact.id]); expect(unknown[0]?.warnings).toContain('version 未核实')
+})
+
+test('exact opaque versions use normalized equality and both exact version and range remain required', () => {
+  const f = fixture(); const opaque = save(f, content('固定提交版本', { scope: { version: 'Build-ABC123' } }))
+  expect(f.lib.search('b', { scope: { version: ' build-abc123 ' } }).items.map(e => e.id)).toEqual([opaque.id])
+  expect(f.lib.search('b', { scope: { version: 'build-def456' } }).items).toHaveLength(0)
+  const both = save(f, content('精确版本加兼容范围', { scope: { version: '1.2.3', versionRange: '>=1.0.0 <2.0.0' } }))
+  expect(f.lib.search('b', { scope: { version: '1.5.0' } }).items).toHaveLength(0)
+  expect(f.lib.search('b', { scope: { version: 'v1.2.3' } }).items.map(e => e.id)).toEqual([both.id])
+  const unknown = f.lib.search('b', {}).items.find(e => e.id === both.id)
+  expect(unknown?.warnings).toEqual(expect.arrayContaining(['version 未核实', 'versionRange 未核实']))
+  save(f, content('相互矛盾的版本要求', { scope: { version: '1.2.3', versionRange: '>=2.0.0' } }))
+  expect(f.lib.search('b', { scope: { version: '1.2.3' } }).items.map(e => e.id)).toEqual([both.id])
+})

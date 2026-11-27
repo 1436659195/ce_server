@@ -59,6 +59,13 @@ function scopeMatch(required: ExperienceScope = {}, actual: ExperienceScope = {}
     else if (r[key] !== a[key]) return { compatible: false, warnings, specificity }
     else specificity++
   }
+  if (r.version) {
+    // Strip only the conventional numeric v prefix; opaque build IDs still require exact equality.
+    const exact = (version: string) => version.replace(/^v(?=\d+\.\d+\.\d+$)/, '')
+    if (!a.version) warnings.push('version 未核实')
+    else if (exact(r.version) !== exact(a.version)) return { compatible: false, warnings, specificity }
+    else specificity++
+  }
   if (r.versionRange) {
     const matches = a.version ? versionMatches(a.version, r.versionRange) : undefined
     if (matches === false) return { compatible: false, warnings, specificity }
