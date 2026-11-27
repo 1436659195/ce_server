@@ -132,7 +132,7 @@ export class ExperienceLibrary {
       const materials = (cmd.content.artifactIds ?? []).map(id => { const a = this.row<RuntimeArtifact>('artifacts', id); if (!a || a.botId !== botId) throw new Error('经验材料成果不存在或归属不匹配'); return this.material(a) })
       const previous = cmd.id ? this.get(botId, cmd.id) : undefined
       if (cmd.id && (!previous || previous.version !== cmd.expectedVersion)) throw new Error('经验不存在或版本已变化，请读取后重试')
-      const key = (e: { title?: string; scope?: ExperienceScope }) => canonical([normalized(e.title ?? ''), normalizeScope(e.scope)])
+      const key = (e: { title?: string; object?: string; goal?: string; applicability?: string; scope?: ExperienceScope }) => canonical([normalized(e.title ?? ''), normalized(e.object ?? ''), normalized(e.goal ?? ''), normalized(e.applicability ?? ''), normalizeScope(e.scope)])
       const duplicate = this.rows<RuntimeExperience>('SELECT body FROM experiences WHERE bot_id=?', botId).find(e => e.kind === 'lesson' && e.id !== cmd.id && key(e) === key(cmd.content))
       if (duplicate) {
         if (cmd.id) throw new Error(`经验主题已存在：${duplicate.id}，请明确合并或更新目标`)

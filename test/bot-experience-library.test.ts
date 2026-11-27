@@ -211,3 +211,14 @@ test('blank check strings do not validate a lesson or count successful adoption'
   f.lib.acceptUsage('b', f.task.id, reply.id)
   expect(f.lib.get('b', e.id)?.stats).toMatchObject({ adopted: 1, succeeded: 0 })
 })
+
+test('generic identical titles do not swallow lessons for different objects, goals or applicability', () => {
+  const f = fixture()
+  const ce = save(f, content('服务重启流程', { object: 'CE', scope: {} }))
+  const pg = save(f, content('服务重启流程', { object: 'PostgreSQL', scope: {}, steps: ['使用 pg_ctl 重启'] }))
+  const otherGoal = save(f, content('服务重启流程', { object: 'CE', scope: {}, goal: '数据库迁移前的停机准备' }))
+  const otherCondition = save(f, content('服务重启流程', { object: 'CE', scope: {}, applicability: '离线恢复环境' }))
+  expect(new Set([ce.id, pg.id, otherGoal.id, otherCondition.id]).size).toBe(4)
+  expect(f.lib.get('b', pg.id)?.steps).toEqual(['使用 pg_ctl 重启'])
+  expect(save(f, content('服务重启流程', { object: 'ce', scope: {} }))).toMatchObject({ id: ce.id, duplicate: true })
+})
