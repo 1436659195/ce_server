@@ -853,9 +853,11 @@ export class BotRuntimeService {
       const task = this.assertActive(worker)
       const dossier = this.store.case(task.caseId)!
       const executionPolicy = bot.workerAccessMode === 'full-access' ? workerExecutionPolicy(bot.directory) : undefined
-      const fingerprint = createHash('sha256').update(JSON.stringify({ owner: bot.ownerPhoneId, directory: bot.directory, policy: bot.policyRevision, model: this.store.settings(bot.botId).model, schema: 2, ...(executionPolicy ? { executionMode: executionPolicy.mode } : {}) })).digest('hex')
       const remote = bot.computers?.length && bot.workerAccessMode === 'full-access' ? REMOTE_WORKER_TOOLS : []
       const threadOptions = { instructions: WORKER_INSTRUCTIONS + (executionPolicy ? `\n${executionPolicy.instructions}` : '') + (remote.length ? `\n${REMOTE_COMPUTER_INSTRUCTIONS}` : ''), tools: executionPolicy ? [...FULL_ACCESS_WORKER_TOOLS, ...remote] : WORKER_TOOLS }
+      // Codex 恢复线程会保留创建时的工具定义；必须按实际契约判断兼容，不能靠手动版本号。
+      // 旧指纹自然失配，只重建执行会话；下面的 payload 继续携带原卷宗、进展和成果。
+      const fingerprint = createHash('sha256').update(JSON.stringify({ owner: bot.ownerPhoneId, directory: bot.directory, policy: bot.policyRevision, model: this.store.settings(bot.botId).model, platform: bot.platform, ...threadOptions, ...(executionPolicy ? { executionMode: executionPolicy.mode } : {}) })).digest('hex')
       const resetForDirectory = !!task.directoryContinuation && !task.directoryContinuation.sessionRunId
       const inherited = !resetForDirectory && !!dossier.threadId && dossier.fingerprint === fingerprint
       run.threadId = inherited ? await client.resumeThread(dossier.threadId!, threadOptions) : await client.startThread(threadOptions)

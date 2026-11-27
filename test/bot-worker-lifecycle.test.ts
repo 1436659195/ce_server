@@ -1,15 +1,16 @@
 import { routerCall } from './helpers/router-decision'
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { BotRuntimeService, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
+import { BotRuntimeService, WORKER_TOOLS, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
 import { silentMemoryClient } from './helpers/model-client'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
 import type { RuntimeBot, RuntimeTask } from '../src/cli/bot-runtime/types'
 import type { BotOperation } from '../src/cli/bot-permissions'
 import type { CodexToolCall, CodexTurn } from '../src/cli/bot-runtime/codex'
+import * as workerPolicy from '../src/cli/bot-runtime/worker-policy'
 
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
@@ -134,6 +135,125 @@ test('CLI 升级后原 Session 恢复失败，保留卷宗且不自动新开重�
   expect(f.store.cases(f.bot.botId)).toHaveLength(1)
   expect(f.store.case(first.caseId)!.threadId).toBe(originalThread)
   expect(f.store.tasks(f.bot.botId)[1].sessionOrigin).toBeUndefined()
+})
+
+for (const fullAccess of [false, true]) test(`工具参数升级后在原卷宗新开会话并完成文件交付，契约未变时继续复用（${fullAccess ? '全权限' : '受控'}）`, async () => {
+  const finish = WORKER_TOOLS.find(t => t.name === 'work_finish')!
+  const currentSchema = finish.inputSchema
+  const oldSchema = structuredClone(currentSchema)
+  delete (oldSchema.properties as Record<string, unknown>).artifactSummaries
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { fullAccess, runTool: async (_tool, args, dir) => JSON.stringify({ name: 'report.txt', data: readFileSync(join(dir, String(args.path))).toString('base64') }) })
+  try {
+    finish.inputSchema = oldSchema
+    f.send(1, '整理材料'); await waitFor(() => f.started() === 1)
+    const first = f.store.tasks()[0]
+    await f.workerCall('work_finish', { revision: 1, text: '材料整理完成', artifactIds: [], checks: ['核对材料'] })
+    f.complete(); await waitFor(() => f.workerCloses() === 1)
+
+    finish.inputSchema = currentSchema
+    decisions.push({ ...start, newCase: undefined, caseId: first.caseId, relation: 'revision', delivery: 'files' })
+    f.send(2, '将已有结论保存为TXT附件'); await waitFor(() => f.started() === 2)
+    const second = f.store.tasks()[1]
+    expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+    expect(second).toMatchObject({ caseId: first.caseId, sessionOrigin: 'new' })
+    expect(f.store.cases(f.bot.botId)).toHaveLength(1)
+    expect(JSON.parse(f.workerPayloads[1]).caseContext.previousTasks).toMatchObject([{ id: first.id, summary: '材料整理完成' }])
+
+    writeFileSync(join(f.dir, 'report.txt'), '已核实的材料结论')
+    const op = await f.workerCall('project_export_file', { path: 'report.txt' }) as { operationId: string }
+    await waitFor(() => f.store.operation(op.operationId)?.state === 'completed')
+    const poll = await f.workerCall('project_poll', { operationId: op.operationId }) as { result: string }
+    const { artifactId } = JSON.parse(poll.result)
+    await f.workerCall('work_finish', { revision: 1, text: '请看附件。', artifactIds: [artifactId], checks: ['读取核对'], artifactSummaries: [{ artifactId, summary: '材料结论TXT', requirements: ['交付报告'], checks: ['读取核对'], limitations: [] }] })
+    f.complete(); await waitFor(() => f.workerCloses() === 2 && f.sent.includes('请看附件。'))
+    const reply = f.store.replies(f.bot.botId).find(r => r.author === 'router' && r.artifactIds?.includes(artifactId))!
+    expect(reply.state).toBe('sent')
+    expect(f.service.replyAttachments(reply)).toMatchObject([{ kind: 'artifact', name: 'report.txt' }])
+    expect(readFileSync(f.store.artifact(artifactId)!.path, 'utf8')).toBe('已核实的材料结论')
+
+    decisions.push({ ...start, newCase: undefined, caseId: first.caseId, relation: 'revision' })
+    f.send(3, '继续核对结论'); await waitFor(() => f.started() === 3)
+    expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start', 'resume'])
+  } finally { finish.inputSchema = currentSchema }
+})
+
+test('没有工具契约指纹的旧版持久会话保留卷宗并新开Session', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions)
+  f.send(1, '整理材料'); await waitFor(() => f.started() === 1)
+  const first = f.store.tasks()[0]
+  await f.workerCall('work_finish', { revision: 1, text: '材料整理完成', artifactIds: [], checks: ['核对'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  const legacy = createHash('sha256').update(JSON.stringify({ owner: f.bot.ownerPhoneId, directory: f.bot.directory, policy: f.bot.policyRevision, model: '', schema: 2 })).digest('hex')
+  f.store.saveCase({ ...f.store.case(first.caseId)!, fingerprint: legacy })
+  decisions.push({ ...start, newCase: undefined, caseId: first.caseId, relation: 'revision' })
+  f.send(2, '继续核对'); await waitFor(() => f.started() === 2)
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+  expect(f.store.cases(f.bot.botId)).toHaveLength(1)
+  expect(JSON.parse(f.workerPayloads[1]).caseContext.previousTasks[0].id).toBe(first.id)
+})
+
+test('工具描述变化也使旧会话失效，不仅比较工具名称', async () => {
+  const report = WORKER_TOOLS.find(t => t.name === 'work_report')!
+  const description = report.description
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions)
+  f.send(1, '整理材料'); await waitFor(() => f.started() === 1)
+  const first = f.store.tasks()[0]
+  await f.workerCall('work_finish', { revision: 1, text: '材料整理完成', artifactIds: [], checks: ['核对'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  try {
+    report.description += ' 新规则：报告须标出尚未验证的事实。'
+    decisions.push({ ...start, newCase: undefined, caseId: first.caseId, relation: 'revision' })
+    f.send(2, '继续核对'); await waitFor(() => f.started() === 2)
+    expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+  } finally { report.description = description }
+})
+
+test('只有固定执行规则变化时也不续接旧会话', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { fullAccess: true })
+  f.send(1, '整理材料'); await waitFor(() => f.started() === 1)
+  const first = f.store.tasks()[0]
+  await f.workerCall('work_finish', { revision: 1, text: '材料整理完成', artifactIds: [], checks: ['核对'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  const policy = workerPolicy.workerExecutionPolicy(f.bot.directory)
+  const changed = spyOn(workerPolicy, 'workerExecutionPolicy').mockReturnValue({ ...policy, instructions: policy.instructions + '\n新增宿主固定执行规则。' })
+  try {
+    decisions.push({ ...start, newCase: undefined, caseId: first.caseId, relation: 'revision' })
+    f.send(2, '继续核对'); await waitFor(() => f.started() === 2)
+    expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+    expect(f.workerThreads[1].instructions).toContain('新增宿主固定执行规则。')
+  } finally { changed.mockRestore() }
+})
+
+test('挂载其他电脑改变工具和执行规则时在原卷宗新开会话', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions, { fullAccess: true })
+  f.send(1, '整理材料'); await waitFor(() => f.started() === 1)
+  const first = f.store.tasks()[0]
+  await f.workerCall('work_finish', { revision: 1, text: '材料整理完成', artifactIds: [], checks: ['核对'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  f.bot.computers = [{ id: 'remote', label: '其他电脑', directory: '/project', directoryAbs: '/project' }]
+  decisions.push({ ...start, newCase: undefined, caseId: first.caseId, relation: 'revision' })
+  f.send(2, '继续核对'); await waitFor(() => f.started() === 2)
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
+  expect(f.workerThreads[1].tools?.some(t => t.name === 'remote_run')).toBe(true)
+  expect(f.workerThreads[1].instructions).not.toBe(f.workerThreads[0].instructions)
+})
+
+test('执行平台切换时不把旧平台线程交给新平台恢复', async () => {
+  const decisions: Array<Record<string, unknown>> = [start]
+  const f = fixture(decisions)
+  f.send(1, '整理材料'); await waitFor(() => f.started() === 1)
+  const first = f.store.tasks()[0]
+  await f.workerCall('work_finish', { revision: 1, text: '材料整理完成', artifactIds: [], checks: ['核对'] })
+  f.complete(); await waitFor(() => f.workerCloses() === 1)
+  f.bot.platform = 'claude'
+  decisions.push({ ...start, newCase: undefined, caseId: first.caseId, relation: 'revision' })
+  f.send(2, '继续核对'); await waitFor(() => f.started() === 2)
+  expect(f.workerThreads.map(t => t.method)).toEqual(['start', 'start'])
 })
 
 test('换目录保护待派工与执行中任务，完成后同卷宗在新目录新开Session', async () => {
