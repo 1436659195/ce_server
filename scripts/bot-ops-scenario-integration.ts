@@ -98,7 +98,7 @@ try {
   const images = [upload(join(bundle, '图片1.jpg')), upload(join(bundle, '图片2.jpg'))]
   const first = send(scenario.turn1, images)
   await until('首轮派工并开始排查', () => store.tasks(bot.botId).length > 0 && sent.length > 0 && running === 0 && !store.pendingReplies(bot.botId).length)
-  await until('首轮 Worker 交付', () => settled() && store.artifacts(bot.botId).length > 0 && store.experiences(bot.botId).length > 0, 25 * 60_000)
+  await until('首轮 Worker 交付', () => settled() && store.artifacts(bot.botId).length > 0 && store.tasks(bot.botId).some(t => t.review?.state === 'approved'), 25 * 60_000)
   const task1 = store.tasks(bot.botId)[0]
   // attachmentInputIds 记的是带附件的消息，不是附件个数。
   check('首轮开在卷宗并带上两张截图', task1.attachmentInputIds?.includes(first.id) === true && (store.inbox(first.id)?.attachments?.length ?? 0) === 2 && cases().size === 1)
@@ -136,9 +136,11 @@ try {
   // 三道关：Worker 结果单独到来那一轮只压短，没有查询
   const locked = turns.filter(t => t.trigger === 'worker_message')
   check('Worker 结果那一轮只压短不查询', locked.length > 0 && locked.every(t => t.toolsLocked) && locked.every(t => (turnTools.get(t.seq) ?? []).every(tool => tool === 'router_decide')), `共 ${locked.length} 轮`)
-  // 经验：每个完成的任务一条候选
-  const completed = store.tasks(bot.botId).filter(t => t.state === 'completed')
-  check('每个完成的任务留一条经验候选', completed.length > 0 && completed.every(t => store.experiences(bot.botId).some(e => e.sourceTaskId === t.id)))
+  // 经验是可选的复用知识，不再要求每份完成报告都生成一条。
+  const completed = store.tasks(bot.botId).filter(t => t.state === 'completed' && t.review?.state === 'approved')
+  const lessons = store.experiences(bot.botId)
+  check('自动经验仅来自经前台验收的任务', completed.length > 0 && lessons.every(e => e.kind === 'lesson' && completed.some(t => t.id === e.sourceTaskId)))
+  record({ kind: 'observe', name: 'Worker 主动总结并获批的经验数', count: lessons.length })
   // 记忆：剧本里没有定规矩的话
   check('剧本里没有偏好话，记忆库保持为空', store.memories(bot.botId).length === 0)
   check('对外的话全部经前台整理', sent.every(r => r.author === 'router'))

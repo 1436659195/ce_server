@@ -126,6 +126,12 @@ bun run src/relay/main.ts --rotate    # 重置所有 token 后退出
 | ce 日志 `拒绝配对…PIN 错/缺` | 手机没带 PIN 或 PIN 错 | 确认 ce 当前 PIN(pin 模式新人首次要) |
 | Bot 提示“前台未提交有效决策” | Router 未成功提交，需区分参数校验、来源/工单校验、未补交或模型运行失败 | 按 Bot ID 或消息 ID 查询下面的 Router 诊断日志 |
 
+### 数字人经验库
+
+经验保存在 `~/.ce/bot-runtime.sqlite`：`experiences` 为当前记录，`experience_versions` 保留不可变版本，`experience_usage`/`experience_events` 保存采用及展示、读取流水，`experience_receipts` 提供重试回执，`experience_fts` 为可重建的全文索引。启动时事务迁移旧记录；旧 `uses` 转为历史曝光，不变成真实采用。普通完成报告保留为历史资料，不参与经验推荐；专门复盘和手写经验保留为经验。
+
+Router 可搜索、分段读取、直接保存和修改经验状态；Worker 可提交草稿及实际采用反馈，草稿经 Router 明确批准后才入库。附件沿用宿主不可变快照，经验更新保留旧版本。详细算法、计数和验证方法见 [数字人经验机制](experience-lifecycle.md)。本次不改变手机协议，不要求更新 APK。
+
 ### Router 回复诊断
 
 本机 `~/.ce/bot-runtime/router-diagnostics.jsonl` 按行保存异常轮次；修正后成功的轮次也记录为 `recovered`，新输入使旧轮次失效则标记 `superseded`。普通成功回复不写日志。无需修改数据库结构或安装新版 APK。
