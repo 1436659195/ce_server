@@ -25,24 +25,32 @@ export interface RuntimeSettings {
   /** 有主人消息的前台轮次累计数；中期记忆按它数「管 10 轮」。 */
   rounds?: number
 }
-/** 干活的经验：某类活上次怎么干、结果怎样。不分渠道和角色，按 Bot 共享。 */
+/** Reusable content is separate from the delivery report and belongs to one Bot. */
+export interface ExperienceScope { project?: string; service?: string; os?: string; versionRange?: string | null; version?: string }
+export interface ExperienceRef { experienceId: string; version: number }
+export interface ExperienceContent {
+  title: string; object: string; goal: string; applicability: string; scope?: ExperienceScope
+  pitfalls: string[]; steps: string[]; verification: string[]; detail?: string; artifactIds?: string[]
+}
+export interface ExperienceSaveCommand {
+  requestId: string; id?: string; expectedVersion?: number; content: ExperienceContent; changeSummary: string
+}
+export interface ExperienceSource { taskId?: string; inboxId?: string; replyId?: string }
+export interface ExperienceUsageReport extends ExperienceRef {
+  status: 'applied' | 'adapted' | 'skipped' | 'failed'; appliedSteps: string[]; result: string
+}
+export interface ExperienceStats { displays: number; reads: number; adopted: number; succeeded: number; legacyExposures: number }
+export interface ExperienceMaterial { artifactId: string; hash: string; revision: number; name: string; mime: string }
 export interface RuntimeExperience {
-  id: string; botId: string
-  state: 'active' | 'needs_review' | 'retired'
-  /** 针对哪类活：卷宗的对象和这次的目标。 */
-  object: string; goal: string
-  /** 一句话做法。 */
-  approach: string
-  detail: string; checks: string[]
-  /** Worker 交了真实验证结果才算核实过。 */
-  verified: boolean
+  id: string; botId: string; state: 'active' | 'needs_review' | 'retired'
+  object: string; goal: string; approach: string; detail: string; checks: string[]; verified: boolean
   sourceTaskId: string; sourceCaseId: string
+  /** Compatibility alias for actual adoption only; historical impressions live in stats.legacyExposures. */
   uses: number; lastUsedAt?: number
-  /** 创建时的平台和工具集指纹；不一致就进待复核。 */
-  platform: string; toolFingerprint: string
-  /** 从旧的设置字段迁入，免指纹校验。 */
-  migrated?: true
-  createdAt: number; updatedAt: number
+  platform: string; toolFingerprint: string; migrated?: true; createdAt: number; updatedAt: number
+  format?: 2; kind?: 'lesson' | 'report'; version?: number; title?: string; applicability?: string; scope?: ExperienceScope
+  pitfalls?: string[]; steps?: string[]; verification?: string[]; materials?: ExperienceMaterial[]; stats?: ExperienceStats
+  changeSummary?: string; source?: ExperienceSource
 }
 /** 主人的偏好或规矩。按渠道（groupId）和对话角色（senderId）分开存。 */
 export type MemoryTier = 'mid' | 'long'
@@ -163,6 +171,7 @@ export interface RuntimeTask {
   goal: string; acceptance: string[]; mandate: RuntimeMandate; state: RuntimeTaskState; revision: number
   summary: string; createdAt: number; updatedAt: number; latestRunId?: string; error?: string
   executionGuidance?: string
+  experienceRefs?: ExperienceRef[]
   review?: { state: 'pending' | 'approved' | 'changes_requested'; rounds: number; feedback?: string }
   caseDecision?: RuntimeCaseDecision
   sessionOrigin?: 'inherited' | 'new'; sessionReason?: string
@@ -192,6 +201,7 @@ export interface RuntimeTaskInput {
   resolution?: string; createdAt: number
   inboxIds?: string[]
   executionGuidance?: string
+  experienceRefs?: ExperienceRef[]
   attachments?: RuntimeAttachment[]
 }
 export interface RuntimeRun {
@@ -207,6 +217,8 @@ export interface RuntimeOperation {
   reconciliation?: { actor: string; at: number; note: string; confirmedStopped: true }
 }
 export interface RuntimeReply {
+  lesson?: Omit<ExperienceSaveCommand, 'requestId'>
+  experienceUsage?: ExperienceUsageReport[]
   automationOccurrenceId?: string
   id: string; key: string; botId: string; groupId: string; inputId?: string; taskId?: string; runId?: string
   author: 'router' | 'worker'; purpose: 'chat' | 'ack' | 'answer' | 'question' | 'result' | 'unable'

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { tokenize } from './memory'
 import type { RuntimeCase, RuntimeExperience, RuntimeTask } from './types'
 
-/** 被用满这么多次的经验才进常驻摘要；摘要最多带几条。 */
+/** Legacy migration constant only; popularity no longer reserves slots. */
 export const EXPERIENCE_ESTABLISHED_USES = 3
 export const EXPERIENCE_SUMMARY_LIMIT = 3
 /** 平台和工具集的指纹：变了就说明这份经验未必还适用。 */
@@ -24,16 +24,12 @@ export function experienceCandidate(task: RuntimeTask, dossier: RuntimeCase, tex
 }
 
 export interface ExperienceSelection { selected: RuntimeExperience[]; stale: string[] }
-/** 用满次数的常驻（最多 3 条，按相关度、被用次数排）；不满 3 条时用相关的候选补位。指纹不符的标待复核，不进摘要。 */
-export function selectExperiences(list: RuntimeExperience[], batchText: string, fingerprint: string): ExperienceSelection {
+/** Compatibility selector for callers not yet using the library catalog. Impressions never rank lessons. */
+export function selectExperiences(list: RuntimeExperience[], batchText: string, _fingerprint: string): ExperienceSelection {
   const tokens = tokenize(batchText)
-  const score = (e: RuntimeExperience) => { let n = 0; for (const token of tokenize(`${e.object} ${e.goal} ${e.approach}`)) if (token.length >= 2 && tokens.has(token)) n += 2; return n }
-  const byRank = (a: RuntimeExperience, b: RuntimeExperience) => score(b) - score(a) || b.uses - a.uses || (b.lastUsedAt ?? b.createdAt) - (a.lastUsedAt ?? a.createdAt) || a.id.localeCompare(b.id)
-  const stale = list.filter(e => e.state === 'active' && !e.migrated && e.toolFingerprint !== fingerprint).map(e => e.id)
-  const usable = list.filter(e => e.state === 'active' && (e.migrated || e.toolFingerprint === fingerprint))
-  const selected = usable.filter(e => e.uses >= EXPERIENCE_ESTABLISHED_USES).sort(byRank).slice(0, EXPERIENCE_SUMMARY_LIMIT)
-  if (selected.length < EXPERIENCE_SUMMARY_LIMIT) selected.push(...usable.filter(e => e.uses < EXPERIENCE_ESTABLISHED_USES && score(e) > 0).sort(byRank).slice(0, EXPERIENCE_SUMMARY_LIMIT - selected.length))
-  return { selected, stale }
+  const score = (e: RuntimeExperience) => { let n = 0; for (const token of tokenize(`${e.title ?? ''} ${e.object} ${e.goal} ${e.approach} ${(e.pitfalls ?? []).join(' ')} ${(e.steps ?? []).join(' ')}`)) if (token.length >= 2 && tokens.has(token)) n += 2; return n }
+  const usable = list.filter(e => e.state === 'active' && (e.kind === 'lesson' || (!e.kind && (e.migrated || /经验.*(?:总结|复盘)|(?:总结|复盘).*(?:经验|踩坑)|踩坑.*(?:总结|复盘)/.test(e.goal)))))
+  return { selected: usable.filter(e => score(e) > 0).sort((a, b) => score(b) - score(a) || Number(b.verified) - Number(a.verified) || a.id.localeCompare(b.id)).slice(0, EXPERIENCE_SUMMARY_LIMIT), stale: [] }
 }
 
 export interface ExperienceSummary { id: string; object: string; goal: string; approach: string; uses: number }

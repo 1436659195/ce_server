@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload, RuntimeRemoteOp } from './types'
 import { EXPERIENCE_ESTABLISHED_USES } from './experience'
+import { ExperienceLibrary } from './experience-library'
 import { relevance } from './cases'
 import { validateRouterReply } from './reply-policy'
 import { queryChatHistory, readChatMessage } from './history'
@@ -31,6 +32,7 @@ function validateWorkerText(value: unknown): string {
 /** 小型本地账本；JSON 是记录正文，SQL 表达式索引负责唯一性。所有业务写入经本类事务。 */
 export class BotRuntimeStore {
   readonly automations: AutomationStore
+  readonly experienceLibrary: ExperienceLibrary
   private db: Database
   private closed = false
   constructor(readonly path: string) {
@@ -77,6 +79,7 @@ export class BotRuntimeStore {
       if (version < 4) this.db.exec('PRAGMA user_version=4')
       return automations
     })
+    this.experienceLibrary = new ExperienceLibrary(this.db)
   }
   close(): void { if (!this.closed) { this.closed = true; this.db.close() } }
   private get<T>(table: Table, key: string): T | undefined {
@@ -515,9 +518,9 @@ export class BotRuntimeStore {
   experiences(botId: string): RuntimeExperience[] { return this.all('experiences', botId) }
   experience(experienceId: string): RuntimeExperience | undefined { return this.get('experiences', experienceId) }
   saveExperience(experience: RuntimeExperience): void { this.put('experiences', experience) }
-  /** 进过摘要或被前台读过都算用过一次；用满次数才常驻。 */
+  /** Compatibility for old callers: visibility is never adoption. */
   useExperiences(ids: string[], now: number): void {
-    for (const id of new Set(ids)) { const experience = this.experience(id); if (experience && experience.state === 'active') this.saveExperience({ ...experience, uses: experience.uses + 1, lastUsedAt: now, updatedAt: now }) }
+    for (const id of new Set(ids)) { const experience = this.experience(id); if (experience && experience.state === 'active') this.saveExperience({ ...experience, stats: { displays: (experience.stats?.displays ?? 0) + 1, reads: experience.stats?.reads ?? 0, adopted: experience.stats?.adopted ?? 0, succeeded: experience.stats?.succeeded ?? 0, legacyExposures: experience.stats?.legacyExposures ?? 0 }, updatedAt: now }) }
   }
   /** 控制请求记账避免双击/重连重复执行。 */
   hasControl(botId: string, requestId: string): boolean { return this.get('controls', `${botId}:${requestId}`) !== undefined }
