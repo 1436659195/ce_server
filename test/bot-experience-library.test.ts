@@ -222,3 +222,10 @@ test('generic identical titles do not swallow lessons for different objects, goa
   expect(f.lib.get('b', pg.id)?.steps).toEqual(['使用 pg_ctl 重启'])
   expect(save(f, content('服务重启流程', { object: 'ce', scope: {} }))).toMatchObject({ id: ce.id, duplicate: true })
 })
+
+test('ambiguous abbreviated caret and tilde ranges warn instead of falsely excluding matching environments', () => {
+  const f = fixture(); save(f, content('宽泛版本条件', { scope: { versionRange: '~1' } }))
+  const found = f.lib.search('b', { scope: { version: '1.5.0' } })
+  expect(found.items).toHaveLength(1)
+  expect(found.items[0].warnings).toContain('versionRange 未核实')
+})

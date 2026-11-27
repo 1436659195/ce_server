@@ -42,7 +42,8 @@ function versionMatches(version: string, range: string): boolean | undefined {
     const parts = group.trim().replace(/([<>]=?|=|~|\^)\s+/g, '$1').split(/\s+/); let match = true
     for (const part of parts) {
       const m = /^(>=|<=|>|<|=|~|\^)?(v?\d+(?:\.\d+){0,2})$/.exec(part); const target = m && parse(m[2])
-      if (!m || !target) { unknown = true; match = false; break }
+      // Only numeric full-version caret/tilde ranges are interpreted; npm shorthand is not inferred.
+      if (!m || !target || ((m[1] === '~' || m[1] === '^') && m[2].replace(/^v/, '').split('.').length !== 3)) { unknown = true; match = false; break }
       const n = cmp(current, target); const op = m[1] ?? '='
       if (!(op === '>=' ? n >= 0 : op === '<=' ? n <= 0 : op === '>' ? n > 0 : op === '<' ? n < 0 : op === '~' ? n >= 0 && current[0] === target[0] && current[1] === target[1] : op === '^' ? n >= 0 && (target[0] ? current[0] === target[0] : target[1] ? current[0] === 0 && current[1] === target[1] : current[0] === 0 && current[1] === 0 && current[2] === target[2]) : n === 0)) match = false
     }
