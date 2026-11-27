@@ -206,7 +206,7 @@ export class ExperienceLibrary {
       this.db.query('INSERT OR IGNORE INTO experience_events(bot_id,event_key,body) VALUES(?,?,?)').run(botId, `usage:${taskId}:${item.id}:${hash(report)}`, JSON.stringify({ taskId, ...report, at: entry.at }))
       this.db.query('INSERT INTO experience_usage(bot_id,task_id,experience_id,body) VALUES(?,?,?,?) ON CONFLICT(bot_id,task_id,experience_id) DO UPDATE SET body=excluded.body').run(botId, taskId, item.id, JSON.stringify(entry))
       if (adopted && !previous?.adopted) this.put({ ...item, uses: (item.stats?.adopted ?? 0) + 1, stats: { ...(item.stats ?? zeroStats()), adopted: (item.stats?.adopted ?? 0) + 1 }, lastUsedAt: Date.now() }, false)
-      if (report.status === 'failed' && item.state === 'active') {
+      if (report.status === 'failed' && item.state === 'active' && item.version === report.version) {
         const current = this.get(botId, item.id)!
         this.changeState(botId, { requestId: `usage-failed:${taskId}:${item.id}:${report.version}`, id: item.id, expectedVersion: current.version!, state: 'needs_review', reason: `采用后发现问题：${report.result}`.slice(0, 1000) }, { taskId })
       }

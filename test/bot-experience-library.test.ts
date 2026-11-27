@@ -190,3 +190,12 @@ test('numeric version ranges and OS aliases are checked while unknown versions r
   expect(f.lib.search('b', { scope: { os: 'windows', version: '2.0.0' } }).items).toHaveLength(0)
   expect(f.lib.search('b', { scope: { os: 'windows' } }).items[0]?.warnings).toContain('versionRange 未核实')
 })
+
+test('failure of a pinned old version does not mark an independently corrected latest version for review', () => {
+  const f = fixture(); const e = save(f)
+  f.lib.save('b', command(content(undefined, { steps: ['已修正的新步骤'] }), { id: e.id, expectedVersion: 1 }), { inboxId: f.msg.id })
+  const ref = { experienceId: e.id, version: 1 }
+  f.lib.recordUsage('b', f.task.id, [{ ...ref, status: 'failed', appliedSteps: ['执行旧步骤'], result: '旧步骤失效，新版尚未派发' }], [ref])
+  expect(f.lib.get('b', e.id)).toMatchObject({ state: 'active', version: 2, steps: ['已修正的新步骤'] })
+  expect(f.lib.usage('b', e.id)[0]).toMatchObject({ version: 1, status: 'failed', successful: false })
+})
