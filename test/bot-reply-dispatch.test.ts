@@ -63,6 +63,25 @@ function fixture(send?: (reply: RuntimeReply) => Promise<void>, inspectHistory?:
   return { runtime, store, bot, root, sent, receive, task, enqueue, modelCalls: () => modelCalls }
 }
 
+test('Worker 失败提示替换尚未发送的受理话', async () => {
+  const f=fixture();const {task,input}=f.task();const ack=f.store.pendingReplies('bot')[0]
+  f.store.updateTask(task.id,{state:'failed',latestRunId:'run-failed'})
+  const failure=f.enqueue('任务未完成。',{author:'worker',purpose:'unable',taskId:task.id,inputId:input.id,runId:'run-failed'})
+  await f.runtime.flush('bot')
+  expect(f.sent.map(r=>r.id)).toEqual([failure.id])
+  expect(f.store.replies('bot').find(r=>r.id===ack.id)?.state).toBe('cancelled')
+})
+
+test('任务重新排队后不再发送上一轮失败提示', async () => {
+  const f=fixture();const {task}=f.task();f.store.cancelReplies('bot')
+  f.store.updateTask(task.id,{state:'failed',latestRunId:'run-failed'})
+  const failure=f.enqueue('任务未完成。',{author:'worker',purpose:'unable',taskId:task.id,runId:'run-failed'})
+  f.store.updateTask(task.id,{state:'queued'})
+  await f.runtime.flush('bot')
+  expect(f.sent).toHaveLength(0)
+  expect(f.store.replies('bot').find(r=>r.id===failure.id)?.state).toBe('cancelled')
+})
+
 test('Worker 已有最终结果时，取消同任务尚未发送的受理话并保留正文与附件关联', async () => {
   const f = fixture(); const { task, input } = f.task()
   const ack = f.store.pendingReplies('bot')[0]

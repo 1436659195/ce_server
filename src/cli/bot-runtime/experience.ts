@@ -1,5 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { tokenize } from './memory'
+const CJK = /[㐀-鿿぀-ヿ]/u
+function tokenize(text: string): Set<string> {
+  const tokens = new Set<string>(text.toLowerCase().match(/[a-z]+|[0-9]+/g) ?? [])
+  const chars = [...text].filter(c => CJK.test(c))
+  for (let i = 0; i < chars.length; i++) { tokens.add(chars[i]); if (i) tokens.add(chars[i - 1] + chars[i]) }
+  return tokens
+}
 import type { RuntimeCase, RuntimeExperience, RuntimeTask } from './types'
 
 /** Legacy migration constant only; popularity no longer reserves slots. */

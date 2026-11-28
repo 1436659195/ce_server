@@ -1,3 +1,4 @@
+import { createMemoryEmbedding } from './bot-runtime/memory-retrieval'
 /**
  * ce —— 跑在被控机的 CLI。编排:
  *   探测/起本地 Jupyter → 连中继(带持久 cid)注册会话 → 生成密钥+二维码 → 配对握手 → 桥接
@@ -655,6 +656,7 @@ async function main(): Promise<void> {
   })
   const botRuntimeStore = new BotRuntimeStore(join(homedir(), '.ce', 'bot-runtime.sqlite'))
   const botRuntime = new BotRuntimeService({
+    memoryEmbedding: createMemoryEmbedding(),
     store: botRuntimeStore, rootDir: join(homedir(), '.ce'),
     claudeExecutable: claudeBin ?? undefined,
     getBot: nameOrId => chatHub.runtimeBot(nameOrId),

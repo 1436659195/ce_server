@@ -21,6 +21,7 @@ if (process.argv.includes('generate-json-schema')) {
     tool.properties.newRequiredField = { type: 'string' }; tool.required.push('newRequiredField')
   }
   if (compat?.badTurnId) schemas['v2/TurnSteerParams.json'].properties.expectedTurnId = { type: 'integer' }
+  if (compat?.badExcludeTurns) schemas['v2/ThreadResumeParams.json'].properties.excludeTurns = { type: 'string' }
   if (compat?.requiresModel) schemas['v2/ThreadStartParams.json'].required = ['model']
   for (const [file, schema] of Object.entries(schemas)) { mkdirSync(dirname(join(out, file)), { recursive: true }); writeFileSync(join(out, file), JSON.stringify(schema)) }
   process.exit(0)
@@ -49,8 +50,13 @@ createInterface({ input: process.stdin }).on('line', line => {
   if (r.method === 'initialize') reply({ userAgent: 'fixture/1' })
   else if (r.method === 'thread/start' || r.method === 'thread/resume') {
     threadConfig = r.params
+    if (r.method === 'thread/resume') {
+      recordProbe(`resume:excludeTurns=${String(r.params.excludeTurns)}`)
+      if ((compat?.removeField?.[1] === 'excludeTurns' || compat?.badExcludeTurns) && r.params.excludeTurns !== undefined) return output({ id: r.id, error: { code: -32602, message: 'unsupported excludeTurns' } })
+    }
     if (r.params.sandbox !== 'danger-full-access' && (r.params.environments?.length !== 0 || r.params.sandbox !== 'read-only')) return output({ id: r.id, error: { code: -1, message: 'unsafe thread config' } })
-    reply({ thread: { id: 'thread-test' }, sandbox: { type: compat?.unsafeSandbox ? 'dangerFullAccess' : r.params.sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'readOnly' }, approvalPolicy: 'never' })
+    const turns = r.method === 'thread/resume' && compat?.largeHistory && r.params.excludeTurns !== true ? [{ items: [{ imageUrl: 'data:image/jpeg;base64,' + 'a'.repeat(9_800_000) }] }] : []
+    reply({ thread: { id: 'thread-test', turns }, sandbox: { type: compat?.unsafeSandbox ? 'dangerFullAccess' : r.params.sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'readOnly' }, approvalPolicy: 'never' })
   } else if (r.method === 'turn/start') {
     turnConfig = r.params
     if (r.params.input[0].text === 'failed-start') return reply({ turn: { id: 'failed-turn', status: 'failed', error: { message: 'fixture model unavailable' } } })
@@ -87,6 +93,7 @@ createInterface({ input: process.stdin }).on('line', line => {
   } else if (r.method === 'test/config') reply({ thread: threadConfig, turn: turnConfig })
   else if (r.method === 'test/auth-error') output({ id:r.id,error:{code:401,message:'Unauthorized api_key=private-test-key'} })
   else if (r.method === 'test/method-error') output({ id:r.id,error:{code:-32601,message:'unknown method private-test-key'} })
+  else if (r.method === 'test/oversized') reply({ text: 'a'.repeat(9_800_000) })
   else if (r.method === 'test/never') { /* 用于超时测试 */ }
   else if (r.method === 'test/tool') { output(toolRequest(r.params.turnId)); reply({ issued: true }) }
   else if (r.method === 'test/closing') {

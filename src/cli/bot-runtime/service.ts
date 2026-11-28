@@ -5,12 +5,14 @@ import { BOT_TOOLS, BOT_EXPORT_TOOL } from '../bot-tools'
 import { operationMode, type BotApproval, type BotOperation, type BotPermissions } from '../bot-permissions'
 import { ClaudeRuntime } from './claude'
 import { CodexAppServer, CodexToolOutput, type CodexActiveTurn, type CodexToolCall, type CodexToolSpec, type CodexTurn } from './codex'
+import { runtimeFailure } from './compatibility'
 import { RouterDiagnostics } from './router-diagnostics'
 import { artifactReference, attachmentMime, attachmentName, ATTACHMENT_MAX_BYTES, BotAttachmentFiles } from './attachments'
 import { activeOperationStatus, bindRouterDecision, boundedText, isControlUtterance, routerContext, REMOTE_COMPUTER_INSTRUCTIONS, ROUTER_INSTRUCTIONS, ROUTER_TOOLS, tool, WORKER_INSTRUCTIONS, type RouterBindings, type RouterDecision } from './router'
 import { EXPERIENCE_USAGE_SCHEMA, type ExperienceReceipt } from './experience-library'
 import { EXPERIENCE_LESSON_SCHEMA, EXPERIENCE_LESSON_JSON, EXPERIENCE_USAGE_JSON, EXPERIENCE_SEARCH_SCHEMA, EXPERIENCE_READ_SCHEMA, EXPERIENCE_ROUTER_SAVE_SCHEMA, EXPERIENCE_STATE_SCHEMA, WORK_READ_EXPERIENCE_TOOL, readExperience } from './experience-tools'
-import { MEMORY_INSTRUCTIONS, MEMORY_LIMITS, MEMORY_PROPOSE_TOOL, memorySummary, parseMemoryProposal, planMemoryChange, selectMemories } from './memory'
+import { MEMORY_INSTRUCTIONS, MEMORY_PROPOSE_TOOL, MEMORY_SEARCH_TOOL, MEMORY_READ_TOOL, memorySummary, memoryVersion, type MemoryAudience } from './memory'
+import { MemoryRetrieval, type MemoryEmbedding } from './memory-retrieval'
 import { caseSummary, groupByCase, selectCases, selectTasks } from './cases'
 import { RemoteShellPool, type RemoteChannel, type RemoteRunResult } from './remote-shell'
 import type { RemoteTicket } from '../remote-peer'
@@ -21,7 +23,7 @@ import { AUTOMATION_LIMITS, ACTIVE_OCCURRENCE_STATES, type AutomationJob, type A
 import { parseAutomationArgs, automationSummary } from './automation/tool'
 import type { collectHostMetric } from './automation/collectors'
 import { FULL_ACCESS_OPERATIONS, workerExecutionPolicy, type WorkerAccessMode } from './worker-policy'
-import type { RuntimeArtifact, RuntimeArtifactSummaryInput, RuntimeAttachment, RuntimeBot, RuntimeInbox, RuntimeMemory, RuntimeMemoryControl, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUploadRequest, RuntimeView } from './types'
+import type { RuntimeArtifact, RuntimeArtifactSummaryInput, RuntimeAttachment, RuntimeBot, RuntimeInbox, RuntimeMemoryControl, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUploadRequest, RuntimeView } from './types'
 
 type Authorization = { directory: string; permissions: BotPermissions; revision: number }
 export interface RuntimeClientOptions { cwd: string; accessMode?: WorkerAccessMode; model?: string; effort?: 'low' | 'medium' | 'high'; onToolCall: (call: CodexToolCall) => Promise<unknown> }
@@ -48,6 +50,7 @@ interface Options {
   sendReply(reply: RuntimeReply): Promise<void>
   checkAccess(bot: RuntimeBot, memberId: string, operation: BotOperation): Promise<Authorization>
   openTools(bot: RuntimeBot, memberId: string, authorize: (operation: BotOperation, summary: string) => Promise<Authorization>): { call(tool: string, args: Record<string, unknown>): Promise<string>; close(): void }
+  memoryEmbedding?: MemoryEmbedding
   createClient?: (role: 'router' | 'worker' | 'memory', options: RuntimeClientOptions) => RuntimeClient
   /** 宿主侧空闲保活时间；默认一分钟，不接受聊天或远端 RPC 覆盖。 */
   routerIdleMs?: number
@@ -69,6 +72,7 @@ interface Options {
 interface RouterSession {
   client: RuntimeClient; fingerprint: string; threadId?: string; turns: number; contextChars: number
   active?: { handler: RuntimeClientOptions['onToolCall']; turn?: Promise<CodexActiveTurn>; inputIds: string[]; workerReplyId?: string; automationOccurrenceId?: string; superseded: boolean; committed: boolean }
+  memoryRevision?: string; memorySnapshot?: string
   idleTimer?: ReturnType<typeof setTimeout>; closing?: Promise<void>
 }
 export const ROUTER_IDLE_MS = 60_000
@@ -129,6 +133,7 @@ export class BotRuntimeService {
   readonly automations: AutomationScheduler
   readonly store: BotRuntimeStore
   readonly files: BotAttachmentFiles
+  readonly memoryRetrieval: MemoryRetrieval
   private routeTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private replyTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private routerBusy = new Map<string, Promise<void>>()
@@ -146,6 +151,7 @@ export class BotRuntimeService {
   private timer: ReturnType<typeof setInterval>
   constructor(private readonly opts: Options) {
     this.store = opts.store
+    this.memoryRetrieval = new MemoryRetrieval(this.store.memoryLibrary, opts.memoryEmbedding)
     this.files = new BotAttachmentFiles(opts.rootDir, this.store)
     // 上次 run 没有确认退出时不盲目恢复；工具实际结果需要核对。
     for (const run of this.store.runs().filter(r => r.state !== 'exited')) {
@@ -325,6 +331,14 @@ export class BotRuntimeService {
       for (const r of this.store.automations.active(job.botId, job.id)) {
         const task = r.taskId ? this.store.task(r.taskId) : undefined
         if (!ACTIVE_OCCURRENCE_STATES.includes(r.state)) continue
+        if (task?.state === 'failed') {
+          // Keep the occurrence valid while its failure notice is being routed
+          // or retried offline. User pause/revocation still invalidates it.
+          const pendingFailure = this.store.pendingReplies(job.botId).some(reply => reply.taskId === task.id && reply.runId === task.latestRunId && reply.purpose === 'unable' && this.replyCurrent(reply))
+          if (pendingFailure) this.store.automations.transition(r.id, 'delivery_pending', now)
+          else this.automations.fail(r.id, task.error ?? '执行失败')
+          continue
+        }
         if (r.state === 'working' && task?.state === 'completed' && task.review?.state === 'approved') this.store.automations.transition(r.id, 'delivery_pending', now)
         const deliveryPending = this.store.automations.occurrence(r.id)?.state === 'delivery_pending'
         // A failed network delivery retries the same outbox ID independently of execution time.
@@ -333,7 +347,7 @@ export class BotRuntimeService {
           if (task && ['queued', 'running', 'waiting_user'].includes(task.state)) await this.stopTask(job.botId, task.id, '事件执行时间预算已用尽')
           continue
         }
-        if (task && ['failed', 'recovering'].includes(task.state)) { this.automations.fail(r.id, task.error ?? '执行结果需要核对'); continue }
+        if (task?.state === 'recovering') { this.automations.fail(r.id, task.error ?? '执行结果需要核对'); continue }
         if (task?.state === 'stopped') { this.store.automations.transition(r.id, 'cancelled', now, { error: '本次任务已停止，下次周期不变' }); continue }
         const current = this.store.automations.occurrence(r.id)!
         if (current.state === 'delivery_pending') {
@@ -524,14 +538,14 @@ export class BotRuntimeService {
           const relatedTaskIds = [...(automationEvent?.job.source.taskId ? [automationEvent.job.source.taskId] : []), ...messages.flatMap(m => m.targetTaskId ? [m.targetTaskId] : []), ...(workerMessage?.taskId ? [workerMessage.taskId] : []), ...(previousWork ? [previousWork] : []), ...(lastResult ? [lastResult] : [])]
           const visibleTasks = selectTasks(allTasks, relatedTaskIds)
           const visibleCases = selectCases(this.store.cases(botId), allTasks, artifacts, { query: messages.map(m => m.text).join('\n'), relatedTaskIds })
-          // 记忆按渠道和对话角色分开取；只带规矩本身，不带完整原话。
-          const speaker = message?.senderId ?? bot.ownerPhoneId
-          const selection = selectMemories(this.store.memories(botId).filter(m => m.channel === bot.groupId && m.senderId === speaker), messages.map(m => m.text).join('\n'), Date.now(), settings.rounds ?? 0)
-          // Small libraries expose the full catalog for Router semantic selection; larger ones use contextual lexical recall.
+          const audience = this.memoryAudience(bot)
+          const task = relatedTaskIds.map(id => allTasks.find(t => t.id === id)).find(t => t !== undefined)
+          const memoryAudience = { ...audience, taskId: task?.id, caseId: task?.caseId }
           const userText = messages.map(m => m.text).join('\n').trim()
-          const triggeredRules = new Set(selection.triggered)
-          const relatedRules = userText ? selection.long.filter(m => triggeredRules.has(m.id)) : []
-          const explicitTasks = new Set([...messages.flatMap(m => m.targetTaskId ? [m.targetTaskId] : []), ...(workerMessage?.taskId ? [workerMessage.taskId] : [])])
+          const memoryQuery = [userText, ...recentMessages.slice(-3).map(m => m.text.slice(0, 200)), task?.goal, task?.summary.slice(0, 400), automationEvent?.job.name].filter(Boolean).join('\n').slice(0, 2000)
+          const selection = await this.memoryRetrieval.disclose(memoryAudience, memoryQuery)
+          const relatedRules = selection.long.filter(m => !m.core)
+          const explicitTasks = new Set([...messages.flatMap(m => m.targetTaskId ? [m.targetTaskId] : []), ...(workerMessage?.taskId ? [workerMessage.taskId] : []), ...(automationEvent?.job.source.taskId ? [automationEvent.job.source.taskId] : [])])
           const query = [userText, ...relatedRules.map(m => m.prompt), ...allTasks.filter(t => explicitTasks.has(t.id)).map(t => t.goal), automationEvent?.job.name ?? ''].join('\n').slice(0, 2000)
           const experience = this.store.experienceLibrary.search(botId, { query })
           const disclosedExperiences = new Set(experience.items.map(e => `${e.id}:${e.version}`))
@@ -539,10 +553,11 @@ export class BotRuntimeService {
           const bindings: RouterBindings = { policyRevision: bot.policyRevision, currentInputIds: messages.map(m => m.id), workerReplyId: workerMessage?.id, workerSource: { worker: !!workerMessage, files: !!workerMessage?.artifactIds?.length },
             tasks: new Map(visibleTasks.map(t => [t.id, { revision: t.revision, questionId: t.question?.id, caseId: t.caseId }])), cases: new Map(visibleCases.map(c => [c.id, { revision: c.revision ?? 1, scopeComplete: true }])) }
           const context = routerContext({ bot, automationEvent, input: message, inputs: messages, workerMessage, workerRequest: workerMessage ? this.workerRequest(workerMessage) : undefined, workerArtifacts: workerMessage?.artifactIds?.flatMap(id => { const a = this.store.artifact(id); return a ? [{ id: a.id, name: a.name ?? a.title, mime: a.mime, size: a.size }] : [] }), pendingReplies: this.pausedRouterReplies(botId).map(r => ({ id: r.id, text: r.text })), profile: settings.profile, messages: recentMessages, cases: visibleCases, tasks: allTasks, artifacts, relatedTaskIds, experienceSummaries: experience.items, operations: this.store.operations(), previousReplies: previousReplies.map(r => ({ text: r.text, createdAt: r.sentAt ?? r.createdAt, taskId: r.taskId, caseId: r.taskId ? this.store.task(r.taskId)?.caseId : undefined })), toolsLocked,
-            memories: { long: selection.long.map(memorySummary), mid: selection.mid.map(memorySummary), overflow: selection.overflow } })
+            memories: selection })
           const fingerprint = this.routerFingerprint(bot)
+          const memorySnapshot = createHash('sha256').update(JSON.stringify([selection.long, selection.mid, memoryAudience])).digest('hex')
           session = this.routerClients.get(botId)
-          if (session && (session.closing || session.fingerprint !== fingerprint || session.turns >= ROUTER_MAX_TURNS || session.contextChars + context.length > ROUTER_MAX_CONTEXT_CHARS)) {
+          if (session && (session.closing || session.fingerprint !== fingerprint || session.memoryRevision !== selection.revision || session.memorySnapshot !== memorySnapshot || session.turns >= ROUTER_MAX_TURNS || session.contextChars + context.length > ROUTER_MAX_CONTEXT_CHARS)) {
             await this.closeRouter(botId, session)
             // Closing can await process exit while the owner changes configuration.
             // Rebuild the snapshot and check that this input still needs routing.
@@ -550,7 +565,7 @@ export class BotRuntimeService {
           }
           if (this.stopped || this.quiescing.has(botId) || messages.some(m => this.store.inbox(m.id)?.state !== 'pending')) break
           if (!session) {
-            const fresh: RouterSession = { client: undefined!, fingerprint, turns: 0, contextChars: 0 }
+            const fresh: RouterSession = { client: undefined!, fingerprint, memoryRevision: selection.revision, memorySnapshot, turns: 0, contextChars: 0 }
             fresh.client = this.client('router', bot, async call => {
               const active = fresh.active
               if (!active || fresh.closing) throw new Error('前台轮次已失效')
@@ -563,6 +578,9 @@ export class BotRuntimeService {
             session = fresh; this.routerClients.set(botId, session)
           }
           clearTimeout(session.idleTimer)
+          let memoryRevision = selection.revision
+          const memoryVersions = new Map([...selection.long, ...selection.mid].map(m => [m.id, m.version]))
+          const rememberVersions = (items: Array<{ id: string; version: number }>) => { for (const m of items) memoryVersions.set(m.id, m.version) }
           let reads = 0; let writes = 0; let experienceReads = 0; let decisions = 0; let committing = false; let readBudget = 8000; let experienceBudget = 32000
           const boundedRead = (result: unknown): unknown => {
             const size = JSON.stringify(result).length
@@ -586,15 +604,43 @@ export class BotRuntimeService {
               try { decision = bindRouterDecision(call.arguments, this.opts.getBot(botId), bindings) }
               catch (error) { diagnostic.decision(call.arguments, decisionOrigin, 'validation', false, error); throw error }
               this.validateExperienceSelection(botId, decision, disclosedExperiences)
+              if (memoryRevision !== this.store.memoryLibrary.revision(audience)) throw new Error('记忆已变化，请memory_search重新核实后再决策')
+              const chosenTaskId = decision.taskId ?? (decision.action === 'reply' && explicitTasks.size === 1 ? [...explicitTasks][0] : undefined)
+              const chosenTask = chosenTaskId ? this.store.task(chosenTaskId) : undefined
+              const adoptionAudience = { ...audience, taskId: chosenTask?.id, caseId: chosenTask?.caseId ?? decision.caseId }
+              for (const id of decision.memoryIds ?? []) {
+                const m = this.store.memoryLibrary.read(audience, id)
+                if (memoryVersions.get(id) !== memoryVersion(m) || !this.store.memoryLibrary.effective(adoptionAudience).some(current => current.id === id)) throw new Error('采用了未披露、已变化或失效的记忆，请重新查询')
+              }
               committing = true; active.committed = true
               try {
                 const receipt = await this.decide(messages, decision, workerMessage, automationEvent); committed = true
                 diagnostic.decision(call.arguments, decisionOrigin, 'commit', true)
-                if (message) this.afterTurn(settings, message, selection.triggered)
+                if (message) this.afterTurn(settings, message)
+                this.store.memoryLibrary.record(audience, decision.memoryIds ?? [], 'used', turnSourceId)
                 return { accepted: true, ...receipt }
               }
               catch (error) { if (!committed) diagnostic.decision(call.arguments, decisionOrigin, 'commit', false, error); throw error }
               finally { committing = false; active.committed = committed }
+            }
+            if (call.tool === 'memory_write') {
+              if (++writes > 10 || !message) throw new Error('记忆写入需要当前用户委托，且不能超出本轮写入预算')
+              this.store.requireBatch(message.id, messages.map(m => m.id))
+              const receipt = this.store.memoryLibrary.write({ ...call.arguments, requestId: `${turnSourceId}:${call.arguments.requestId}` }, { ...audience, batch: messages, actor: 'router' })
+              memoryRevision = receipt.revision
+              session!.memoryRevision = memoryRevision; rememberVersions(receipt.items)
+              this.memoryRetrieval.invalidate(); void this.memoryRetrieval.index(audience)
+              return receipt
+            }
+            if (call.tool === 'memory_search' || call.tool === 'memory_read') {
+              if (++reads > 4) throw new Error('本轮读取预算已用尽')
+              const result = await this.memoryQuery(memoryAudience, call.tool, call.arguments)
+              const page = boundedRead(result)
+              memoryRevision = result.revision
+              if ('items' in result) rememberVersions(result.items)
+              else rememberVersions([memorySummary(result.memory)])
+              this.store.memoryLibrary.record(audience, 'items' in result ? result.items.map(m => m.id) : [result.memory.id], 'recall', `${turnSourceId}:${call.callId}`)
+              return page
             }
             if (call.tool === 'automation') {
               const read = call.arguments.action === 'list' || call.arguments.action === 'inspect'
@@ -691,7 +737,7 @@ export class BotRuntimeService {
               for (const c of summaries) bindings.cases.set(c.id, { revision: c.revision, scopeComplete: true })
               return result
             }
-            if (call.tool === 'task_inspect') { const task = this.requireTask(botId, String(args.taskId)); const dossier = this.store.case(task.caseId)!; const result = boundedRead({ dossier: { id: dossier.id, title: dossier.title, goal: dossier.goal.slice(0, 200), goalTruncated: dossier.goal.length > 200, revision: dossier.revision ?? 1 }, id: task.id, caseId: task.caseId, goal: task.goal.slice(0, 500), state: task.state, revision: task.revision, review: task.review, executionGuidance: task.executionGuidance, acceptance: task.acceptance, summary: task.summary.slice(0, 500), summaryUpdatedAt: task.summaryUpdatedAt ?? null, observedAt: Date.now(), activeOperations: activeOperationStatus(this.store.operations(task.id)), question: task.question, directory: task.mandate.directory, policyRevision: task.mandate.policyRevision, directoryChanged: task.mandate.directory !== bot.directory, allowedOps: task.mandate.allowedOps, inputs: this.store.inputs(task.id).filter(i => !i.resolution).slice(-3).map(i => ({ id: i.id, kind: i.kind, text: i.text.slice(0, 500), delivery: i.delivery, revision: i.revision, consumedAt: i.consumedAt })) }); bindings.tasks.set(task.id, { revision: task.revision, questionId: task.question?.id, caseId: task.caseId }); bindings.cases.set(dossier.id, { revision: dossier.revision ?? 1, scopeComplete: dossier.goal.length <= 200 || (bindings.cases.get(dossier.id)?.revision === (dossier.revision ?? 1) && bindings.cases.get(dossier.id)?.scopeComplete === true) }); return result }
+            if (call.tool === 'task_inspect') { const task = this.requireTask(botId, String(args.taskId)); const dossier = this.store.case(task.caseId)!; const result = boundedRead({ dossier: { id: dossier.id, title: dossier.title, goal: dossier.goal.slice(0, 200), goalTruncated: dossier.goal.length > 200, revision: dossier.revision ?? 1 }, id: task.id, caseId: task.caseId, goal: task.goal.slice(0, 500), state: task.state, revision: task.revision, delivery: task.delivery, review: task.review, executionGuidance: task.executionGuidance, acceptance: task.acceptance, summary: task.summary.slice(0, 500), summaryUpdatedAt: task.summaryUpdatedAt ?? null, observedAt: Date.now(), activeOperations: activeOperationStatus(this.store.operations(task.id)), question: task.question, directory: task.mandate.directory, policyRevision: task.mandate.policyRevision, directoryChanged: task.mandate.directory !== bot.directory, allowedOps: task.mandate.allowedOps, inputs: this.store.inputs(task.id).filter(i => !i.resolution).slice(-3).map(i => ({ id: i.id, kind: i.kind, text: i.text.slice(0, 500), delivery: i.delivery, revision: i.revision, consumedAt: i.consumedAt })) }); bindings.tasks.set(task.id, { revision: task.revision, questionId: task.question?.id, caseId: task.caseId }); bindings.cases.set(dossier.id, { revision: dossier.revision ?? 1, scopeComplete: dossier.goal.length <= 200 || (bindings.cases.get(dossier.id)?.revision === (dossier.revision ?? 1) && bindings.cases.get(dossier.id)?.scopeComplete === true) }); return result }
             throw new Error('未知前台工具')
           } }
           session.active = active; turnState = active
@@ -703,6 +749,7 @@ export class BotRuntimeService {
           active.turn = session.client.startTurn(session.threadId, context, turnSourceId)
           const turn = await active.turn
           this.store.experienceLibrary.recordExposure(botId, experience.items.map(e => ({ experienceId: e.id, version: e.version })), 'display', `router:${turnSourceId}`)
+          this.store.memoryLibrary.record(audience, [...selection.long, ...selection.mid].map(m => m.id), 'recall', turnSourceId)
           const result = await turn.done
           diagnostic.turn(result)
           if (active.superseded) continue
@@ -793,7 +840,7 @@ export class BotRuntimeService {
     if (workerMessage && !this.replyCurrent(workerMessage)) throw new Error('Worker结果已失效，请按最新状态处理')
     if (this.stopped || this.quiescing.has(bot.botId) || !this.enabled(bot.botId) || bot.policyRevision !== d.policyRevision) throw new Error('运行模式或权限已改变')
     if (message) this.store.requireBatch(message.id, inputIds)
-    for (const id of d.cancelReplyIds) if (!this.store.replies(bot.botId).some(r => r.id === id && r.author === 'router' && r.attemptedAt === undefined && r.state !== 'sent' && !(r.sourceReplyId && (r.artifactIds?.length || r.purpose === 'question')))) throw new Error('只能取消当前 Bot 尚未尝试发送的前台气泡')
+    for (const id of d.cancelReplyIds) if (!this.store.replies(bot.botId).some(r => r.id === id && r.author === 'router' && r.attemptedAt === undefined && r.state !== 'sent' && !(r.sourceReplyId && (r.artifactIds?.length || r.purpose === 'question' || r.purpose === 'unable')))) throw new Error('只能取消当前 Bot 尚未尝试发送的前台气泡')
     if (d.action === 'stop' || d.action === 'resume') await this.control(bot.botId, message!.senderId, { action: d.action, taskId: d.taskId!, expectedRevision: d.expectedRevision!, requestId: message!.id }, inputIds)
     if (d.action === 'approve_directory') {
       await this.control(bot.botId, message!.senderId, { action: d.action, taskId: d.taskId!, expectedRevision: d.expectedRevision!, questionId: d.questionId, requestId: message!.id }, inputIds)
@@ -982,7 +1029,12 @@ export class BotRuntimeService {
     } catch (error) {
       if (!worker.stopping) {
         const task = this.store.task(run.taskId)
-        if (task && !['completed', 'stopped', 'waiting_user'].includes(task.state)) this.store.updateTask(task.id, { state: 'failed', error: this.error(error) })
+        if (task && !['completed', 'stopped', 'waiting_user'].includes(task.state)) this.store.transaction(() => {
+          this.store.updateTask(task.id, { state: 'failed', error: this.error(error) })
+          const diagnostic = runtimeFailure(bot.platform === 'claude' ? 'Claude Code' : 'Codex', error).message
+          this.store.reply({ botId: bot.botId, groupId: task.groupId, inputId: task.originInputId, taskId: task.id, taskRevision: task.revision, runId: run.id,
+            author: 'worker', purpose: 'unable', text: `任务未完成：${diagnostic}。卷宗和已有成果已保留。`, key: `${run.id}:failure`, policyRevision: task.mandate.policyRevision })
+        })
       }
     } finally {
       worker.writable = false; run.state = 'draining'; run.updatedAt = Date.now(); this.store.saveRun(run); clearTimeout(worker.budgetTimer)
@@ -1446,6 +1498,7 @@ export class BotRuntimeService {
     const task = this.store.task(reply.taskId)
     return !!task && task.botId === reply.botId && !['stopping', 'stopped', 'recovering'].includes(task.state) && (!reply.runId || task.latestRunId === reply.runId)
       && (reply.purpose !== 'result' || reply.taskRevision === undefined || reply.taskRevision === task.revision)
+      && (reply.purpose !== 'unable' || task.state === 'failed' && reply.taskRevision === task.revision)
       && (reply.purpose !== 'question' || task.question?.id === (reply.questionId ?? reply.key) || task.followup?.questionId === (reply.questionId ?? reply.key))
   }
   /** Worker 不阻塞的提问没人答：主人安静满一段时间后最多再提一次。 */
@@ -1478,7 +1531,7 @@ export class BotRuntimeService {
       const replacement = pending.find(candidate => {
         if ((!candidate.sourceReplyId && candidate.author !== 'worker') || candidate.taskId !== reply.taskId || candidate.groupId !== reply.groupId) return false
         if (candidate.purpose === 'answer') return !!candidate.inputId && candidate.inputId === reply.inputId
-        if (!['result', 'question'].includes(candidate.purpose)) return false
+        if (!['result', 'question', 'unable'].includes(candidate.purpose)) return false
         return candidate.taskRevision !== undefined && reply.taskRevision !== undefined
           ? candidate.taskRevision >= reply.taskRevision : candidate.createdAt >= reply.createdAt
       })
@@ -1541,29 +1594,32 @@ export class BotRuntimeService {
       }
     } catch { /* 保留同一 outbox ID，重连只重发，不重跑模型。 */ }
   }
-  /** 一轮成功提交后的记忆记账：轮次加一、相关命中记触发；命中快提示才排慢路。记账出错不影响已提交的回复。 */
-  /** 每一轮主人话提交后都排一次记忆整理：哪句是规矩由模型判断，这里不设词表门槛；同一批只整理一次。 */
-  private afterTurn(settings: RuntimeSettings, anchor: RuntimeInbox, triggered: string[]): void {
+  private memoryAudience(bot: RuntimeBot): MemoryAudience { return { botId: bot.botId, channel: bot.groupId, senderId: bot.ownerPhoneId, project: bot.directory } }
+  private async memoryQuery(audience: MemoryAudience, tool: string, args: Record<string, unknown>) {
+    if (tool === 'memory_search') return this.memoryRetrieval.search(audience, args)
+    const id = boundedText(args.id, '记忆编号', 150)
+    const current = this.store.memoryLibrary.read(audience, id)
+    const history = args.history === true || args.version !== undefined ? this.store.memoryLibrary.history(audience, id) : []
+    const selected = args.version === undefined ? current : history.find(m => memoryVersion(m) === args.version)
+    if (!selected) throw new Error('记忆历史版本不存在')
+    const memory = { ...selected, source: { ...selected.source, context: '' } }
+    const limit = args.limit === undefined ? 3 : Number(args.limit), offset = args.offset === undefined ? 0 : Number(args.offset)
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10 || !Number.isInteger(offset) || offset < 0) throw new Error('记忆历史分页参数无效')
+    return { memory, revision: this.store.memoryLibrary.revision(audience), ...(args.history === true ? { versions: history.slice(offset, offset + limit).map(m => ({ ...memorySummary(m), status: m.status, sourceInboxId: m.source.inboxId, updatedAt: m.updatedAt })), total: history.length, ...(offset + limit < history.length ? { nextOffset: offset + limit } : {}) } : {}) }
+  }
+  /** Background extraction still examines other topics; the shared writer deduplicates explicit saves. */
+  private afterTurn(settings: RuntimeSettings, anchor: RuntimeInbox): void {
     try {
-      const now = Date.now()
       this.store.transaction(() => {
         this.store.saveSettings({ ...settings, rounds: (settings.rounds ?? 0) + 1 })
-        this.store.triggerMemories(triggered, now)
-        this.store.setMemoryJob(anchor.id, { state: 'queued', scheduledAt: now })
+        this.store.setMemoryJob(anchor.id, { state: 'queued', scheduledAt: Date.now() })
       })
-    } catch { /* 记账不是回复的一部分 */ }
+    } catch { /* The reply is already committed; diagnostics remain separate. */ }
   }
-  /** 到期、升长期、进待看清单：每次巡检判一遍，只改状态并留流水，从不删除。 */
   private sweepMemories(botId: string): void {
     if (this.stopped || this.quiescing.has(botId) || !this.enabled(botId)) return
-    const now = Date.now()
-    const selection = selectMemories(this.store.memories(botId), '', now, this.store.settings(botId).rounds ?? 0)
-    const ops: RuntimeMemory[] = []; const logs: RuntimeMemoryLog[] = []
-    const log = (memory: RuntimeMemory, action: RuntimeMemoryLog['action'], note?: string): RuntimeMemoryLog => ({ id: `mlog_${randomUUID()}`, botId, memoryId: memory.id, action, actor: 'host', at: now, ...(note ? { note } : {}) })
-    for (const id of selection.expired) { const memory = this.store.memory(id); if (memory?.status === 'active') { ops.push({ ...memory, status: 'expired', updatedAt: now }); logs.push(log(memory, 'expire')) } }
-    for (const id of selection.promoted) { const memory = this.store.memory(id); if (memory?.status === 'active' && memory.tier === 'mid') { ops.push({ ...memory, tier: 'long', promotedAt: now, bornRound: undefined, expiresAt: undefined, updatedAt: now }); logs.push(log(memory, 'promote')) } }
-    for (const id of selection.review) { const memory = this.store.memory(id); if (memory && !memory.needsReview) { ops.push({ ...memory, needsReview: true, updatedAt: now }); logs.push(log(memory, 'review', '30 天没被用到，请主人看一眼')) } }
-    if (ops.length) this.store.applyMemoryOps(ops, logs)
+    this.store.memoryLibrary.sweep(botId)
+    void this.memoryRetrieval.index(this.memoryAudience(this.opts.getBot(botId)))
   }
   private readonly memoryJobs = new Map<string, Promise<void>>()
   private runMemoryJobs(botId: string): void {
@@ -1573,33 +1629,33 @@ export class BotRuntimeService {
     const job = this.runMemoryJob(botId, anchor).finally(() => { this.memoryJobs.delete(botId); this.runMemoryJobs(botId) })
     this.memoryJobs.set(botId, job)
   }
-  /** 慢路：后台单独一条模型通道；模型的结论经核对才落库。失败只记状态，不影响回复。 */
   private async runMemoryJob(botId: string, anchor: RuntimeInbox): Promise<void> {
     const scheduledAt = anchor.memoryJob!.scheduledAt
     this.store.setMemoryJob(anchor.id, { state: 'running', scheduledAt })
     let client: RuntimeClient | undefined; let timeout: ReturnType<typeof setTimeout> | undefined
     try {
-      const bot = this.owner(botId, anchor.senderId)
+      const bot = this.owner(botId, anchor.senderId), audience = this.memoryAudience(bot)
       const inputIds = (anchor.decision as { inputIds?: string[] } | undefined)?.inputIds ?? [anchor.id]
-      const batch = inputIds.map(id => this.store.inbox(id)).filter((m): m is RuntimeInbox => !!m)
-      const candidates = this.store.memories(botId).filter(m => m.channel === bot.groupId && m.senderId === anchor.senderId && m.status === 'active').slice(-MEMORY_LIMITS.candidates)
-      let committed = false
+      const batch = inputIds.map(id => this.store.inbox(id)).filter((m): m is RuntimeInbox => !!m && !m.revokedAt)
+      const candidates = await this.memoryRetrieval.search(audience, { query: batch.map(m => m.text).join('\n').slice(0, 2000), limit: 20 })
+      let committed = false; let calls = 0
       client = this.client('memory', bot, async call => {
-        if (call.tool !== 'memory_commit') throw new Error('记忆整理只允许 memory_commit')
         if (committed) throw new Error('本批记忆判断已提交')
-        committed = true
-        const proposal = parseMemoryProposal(call.arguments)
-        if (!proposal) return { accepted: false, reason: '判断格式无效，本批不写记忆' }
-        const plan = planMemoryChange(proposal, batch, candidates, Date.now(), this.store.settings(botId).rounds ?? 0)
-        if (plan.reject) return { accepted: false, reason: plan.reject }
-        if (plan.ops?.length) this.store.applyMemoryOps(plan.ops, plan.logs ?? [])
-        return { accepted: true, memories: plan.ops?.length ?? 0 }
+        if (++calls > 12) throw new Error('记忆整理工具预算已用尽')
+        if (call.tool === 'memory_search' || call.tool === 'memory_read') return this.memoryQuery(audience, call.tool, call.arguments)
+        if (call.tool !== 'memory_commit') throw new Error('记忆整理仅允许查询和提交')
+        const currentBatch = batch.map(m => this.store.inbox(m.id)).filter((m): m is RuntimeInbox => !!m && !m.revokedAt)
+        const receipt = this.store.memoryLibrary.write({ ...call.arguments, requestId: `background:${anchor.id}` }, { ...audience, batch: currentBatch, actor: 'memory' })
+        committed = true; this.memoryRetrieval.invalidate(); void this.memoryRetrieval.index(audience)
+        return { accepted: true, ...receipt }
       })
-      const thread = await client.startThread({ instructions: MEMORY_INSTRUCTIONS, tools: [MEMORY_PROPOSE_TOOL], ephemeral: true })
+      const thread = await client.startThread({ instructions: MEMORY_INSTRUCTIONS, tools: [MEMORY_SEARCH_TOOL, MEMORY_READ_TOOL, MEMORY_PROPOSE_TOOL], ephemeral: true })
       timeout = setTimeout(() => { void client?.close().catch(() => undefined) }, 60_000)
-      const turn = await client.startTurn(thread, JSON.stringify({ recent: this.conversation(botId, 12), batch: batch.map(m => ({ id: m.id, text: m.text.slice(0, 2000), sentAt: m.createdAt })), candidates: candidates.map(memorySummary) }))
+      const tasks = this.store.tasks(botId).filter(t => batch.some(m => t.originInputId === m.id || t.originInputIds?.includes(m.id) || m.targetTaskId === t.id || (m.decision as { taskId?: string } | undefined)?.taskId === t.id)).map(t => ({ id: t.id, caseId: t.caseId, goal: t.goal, state: t.state, summary: t.summary.slice(0, 500) }))
+      const turn = await client.startTurn(thread, JSON.stringify({ batchId: anchor.id, revision: candidates.revision, project: bot.directory, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, observedAt: Date.now(),
+        recent: this.conversation(botId, 12), batch: batch.map(m => ({ id: m.id, text: m.text, sentAt: m.createdAt })), tasks, candidates }))
       const result = await turn.done
-      if (result.status !== 'completed') throw new Error(result.error?.message ?? '记忆整理未正常完成')
+      if (result.status !== 'completed' || !committed) throw new Error(result.error?.message ?? '记忆整理未成功提交判断')
       this.store.setMemoryJob(anchor.id, { state: 'done', scheduledAt, finishedAt: Date.now() })
     } catch (error) {
       this.store.setMemoryJob(anchor.id, { state: 'failed', scheduledAt, finishedAt: Date.now(), error: this.error(error) })
@@ -1613,17 +1669,12 @@ export class BotRuntimeService {
     if (!message || message.revokedAt) return
     this.store.transaction(() => {
       this.store.revokeInbox(message.id, at)
-      const ops: RuntimeMemory[] = []; const logs: RuntimeMemoryLog[] = []
-      for (const memory of this.store.memoriesBySource(botId, message.id)) {
-        if (!['active', 'suppressed'].includes(memory.status)) continue
-        ops.push({ ...memory, status: 'revoked', revokedReason: '原话被撤回', updatedAt: at })
-        logs.push({ id: `mlog_${randomUUID()}`, botId, memoryId: memory.id, action: 'revoke', actor: 'host', at, note: '原话被撤回' })
-      }
-      this.store.applyMemoryOps(ops, logs)
+      this.store.memoryLibrary.withdrawSource(this.memoryAudience(bot), message.id, at)
+      this.memoryRetrieval.invalidate()
     })
     void this.cancelInvalidAutomationWork().catch(error => this.store.saveSettings({ ...this.store.settings(botId), error: `撤回事件委托：${this.error(error)}` }))
   }
-  /** 主人对记忆或经验的管理：压下、取消压下、作废。模型没有任何删除能力。 */
+  /** Owner controls share the same lifecycle and invalidation as model-mediated writes. */
   async memoryControl(botId: string, actor: string, c: RuntimeMemoryControl): Promise<RuntimeView> {
     const bot = this.owner(botId, actor)
     boundedText(c.requestId, '请求 ID', 150)
@@ -1637,20 +1688,15 @@ export class BotRuntimeService {
         else this.store.saveExperience({ ...item, state: 'retired', updatedAt: Date.now() })
         return { done: true }
       }
-      const memory = this.store.memory(c.id)
-      if (!memory || memory.botId !== bot.botId) throw new Error('记忆不存在')
-      const now = Date.now(); const note = c.note?.trim()
-      const next = c.action === 'suppress' ? { status: 'suppressed' as const, suppressedBy: actor }
-        : c.action === 'unsuppress' ? { status: 'active' as const, suppressedBy: undefined }
-          : { status: 'revoked' as const, revokedReason: note || '主人作废' }
-      this.store.applyMemoryOps([{ ...memory, ...next, updatedAt: now }], [{ id: `mlog_${randomUUID()}`, botId: bot.botId, memoryId: memory.id, action: c.action, actor: 'owner', at: now, ...(note ? { note } : {}) }])
+      this.store.memoryLibrary.control(this.memoryAudience(bot), c.id, c.action)
+      this.memoryRetrieval.invalidate()
       return { done: true }
     })
     return this.view(bot.botId, actor)
   }
   async close(): Promise<void> {
     if (this.stopped) return
-    this.stopped = true; clearInterval(this.timer)
+    this.stopped = true; clearInterval(this.timer); this.memoryRetrieval.close()
     await this.automations.stop()
     for (const timer of [...this.routeTimers.values(), ...this.replyTimers.values()]) clearTimeout(timer)
     this.routeTimers.clear(); this.replyTimers.clear()

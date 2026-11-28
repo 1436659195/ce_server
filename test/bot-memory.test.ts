@@ -2,11 +2,11 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { MEMORY_LIMITS, parseMemoryProposal, planMemoryChange, relevance, selectMemories, tokenize } from '../src/cli/bot-runtime/memory'
+import type { MemoryEmbedding } from '../src/cli/bot-runtime/memory-retrieval'
 import { BotRuntimeService, type RuntimeClient, type RuntimeClientOptions } from '../src/cli/bot-runtime/service'
 import { BotRuntimeStore } from '../src/cli/bot-runtime/store'
 import type { CodexToolCall, CodexTurn } from '../src/cli/bot-runtime/codex'
-import type { RuntimeBot, RuntimeInbox, RuntimeMemory, RuntimeReply } from '../src/cli/bot-runtime/types'
+import type { RuntimeBot, RuntimeMemory, RuntimeReply } from '../src/cli/bot-runtime/types'
 
 const DAY = 86_400_000
 const cleanups: Array<() => Promise<void>> = []
@@ -19,12 +19,12 @@ function memory(p: Partial<RuntimeMemory> & Pick<RuntimeMemory, 'id' | 'prompt'>
   const now = Date.now()
   return { botId: 'b', channel: 'dm', senderId: 'owner', tier: 'long', status: 'active', source: { inboxId: `msg-${p.id}`, quote: p.prompt, context: '', sentAt: now }, triggers: { count: 0 }, createdAt: now, updatedAt: now, ...p }
 }
-function fixture(options: { tickMs?: number } = {}) {
+function fixture(options: { tickMs?: number; memoryEmbedding?: MemoryEmbedding } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ce-memory-'))
   const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
   const bot: RuntimeBot = { botId: 'b', name: '小林', groupId: 'dm', ownerPhoneId: 'owner', sourceCwd: dir, directory: dir, platform: 'codex', policyRevision: 1, commandSandbox: false,
     permissions: { version: 1, directory: '.', read: 'allow', create: 'allow', edit: 'allow', delete: 'deny', execute: 'deny', commanders: 'owner', allowedPhoneIds: [] } }
-  const turns: Array<{ context: any; decide: (args: Record<string, unknown>) => Promise<any>; finish: () => void }> = []
+  const turns: Array<{ context: any; decide: (args: Record<string, unknown>) => Promise<any>; call: (tool: string, args: Record<string, unknown>) => Promise<any>; finish: () => void }> = []
   const sent: RuntimeReply[] = []
   const memoryPayloads: any[] = []
   const proposals: Array<(payload: any) => Record<string, unknown> | undefined> = []
@@ -51,213 +51,170 @@ function fixture(options: { tickMs?: number } = {}) {
         const turnId = `turn-${turns.length}`
         const done = new Promise<CodexTurn>(r => { resolve = r })
         const complete = resolve!
-        turns.push({ context: JSON.parse(text), decide: async (args: Record<string, unknown>) => options.onToolCall({ threadId, turnId, callId: turnId, tool: 'router_decide', arguments: { decision: { action: args.action ?? 'reply' }, feasibility: 'can', replies: args.replies ?? [], basis: args.basis } }), finish: () => complete({ id: turnId, status: 'completed' }) })
+        turns.push({ context: JSON.parse(text), call: (tool, args) => options.onToolCall({ threadId, turnId, callId: `${turnId}:${tool}`, tool, arguments: args }), decide: async (args: Record<string, unknown>) => options.onToolCall({ threadId, turnId, callId: turnId, tool: 'router_decide', arguments: { decision: args.decision ?? { action: args.action ?? 'reply' }, feasibility: 'can', replies: args.replies ?? [], basis: args.basis, memoryIds: args.memoryIds } }), finish: () => complete({ id: turnId, status: 'completed' }) })
         return { threadId, turnId, done }
       }, steer: async () => '', interrupt: async () => {}, close: async () => { resolve?.({ id: 'closed', status: 'interrupted' }) } }
   }
-  const serviceOptions = { store, rootDir: dir, routerQuietMs: 0, bubbleGapMs: 0, tickMs: options.tickMs ?? 3_600_000, getBot: () => bot, sendReply: async (reply: RuntimeReply) => { sent.push(reply) }, checkAccess: async () => { throw new Error('no worker') }, openTools: () => { throw new Error('no worker') }, createClient }
+  const serviceOptions = { memoryEmbedding: options.memoryEmbedding, store, rootDir: dir, routerQuietMs: 0, bubbleGapMs: 0, tickMs: options.tickMs ?? 3_600_000, getBot: () => bot, sendReply: async (reply: RuntimeReply) => { sent.push(reply) }, checkAccess: async () => { throw new Error('no worker') }, openTools: () => { throw new Error('no worker') }, createClient }
   let service = new BotRuntimeService(serviceOptions)
   store.saveSettings({ ...store.settings('b'), mode: 'router-worker', revision: 1 })
   let seq = 0
-  const send = (text: string) => service.receive('b', { groupId: 'dm', seq: ++seq, text, senderId: 'owner', memberId: 'om', createdAt: Date.now() })
+  const send = (text: string, targetTaskId?: string) => service.receive('b', { groupId: 'dm', seq: ++seq, text, targetTaskId, senderId: 'owner', memberId: 'om', createdAt: Date.now() })
   const restart = async () => { await service.close(); service = new BotRuntimeService(serviceOptions) }
   cleanups.push(async () => { await service.close(); store.close(); rmSync(dir, { recursive: true, force: true }) })
   return { get service() { return service }, store, bot, turns, sent, send, memoryPayloads, proposals, state, restart }
 }
 
-test('相关度：中文按字和二字组，英文数字按词', () => {
-  expect([...tokenize('报告 Report2026 要简短')]).toEqual(expect.arrayContaining(['报告', '要简', '简短', 'report', '2026']))
-  const base = memory({ id: 'm', prompt: '报告要简短' })
-  expect(relevance(base, tokenize('报告写简短一点'))).toBeGreaterThan(relevance(base, tokenize('今天天气不错')))
-  expect(relevance(base, tokenize('report'))).toBe(0)
-})
 
-test('长期记忆全部常驻，超过 30 条只计数；中期按相关程度取 10 条', () => {
-  const now = Date.now()
-  const long = Array.from({ length: 31 }, (_, i) => memory({ id: `l${i}`, prompt: `长期规矩${i}`, updatedAt: now + i }))
-  const mid = Array.from({ length: 12 }, (_, i) => memory({ id: `m${i}`, prompt: i < 3 ? `报告要简短${i}` : `无关偏好${i}`, tier: 'mid', bornRound: 1, expiresAt: now + DAY }))
-  const selection = selectMemories([...long, ...mid], '报告写简短一点', now, 3)
-  expect(selection.long).toHaveLength(MEMORY_LIMITS.long)
-  expect(selection.overflow).toBe(1)
-  expect(selection.mid).toHaveLength(MEMORY_LIMITS.mid)
-  expect(selection.mid.slice(0, 3).map(m => m.id)).toEqual(['m0', 'm1', 'm2'])
-  expect(selection.triggered).toEqual(expect.arrayContaining(['m0', 'm1', 'm2']))
-})
+const change = (payload: any, extra: Record<string, unknown> = {}) => ({ action: 'save', tier: 'long', kind: 'preference', topic: '回复长度', prompt: '回复保持简短', core: true, sourceInboxId: payload.batch[0].id, quote: payload.batch[0].text.slice(0, 100), ...extra })
+const command = (payload: any, changes: unknown[]) => ({ requestId: payload.batchId, expectedRevision: payload.revision, changes })
 
-test('中期记忆 10 轮或 7 天先到为准，到期的不进上下文', () => {
-  const now = Date.now()
-  const byRound = memory({ id: 'r', prompt: '报告要简短', tier: 'mid', bornRound: 2, expiresAt: now + DAY })
-  const byTime = memory({ id: 't', prompt: '报告要简短', tier: 'mid', bornRound: 90, expiresAt: now - 1 })
-  const alive = memory({ id: 'a', prompt: '报告要简短', tier: 'mid', bornRound: 5, expiresAt: now + DAY })
-  const selection = selectMemories([byRound, byTime, alive], '报告写简短一点', now, 12)
-  expect(selection.mid.map(m => m.id)).toEqual(['a'])
-  expect(selection.expired).toEqual(['r', 't'])
-})
-
-test('慢路核对：来源不在本批、引文不是原话都不写；长期还是近期、是否取代旧规矩由模型判断', () => {
-  const now = Date.now()
-  const batch = [{ id: 'in-1', botId: 'b', groupId: 'dm', text: '以后都简短点', senderId: 'owner', createdAt: 1 }, { id: 'in-2', botId: 'b', groupId: 'dm', text: '太长了', senderId: 'owner', createdAt: 2 }] as RuntimeInbox[]
-  const parse = (args: Record<string, unknown>) => parseMemoryProposal(args)!
-  expect(planMemoryChange(parse({ intent: 'none' }), batch, [], now, 3).ops).toBeUndefined()
-  expect(planMemoryChange(parse({ intent: 'preference', tier: 'mid', prompt: 'x', sourceInboxId: 'in-other', quote: '太长了' }), batch, [], now, 3).reject).toContain('本批')
-  expect(planMemoryChange(parse({ intent: 'preference', tier: 'mid', prompt: 'x', sourceInboxId: 'in-1', quote: '我没说过这句' }), batch, [], now, 3).reject).toContain('原话')
-  // 不靠词表：没有「以后」这类词，模型判长期就是长期；没给档位按近期记并带到期。
-  const plain = planMemoryChange(parse({ intent: 'preference', tier: 'long', prompt: '回复短一点', sourceInboxId: 'in-2', quote: '太长了' }), batch, [], now, 3)
-  expect(plain.ops?.[0]).toMatchObject({ tier: 'long', status: 'active', channel: 'dm', senderId: 'owner', source: { inboxId: 'in-2', quote: '太长了' } })
-  expect(plain.ops?.[0].expiresAt).toBeUndefined()
-  const unset = planMemoryChange(parse({ intent: 'preference', prompt: '回复短一点', sourceInboxId: 'in-2', quote: '太长了' }), batch, [], now, 3)
-  expect(unset.ops?.[0]).toMatchObject({ tier: 'mid', bornRound: 3 })
-  expect(unset.ops?.[0].expiresAt).toBe(now + 7 * DAY)
-  const old = memory({ id: 'old', prompt: '回复写详细一点' })
-  const replaced = planMemoryChange(parse({ intent: 'preference', tier: 'mid', prompt: '短一点', sourceInboxId: 'in-2', quote: '太长了', conflicts: [{ memoryId: 'old', relation: 'supersedes' }] }), batch, [old], now, 3)
-  expect(replaced.ops?.find(op => op.id === 'old')).toMatchObject({ status: 'superseded', supersededBy: expect.any(String) })
-  expect(replaced.ops?.find(op => op.id !== 'old')).toMatchObject({ supersedes: 'old' })
-  expect(replaced.logs?.map(l => l.action)).toContain('supersede')
-  // 以下重复与计数的情形保持原样
-})
-
-test('同一条原话再说一遍不重复记；换一句原话重复同一件事只加次数', () => {
-  const now = Date.now()
-  const batch = [{ id: 'in-1', botId: 'b', groupId: 'dm', text: '以后都简短点', senderId: 'owner', createdAt: 1 }, { id: 'in-2', botId: 'b', groupId: 'dm', text: '太长了', senderId: 'owner', createdAt: 2 }] as RuntimeInbox[]
-  const parse = (args: Record<string, unknown>) => parseMemoryProposal(args)!
-  const sameSource = memory({ id: 'same', prompt: '回复保持简短', source: { inboxId: 'in-1', quote: '以后都简短点', context: '', sentAt: 1 } })
-  const sameMessage = planMemoryChange(parse({ intent: 'preference', tier: 'long', prompt: '回复保持简短', sourceInboxId: 'in-1', quote: '以后都简短点', conflicts: [{ memoryId: 'same', relation: 'duplicate' }] }), batch, [sameSource], now, 3)
-  expect(sameMessage.ops).toEqual([])
-  expect(sameMessage.logs).toEqual([])
-  const twin = memory({ id: 'twin', prompt: '回复保持简短', triggers: { count: 1 } })
-  const bump = planMemoryChange(parse({ intent: 'preference', tier: 'long', prompt: '回复保持简短', sourceInboxId: 'in-2', quote: '太长了', conflicts: [{ memoryId: 'twin', relation: 'duplicate' }] }), batch, [twin], now, 3)
-  expect(bump.ops?.[0]).toMatchObject({ id: 'twin', triggers: { count: 2 }, extraSources: [{ inboxId: 'in-2', quote: '太长了' }] })
-  expect(bump.logs?.[0]).toMatchObject({ action: 'duplicate', memoryId: 'twin' })
-})
-
-test('每一轮主人话提交后都排一次记忆整理；模型判是长期规矩就落长期；同一批只整理一次，重启不重复', async () => {
+test('background sees full messages, commits multiple topics through the shared writer and records real success', async () => {
   const f = fixture({ tickMs: 10 })
-  f.proposals.push(payload => ({ intent: 'preference', tier: 'long', prompt: '回复保持简短', sourceInboxId: payload.batch[0].id, quote: '以后都简短点' }))
-  const message = f.send('以后都简短点'); await until(() => f.turns.length === 1)
-  expect(f.turns[0].context.memories).toEqual({ long: [], mid: [], overflow: 0 })
+  f.proposals.push(p => command(p, [change(p), change(p, { topic: '称呼', prompt: '称呼用户老王', quote: '以后叫我老王' })]))
+  const text = '以后回复简短。' + '背景信息'.repeat(600) + '以后叫我老王'
+  const message = f.send(text); await until(() => f.turns.length === 1)
   expect(f.state.memoryCalls).toBe(0)
-  await f.turns[0].decide({ replies: ['好，以后简短。'] }); f.turns[0].finish()
-  await until(() => f.sent.length === 1)
-  await until(() => f.store.memories('b').length === 1)
-  expect(f.store.memories('b')[0]).toMatchObject({ tier: 'long', status: 'active', prompt: '回复保持简短', channel: 'dm', senderId: 'owner', source: { inboxId: message.id, quote: '以后都简短点' } })
-  expect(f.store.inbox(message.id)?.memoryJob).toMatchObject({ state: 'done' })
-  expect(f.memoryPayloads[0].batch.map((m: RuntimeInbox) => m.id)).toEqual([message.id])
-  expect(f.memoryPayloads[0].recent.some((m: { text: string }) => m.text === '以后都简短点')).toBe(true)
-  await f.restart(); await Bun.sleep(60)
-  expect(f.state.memoryCalls).toBe(1)
-  expect(f.store.memories('b')).toHaveLength(1)
-  expect(f.store.memoryLog('b').map(l => l.action)).toEqual(['create'])
-})
-
-test('没有词表门槛：听不出规矩的话也交给模型判断，模型说没有就不写', async () => {
-  const f = fixture({ tickMs: 10 })
-  f.proposals.push(() => ({ intent: 'none' }))
-  const message = f.send('以后再聊'); await until(() => f.turns.length === 1)
   await f.turns[0].decide({ replies: ['好。'] }); f.turns[0].finish()
   await until(() => f.store.inbox(message.id)?.memoryJob?.state === 'done')
+  expect(f.memoryPayloads[0].batch[0].text).toBe(text)
+  expect(f.store.memories('b')).toHaveLength(2)
+  expect(f.store.memoryLog('b').map(l => l.actor)).toEqual(['memory', 'memory'])
+  await f.restart(); await Bun.sleep(30); expect(f.state.memoryCalls).toBe(1)
+})
+
+test('a missing or rejected memory commit is failure, not a successful empty extraction', async () => {
+  const f = fixture({ tickMs: 10 }); const msg = f.send('以后都简短点')
+  await until(() => f.turns.length === 1); await f.turns[0].decide({ replies: ['好。'] }); f.turns[0].finish()
+  await until(() => f.store.inbox(msg.id)?.memoryJob?.state === 'failed')
+  expect(f.service.view('b', 'owner').memory.failedJobs.map(j => j.id)).toContain(msg.id)
+  expect(f.sent).toHaveLength(1)
+})
+
+test('explicit Router write returns receipt, updates next disclosure, and background deduplicates explicit saves', async () => {
+  const f = fixture({ tickMs: 10 }); f.proposals.push(p => command(p, [change(p)])); const msg = f.send('记住以后回复简短')
+  await until(() => f.turns.length === 1)
+  const turn = f.turns[0]
+  const receipt = await turn.call('memory_write', { requestId: 'remember', expectedRevision: turn.context.memories.revision, changes: [{ action: 'save', tier: 'long', kind: 'preference', topic: '回复长度', prompt: '回复保持简短', core: true, sourceInboxId: msg.id, quote: msg.text }] })
+  expect(receipt.items[0]).toMatchObject({ version: 1, action: 'save' })
+  await turn.decide({ replies: ['已记住。'], memoryIds: [receipt.items[0].id] }); turn.finish()
+  await until(() => f.store.inbox(msg.id)?.memoryJob?.state === 'done'); expect(f.state.memoryCalls).toBe(1); expect(f.store.memories('b')).toHaveLength(1)
+  f.send('你好'); await until(() => f.turns.length === 2)
+  expect(f.turns[1].context.memories.long.map((m: any) => m.id)).toEqual([receipt.items[0].id])
+})
+
+test('disclosure and actual adoption are counted separately and unknown memory IDs are rejected', async () => {
+  const f = fixture(); f.store.saveMemory(memory({ id: 'mine', prompt: '报告要简短', format: 2, version: 1, core: true }))
+  f.send('报告写简短一点'); await until(() => f.turns.length === 1)
+  await expect(f.turns[0].decide({ memoryIds: ['unknown'] })).rejects.toThrow(/记忆/)
+  await f.turns[0].decide({ replies: ['好。'], memoryIds: [] }); f.turns[0].finish(); await until(() => f.sent.length === 1)
+  expect(f.store.memory('mine')).toMatchObject({ recalls: 1 })
+  expect(f.store.memory('mine')?.uses ?? 0).toBe(0)
+})
+
+test('memory query is scoped, source IDs use existing chat_read, owner controls invalidate context', async () => {
+  const f = fixture(); const msg = f.send('以后简短回复'); await until(() => f.turns.length === 1)
+  const turn = f.turns[0]
+  const receipt = await turn.call('memory_write', { requestId: 'remember', expectedRevision: turn.context.memories.revision, changes: [{ action: 'save', tier: 'long', kind: 'preference', topic: '回复长度', prompt: '回复保持简短', core: true, sourceInboxId: msg.id, quote: msg.text }] })
+  const found = await turn.call('memory_search', { topic: '回复长度' }); expect(found.items[0].id).toBe(receipt.items[0].id)
+  const full = await turn.call('memory_read', { id: receipt.items[0].id }); expect(full.memory.source.inboxId).toBe(msg.id)
+  await f.service.memoryControl('b', 'owner', { requestId: 'forget', action: 'revoke', id: receipt.items[0].id })
+  await expect(turn.decide({ memoryIds: [receipt.items[0].id] })).rejects.toThrow(/记忆|失效|变化/)
+})
+
+test('time expiry never promotes hot memories or expires them after ten rounds', async () => {
+  const f = fixture({ tickMs: 10 }); const now = Date.now()
+  f.store.saveMemory(memory({ id: 'hot', prompt: '报告要简短', tier: 'mid', bornRound: 0, expiresAt: now + DAY, triggers: { count: 99 } }))
+  f.store.saveMemory(memory({ id: 'expired', prompt: '旧规则', tier: 'mid', expiresAt: now - 1 }))
+  f.store.saveSettings({ ...f.store.settings('b'), rounds: 100 })
+  await until(() => f.store.memory('expired')?.status === 'expired')
+  expect(f.store.memory('hot')).toMatchObject({ tier: 'mid', status: 'active' })
+})
+
+test('owner revocation of source clears local original and invalidates only affected rules', async () => {
+  const f = fixture(); const msg = f.send('以后简短回复'); await until(() => f.turns.length === 1)
+  const rule = memory({ id: 'rule', prompt: '回复保持简短', source: { inboxId: msg.id, quote: msg.text, context: msg.text, sentAt: msg.createdAt } }); f.store.saveMemory(rule)
+  f.service.revokeMessage('b', 'dm', msg.seq, Date.now())
+  expect(f.store.inbox(msg.id)?.text).toBe(''); expect(f.store.memory('rule')?.status).toBe('revoked')
+  await expect(f.service.memoryControl('b', 'other', { requestId: 'foreign', id: 'rule', action: 'unsuppress' })).rejects.toThrow(/owner|创建者/)
+})
+
+test('background still extracts an independent preference after an explicit Router save', async () => {
+  const f = fixture({ tickMs: 10 })
+  f.proposals.push(p => command(p, [change(p), change(p, { topic: '称呼', prompt: '称呼用户老王', quote: '以后叫我老王' })]))
+  const msg = f.send('记住以后简短回复。以后叫我老王'); await until(() => f.turns.length === 1)
+  const turn = f.turns[0]
+  await turn.call('memory_write', { requestId: 'remember', expectedRevision: turn.context.memories.revision, changes: [{ action: 'save', tier: 'long', kind: 'preference', topic: '回复长度', prompt: '回复保持简短', core: true, sourceInboxId: msg.id, quote: '记住以后简短回复' }] })
+  await turn.decide({ replies: ['已记住。'] }); turn.finish()
+  await until(() => f.store.inbox(msg.id)?.memoryJob?.state === 'done')
+  expect(f.store.memories('b').map(m => m.topic).sort()).toEqual(['回复长度','称呼'])
+})
+
+test('new tasks cannot adopt the prior task or case memory even when disclosed or read', async () => {
+  const f = fixture()
+  const input = f.store.receive({ botId: 'b', groupId: 'dm', senderId: 'owner', memberId: 'om', text: '整理财务报告', seq: 0, createdAt: Date.now() })
+  const old = f.store.acceptWork({ inputId: input.id, newCase: { title: '财务', object: '财务', goal: '报告' }, goal: '整理财务报告', acceptance: [], replies: [], mandate: { ownerPhoneId: 'owner', policyRevision: 1, directory: f.bot.directory, allowedOps: ['read'], exclusions: [], mode: 'execute' } })
+  f.store.saveMemory(memory({ id: 'task-rule', prompt: '报告必须十页', scope: { taskId: old.id }, format: 2, version: 1 }))
+  f.store.saveMemory(memory({ id: 'case-rule', prompt: '报告必须十页', scope: { caseId: old.caseId }, format: 2, version: 1 }))
+  f.send('新建网站'); await until(() => f.turns.length === 1)
+  const turn = f.turns[0]
+  for (const id of ['task-rule', 'case-rule']) await turn.call('memory_read', { id })
+  const base = { action: 'start', goal: '新建网站', delivery: 'chat', allowedOps: ['read'] }
+  const dossier = { kind: 'new', title: '网站', object: '网站', goal: '新建网站', reason: '与财务无关的独立事项' }
+  for (const id of ['task-rule', 'case-rule']) await expect(turn.decide({ decision: { ...base, dossier }, memoryIds: [id] })).rejects.toThrow(/记忆|范围/)
+  // Reusing a case does not grant the new task access to another task's rule.
+  const existing = { kind: 'existing', caseId: old.caseId, relation: 'next_step', reason: '后续任务' }
+  await expect(turn.decide({ decision: { ...base, dossier: existing }, memoryIds: ['task-rule'] })).rejects.toThrow(/记忆|范围/)
+  expect(f.store.tasks('b')).toHaveLength(1)
+  await turn.decide({ decision: { ...base, dossier: existing }, memoryIds: ['case-rule'] }); turn.finish()
+  expect(f.store.tasks('b')).toHaveLength(2)
+  expect(f.store.memory('case-rule')?.uses).toBe(1)
+})
+
+
+test('direct replies can adopt memory belonging to the explicitly addressed task', async () => {
+  const f = fixture()
+  const input = f.store.receive({ botId: 'b', groupId: 'dm', senderId: 'owner', memberId: 'om', text: '整理财务报告', seq: 0, createdAt: Date.now() })
+  const task = f.store.acceptWork({ inputId: input.id, newCase: { title: '财务', object: '财务', goal: '报告' }, goal: '整理财务报告', acceptance: [], replies: [], mandate: { ownerPhoneId: 'owner', policyRevision: 1, directory: f.bot.directory, allowedOps: ['read'], exclusions: [], mode: 'execute' } })
+  f.store.saveMemory(memory({ id: 'rule', prompt: '报告必须十页', scope: { taskId: task.id }, format: 2, version: 1 }))
+  f.send('报告格式是什么？', task.id); await until(() => f.turns.length === 1)
+  const turn = f.turns[0]
+  expect(turn.context.memories.long.map((m: any) => m.id)).toEqual(['rule'])
+  await turn.decide({ replies: ['报告要求十页。'], memoryIds: ['rule'] }); turn.finish()
+  expect(f.store.memory('rule')?.uses).toBe(1)
+})
+
+test('a memory tool result cannot silently adopt a newer revision than the returned snapshot', async () => {
+  const f = fixture(); f.store.saveMemory(memory({ id: 'rule', prompt: '报告要简短', core: true, format: 2, version: 1 }))
+  f.send('报告格式是什么？'); await until(() => f.turns.length === 1)
+  const turn = f.turns[0]
+  const search = f.service.memoryRetrieval.search.bind(f.service.memoryRetrieval)
+  let changed = false
+  f.service.memoryRetrieval.search = async (...args) => {
+    const result = await search(...args)
+    if (!changed) { changed = true; f.store.memoryLibrary.control({ botId: 'b', channel: 'dm', senderId: 'owner' }, 'rule', 'purge') }
+    return result
+  }
+  const result = await turn.call('memory_search', { topic: 'rule' })
+  expect(result.revision).not.toBe(f.store.memoryLibrary.revision({ botId: 'b', channel: 'dm', senderId: 'owner' }))
+  await expect(turn.decide({ replies: ['收到。'] })).rejects.toThrow(/记忆已变化/)
+  await turn.call('memory_search', { topic: 'rule' })
+  await turn.decide({ replies: ['收到。'] }); turn.finish()
+})
+
+test('background commits both time windows from a single message in one atomic memory_commit', async () => {
+  const f = fixture({ tickMs: 10 })
+  f.proposals.push(p => {
+    const start = p.batch[0].sentAt
+    return command(p, [
+      change(p, { tier: 'mid', core: false, prompt: '简短回复', quote: '简短回复', startsAt: start, expiresAt: start + DAY }),
+      change(p, { tier: 'mid', core: false, prompt: '详细回复', quote: '详细回复', startsAt: start + DAY, expiresAt: start + 2 * DAY }),
+    ])
+  })
+  const msg = f.send('今天简短回复，明天详细回复'); await until(() => f.turns.length === 1)
+  await f.turns[0].decide({ replies: ['好。'] }); f.turns[0].finish()
+  await until(() => ['done', 'failed'].includes(f.store.inbox(msg.id)?.memoryJob?.state ?? ''))
+  expect(f.store.inbox(msg.id)?.memoryJob?.state).toBe('done')
   expect(f.state.memoryCalls).toBe(1)
-  expect(f.store.memories('b')).toEqual([])
-})
-
-test('前台只说了正文、由宿主代为提交的那一轮，同样会整理记忆', async () => {
-  const f = fixture({ tickMs: 10 })
-  f.proposals.push(payload => ({ intent: 'preference', tier: 'long', prompt: '回复保持简短', sourceInboxId: payload.batch[0].id, quote: '以后回复都简短点' }))
-  const message = f.send('以后回复都简短点'); await until(() => f.turns.length === 1)
-  f.turns[0].finish()
-  await until(() => f.store.memories('b').length === 1)
-  expect(f.store.inbox(message.id)?.state).toBe('routed')
-  expect(f.store.memories('b')[0]).toMatchObject({ tier: 'long', prompt: '回复保持简短', source: { inboxId: message.id, quote: '以后回复都简短点' } })
-})
-
-test('记忆按渠道和对话角色分开取；长期常驻进上下文，命中相关度的记一次触发', async () => {
-  const f = fixture()
-  const mine = memory({ id: 'mine', prompt: '报告要简短', triggers: { count: 1 } })
-  const otherRole = memory({ id: 'other-role', prompt: '别的角色', senderId: 'someone' })
-  const otherChannel = memory({ id: 'other-channel', prompt: '别的渠道', channel: 'team' })
-  const unrelated = memory({ id: 'unrelated', prompt: '早上问声好' })
-  for (const m of [mine, otherRole, otherChannel, unrelated]) f.store.saveMemory(m)
-  f.send('报告写简短一点'); await until(() => f.turns.length === 1)
-  const shown = f.turns[0].context.memories
-  expect(shown.long.map((m: { id: string }) => m.id).sort()).toEqual(['mine', 'unrelated'])
-  expect(shown.overflow).toBe(0)
-  await f.turns[0].decide({ replies: ['好。'] }); f.turns[0].finish()
-  await until(() => f.sent.length === 1)
-  expect(f.store.memory('mine')?.triggers).toMatchObject({ count: 2 })
-  expect(f.store.memory('unrelated')?.triggers.count).toBe(0)
-})
-
-test('慢路出错不影响回复，失败在视图里可见；重启时进行中的任务标失败不重跑', async () => {
-  const f = fixture({ tickMs: 10 })
-  f.state.memoryFail = true
-  const message = f.send('以后都简短点'); await until(() => f.turns.length === 1)
-  await f.turns[0].decide({ replies: ['好。'] }); f.turns[0].finish()
-  await until(() => f.sent.length === 1)
-  await until(() => f.store.inbox(message.id)?.memoryJob?.state === 'failed')
-  expect(f.store.inbox(message.id)?.state).toBe('routed')
-  expect(f.service.view('b', 'owner').memory.failedJobs.map(j => j.id)).toEqual([message.id])
-  const running = f.send('以后都别用表格'); await until(() => f.turns.length === 2)
-  await f.turns[1].decide({ replies: ['好。'] }); f.turns[1].finish()
-  await until(() => f.store.inbox(running.id)?.memoryJob?.state === 'failed')
-  f.store.setMemoryJob(running.id, { state: 'running', scheduledAt: Date.now() })
-  await f.restart()
-  expect(f.store.inbox(running.id)?.memoryJob).toMatchObject({ state: 'failed' })
-  expect(f.store.inbox(running.id)?.memoryJob?.error).toContain('重启')
-})
-
-test('中期 7 天内触发满 3 次升长期；满 10 轮到期作废；长期 30 天没被触发进待看清单', async () => {
-  const f = fixture({ tickMs: 10 })
-  const now = Date.now()
-  const hot = memory({ id: 'hot', prompt: '报告要简短', tier: 'mid', bornRound: 1, expiresAt: now + DAY, triggers: { count: 3, lastTriggeredAt: now } })
-  const stale = memory({ id: 'stale', prompt: '早上问声好', tier: 'mid', bornRound: 0, expiresAt: now + DAY })
-  const quiet = memory({ id: 'quiet', prompt: '遇到故障先看日志', triggers: { count: 2, lastTriggeredAt: now - 31 * DAY } })
-  for (const m of [hot, stale, quiet]) f.store.saveMemory(m)
-  f.store.saveSettings({ ...f.store.settings('b'), rounds: 10 })
-  await until(() => f.store.memory('hot')?.tier === 'long')
-  expect(f.store.memory('hot')).toMatchObject({ status: 'active', promotedAt: expect.any(Number) })
-  expect(f.store.memory('hot')?.expiresAt).toBeUndefined()
-  expect(f.store.memory('stale')?.status).toBe('expired')
-  expect(f.store.memory('quiet')).toMatchObject({ status: 'active', needsReview: true })
-  expect(f.service.view('b', 'owner').memory.review.map((m: RuntimeMemory) => m.id)).toEqual(['quiet'])
-  expect(f.store.memoryLog('b').map(l => `${l.memoryId}:${l.action}`).sort()).toEqual(['hot:promote', 'quiet:review', 'stale:expire'])
-})
-
-test('原话被撤回：规矩作废、本地原文清空、流水留痕', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ce-memory-revoke-'))
-  const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
-  cleanups.push(async () => { store.close(); rmSync(dir, { recursive: true, force: true }) })
-  const message = store.receive({ botId: 'b', groupId: 'dm', seq: 1, senderId: 'owner', memberId: 'om', text: '以后都简短点', attachments: [{ id: 'upload-x', kind: 'upload', botId: 'b', name: 'a.txt', mime: 'text/plain', size: 1, hash: 'h' }], createdAt: Date.now() })
-  const rule = memory({ id: 'rule', prompt: '回复保持简短', source: { inboxId: message.id, quote: '以后都简短点', context: '以后都简短点', sentAt: message.createdAt } })
-  const untouched = memory({ id: 'other', prompt: '早问好', source: { inboxId: 'msg-other', quote: '早问好', context: '', sentAt: message.createdAt } })
-  store.saveMemory(rule); store.saveMemory(untouched)
-  expect(store.inboxBySeq('b', 'dm', 1)?.id).toBe(message.id)
-  store.applyMemoryOps([{ ...rule, status: 'revoked', revokedReason: '原话被撤回', updatedAt: 5 }], [{ id: 'log-1', botId: 'b', memoryId: 'rule', action: 'revoke', actor: 'host', at: 5, note: '原话被撤回' }])
-  store.revokeInbox(message.id, 7)
-  expect(store.inbox(message.id)).toMatchObject({ text: '', revokedAt: 7 })
-  expect(store.inbox(message.id)?.attachments).toBeUndefined()
-  expect(store.memoriesBySource('b', message.id).map(m => m.status)).toEqual(['revoked'])
-  expect(store.memory('other')?.status).toBe('active')
-})
-
-test('变更流水只增不改；主人能压下和作废，别人不能', async () => {
-  const f = fixture()
-  const rule = memory({ id: 'rule', prompt: '回复保持简短' })
-  f.store.saveMemory(rule)
-  const log = { id: 'log-1', botId: 'b', memoryId: 'rule', action: 'review' as const, actor: 'owner' as const, at: 1 }
-  f.store.appendMemoryLog(log)
-  expect(() => f.store.appendMemoryLog(log)).toThrow()
-  expect(() => f.store.appendMemoryLog({ ...log, action: 'revoke', at: 2 })).toThrow()
-  await expect(f.service.memoryControl('b', 'other', { requestId: 'r1', action: 'suppress', id: 'rule' })).rejects.toThrow(/owner|创建者/)
-  await f.service.memoryControl('b', 'owner', { requestId: 'r1', action: 'suppress', id: 'rule', note: '先不用这条' })
-  expect(f.store.memory('rule')).toMatchObject({ status: 'suppressed', suppressedBy: 'owner' })
-  f.send('报告写简短一点'); await until(() => f.turns.length === 1)
-  expect(f.turns[0].context.memories.long).toEqual([])
-  await f.turns[0].decide({ replies: ['好。'] }); f.turns[0].finish()
-  await until(() => f.sent.length === 1)
-  await f.service.memoryControl('b', 'owner', { requestId: 'r2', action: 'unsuppress', id: 'rule' })
-  expect(f.store.memory('rule')?.status).toBe('active')
-  await f.service.memoryControl('b', 'owner', { requestId: 'r3', action: 'revoke', id: 'rule', note: '这条不对' })
-  expect(f.store.memory('rule')).toMatchObject({ status: 'revoked', revokedReason: '这条不对' })
-  await f.service.memoryControl('b', 'owner', { requestId: 'r3', action: 'revoke', id: 'rule', note: '重复点击' })
-  expect(f.store.memory('rule')?.revokedReason).toBe('这条不对')
-  expect(f.service.view('b', 'owner').memory.log.map(l => l.action)).toEqual(['review', 'suppress', 'unsuppress', 'revoke'])
+  expect(f.store.memories('b').map(m => m.prompt)).toEqual(['简短回复', '详细回复'])
 })

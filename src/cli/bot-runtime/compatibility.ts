@@ -3,8 +3,9 @@ import { resolve } from 'node:path'
 import { z } from 'zod/v4'
 
 /** Change this when the adapter contract changes. Only successful static probes are cached. */
-const ADAPTER_REVISION = 'ce-agent-compat-1'
-const compatible = new Set<string>()
+const ADAPTER_REVISION = 'ce-agent-compat-2'
+type ProtocolCapabilities = { excludeTurns?: boolean }
+const compatible = new Map<string, ProtocolCapabilities>()
 class RuntimeDiagnosticError extends Error {}
 export class RuntimeCompatibilityError extends RuntimeDiagnosticError {}
 
@@ -22,9 +23,10 @@ export function compatibilityKey(platform: string, executable: string, version: 
   return JSON.stringify([ADAPTER_REVISION, platform, path, file.size, file.mtimeMs, file.ctimeMs, version, mode])
 }
 export function wasCompatible(key: string): boolean { return compatible.has(key) }
-export function rememberCompatible(key: string): void {
-  if (compatible.size >= 64) compatible.delete(compatible.values().next().value!)
-  compatible.add(key)
+export function compatibleCapabilities(key: string): ProtocolCapabilities | undefined { return compatible.get(key) }
+export function rememberCompatible(key: string, capabilities: ProtocolCapabilities = {}): void {
+  if (compatible.size >= 64) compatible.delete(compatible.keys().next().value!)
+  compatible.set(key, capabilities)
 }
 
 export function requireCliOptions(help: string, options: string[], label: string): void {
@@ -49,7 +51,7 @@ function accepts(schema: Schema, value: unknown, root: Schema, depth = 0): boole
 }
 
 /** Inspect the installed binary's own protocol, not a version allowlist. */
-export function checkCodexProtocol(read: (name: string) => Schema, fullAccess: boolean, version: string): void {
+export function checkCodexProtocol(read: (name: string) => Schema, fullAccess: boolean, version: string): ProtocolCapabilities {
   const fail = (detail: string): never => { throw new RuntimeCompatibilityError(`Codex ${version} 协议能力不满足：${detail}；请更新 CE 适配器或使用支持该能力的 CLI`) }
   const get = (name: string): Schema => {
     try { const schema = read(name); if (schema && typeof schema === 'object') return schema } catch { /* Only report a schema name, never raw CLI output. */ }
@@ -76,6 +78,10 @@ export function checkCodexProtocol(read: (name: string) => Schema, fullAccess: b
     'v2/TurnStartResponse.json': ['turn'],
     'v2/TurnSteerResponse.json': ['turnId'],
   }
+  // Optional optimization: old CLIs may still resume without this field.
+  const resumeSchema = get('v2/ThreadResumeParams.json')
+  const excludeTurns = accepts(resumeSchema.properties?.excludeTurns, true, resumeSchema)
+  if (excludeTurns) fields['v2/ThreadResumeParams.json'].push('excludeTurns')
   if (!fullAccess) {
     fields['v2/ThreadStartParams.json'].push('baseInstructions', 'environments', 'runtimeWorkspaceRoots', 'selectedCapabilityRoots')
     fields['v2/ThreadResumeParams.json'].push('baseInstructions', 'runtimeWorkspaceRoots')
@@ -105,7 +111,7 @@ export function checkCodexProtocol(read: (name: string) => Schema, fullAccess: b
   const input = [{ type: 'text', text: 'check', text_elements: [] }]
   const samples: Record<string, unknown> = {
     'v2/ThreadStartParams.json': { ...thread, ephemeral: true, dynamicTools: [{ type: 'function', name: 'ce_runtime_check', description: 'check', inputSchema: { type: 'object', properties: { nonce: { type: 'string' } }, required: ['nonce'], additionalProperties: false } }] },
-    'v2/ThreadResumeParams.json': { ...thread, threadId: 'thread-check' },
+    'v2/ThreadResumeParams.json': { ...thread, threadId: 'thread-check', ...(excludeTurns ? { excludeTurns: true } : {}) },
     'v2/TurnStartParams.json': { threadId: 'thread-check', input, clientUserMessageId: 'input-check', effort: 'low', ...(!fullAccess ? { environments: [], runtimeWorkspaceRoots: [] } : {}) },
     'v2/TurnSteerParams.json': { threadId: 'thread-check', expectedTurnId: 'turn-check', input, clientUserMessageId: 'input-check' },
     'v2/TurnInterruptParams.json': { threadId: 'thread-check', turnId: 'turn-check' },
@@ -118,6 +124,7 @@ export function checkCodexProtocol(read: (name: string) => Schema, fullAccess: b
     catch { fail(`${file}: 无法核验请求结构`) }
     if (!result!.success) fail(`${file}: ${result!.error.issues.map(issue => issue.path.join('.') || '请求结构').slice(0, 3).join('、')}`)
   }
+  return { excludeTurns }
 }
 
 /** Classify common failures without copying account data or raw SDK diagnostics into chat. */

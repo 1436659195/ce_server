@@ -120,7 +120,7 @@ test('升级迁移只执行一次，重启不把新Worker内部消息变成旧�
   store.markReplyAttempted(source.id);store.close()
   const reopened=new BotRuntimeStore(path);stores.push(reopened)
   expect(reopened.replies('bot-a')[0]).not.toHaveProperty('legacyDeliveryRecovery')
-  const db=new Database(path);expect(db.query('PRAGMA user_version').get()).toEqual({user_version:5});db.close()
+  const db=new Database(path);expect(db.query('PRAGMA user_version').get()).toEqual({user_version:6});db.close()
 })
 
 test('旧设置里的手写经验一次性迁进经验表：保留历史，展示不算采用',()=>{
@@ -135,5 +135,5 @@ test('旧设置里的手写经验一次性迁进经验表：保留历史，展�
   reopened.close()
   const again=new BotRuntimeStore(path);stores.push(again)
   expect(again.experiences('bot-a')).toHaveLength(1)
-  const check=new Database(path);expect(check.query('PRAGMA user_version').get()).toEqual({user_version:5});check.close()
+  const check=new Database(path);expect(check.query('PRAGMA user_version').get()).toEqual({user_version:6});check.close()
 })

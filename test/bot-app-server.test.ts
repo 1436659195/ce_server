@@ -47,6 +47,31 @@ afterEach(async () => {
 })
 
 describe('Codex app-server transport', () => {
+  test('带大图片历史的原 Session 只恢复元数据，能力缓存后仍可继续同一线程', async () => {
+    const first = compatibleClient({ largeHistory: true })
+    for (const c of [first.instance, compatibleClient({ largeHistory: true }, first).instance]) {
+      expect(await c.resumeThread('thread-test', { instructions: '继续当前任务' })).toBe('thread-test')
+      const config = await c.call<any>('test/config', {})
+      expect(config.thread.excludeTurns).toBe(true)
+      expect(config.thread.history).toBeUndefined()
+      const turn = await c.startTurn('thread-test', 'fast')
+      expect((await turn.done).status).toBe('completed')
+      await c.close()
+    }
+    expect(readFileSync(first.log, 'utf8').match(/"event":"schema"/g)).toHaveLength(1)
+  })
+  test.each([{ removeField: ['v2/ThreadResumeParams.json', 'excludeTurns'] }, { badExcludeTurns: true }])('旧协议没有可用的 excludeTurns 时仍可恢复 %j', async settings => {
+    const first = compatibleClient(settings)
+    for (const c of [first.instance, compatibleClient(settings, first).instance]) {
+      expect(await c.resumeThread('thread-test', { instructions: 'host' })).toBe('thread-test')
+      expect((await c.call<any>('test/config', {})).thread.excludeTurns).toBeUndefined()
+      await c.close()
+    }
+  })
+  test('减少历史回传不放宽其他协议消息的大小限制', async () => {
+    const c = client(); await c.initialize()
+    await expect(c.call('test/oversized', {})).rejects.toThrow('消息超过上限')
+  })
   test('兼容新版 Codex 可完成派工、活动输入、原会话恢复与停止，不按版本号拒绝', async () => {
     const { instance: c } = compatibleClient()
     const tid = await c.startThread({ instructions: 'host', tools: [], ephemeral: true })

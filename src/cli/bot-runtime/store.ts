@@ -5,6 +5,7 @@ import { dirname } from 'node:path'
 import type { RuntimeExperience, MemoryJob, RuntimeArtifact, RuntimeCase, RuntimeInbox, RuntimeMandate, RuntimeMemory, RuntimeMemoryLog, RuntimeOperation, RuntimeReply, RuntimeRun, RuntimeSettings, RuntimeTask, RuntimeTaskInput, RuntimeUpload, RuntimeRemoteOp, ExperienceRef } from './types'
 import { EXPERIENCE_ESTABLISHED_USES } from './experience'
 import { ExperienceLibrary } from './experience-library'
+import { MemoryLibrary } from './memory-library'
 import { relevance } from './cases'
 import { validateRouterReply } from './reply-policy'
 import { queryChatHistory, readChatMessage } from './history'
@@ -32,6 +33,7 @@ function validateWorkerText(value: unknown): string {
 /** 小型本地账本；JSON 是记录正文，SQL 表达式索引负责唯一性。所有业务写入经本类事务。 */
 export class BotRuntimeStore {
   readonly automations: AutomationStore
+  readonly memoryLibrary: MemoryLibrary
   readonly experienceLibrary: ExperienceLibrary
   private db: Database
   private closed = false
@@ -80,6 +82,7 @@ export class BotRuntimeStore {
       return automations
     })
     this.experienceLibrary = new ExperienceLibrary(this.db)
+    this.memoryLibrary = new MemoryLibrary(this.db)
   }
   close(): void { if (!this.closed) { this.closed = true; this.db.close() } }
   private get<T>(table: Table, key: string): T | undefined {
@@ -435,6 +438,7 @@ export class BotRuntimeStore {
       const format = validateRouterReply(texts, { worker: indexes.length > 0, files: indexes.length > 0 && !!source.artifactIds?.length })
       const validated = texts.map(t => t.trim())
       if (!indexes.length && source.purpose === 'question' && !source.followupReminder) throw new Error('必要问题不能被前台静默丢弃')
+      if (!indexes.length && source.purpose === 'unable') throw new Error('执行失败不能被前台静默丢弃')
       if (!indexes.length && source.artifactIds?.length) throw new Error('文件交付必须保留附件，不能静默丢弃')
       if (!indexes.length && !basis.trim()) throw new Error('省略Worker结果需要说明依据')
       const { id: _id, createdAt: _created, state: _state, text: _text, routingAttempts: _attempts, nextRoutingAt: _next, routingError: _error, lesson: _lesson, experienceUsage: _usage, ...metadata } = source
@@ -490,12 +494,8 @@ export class BotRuntimeStore {
   recentExperiences(botId: string): RuntimeExperience[] { return this.queryRows('experiences', botId, { limit: 50 }) }
   memories(botId: string): RuntimeMemory[] { return this.all('memories', botId) }
   memory(memoryId: string): RuntimeMemory | undefined { return this.get('memories', memoryId) }
-  saveMemory(memory: RuntimeMemory): void { this.put('memories', memory) }
+  saveMemory(memory: RuntimeMemory): void { this.transaction(() => { this.put('memories', memory); this.memoryLibrary.indexRecord(memory) }) }
   memoriesBySource(botId: string, inboxId: string): RuntimeMemory[] { return this.memories(botId).filter(m => m.source.inboxId === inboxId) }
-  /** 被相关度命中的记忆记一次触发；这是升降和「30 天没用到」的依据。 */
-  triggerMemories(ids: string[], now: number): void {
-    for (const id of new Set(ids)) { const memory = this.memory(id); if (memory && memory.status === 'active') this.saveMemory({ ...memory, triggers: { count: memory.triggers.count + 1, lastTriggeredAt: now }, updatedAt: now }) }
-  }
   /** 流水只增不改：同一编号写第二次直接报错。 */
   saveRemoteOp(op: RuntimeRemoteOp): void { this.put('remote_ops', op) }
   remoteOps(botId: string, limit = 40): RuntimeRemoteOp[] {

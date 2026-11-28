@@ -22,7 +22,7 @@ export interface RuntimeSettings {
   profile: string
   model: string
   error?: string
-  /** 有主人消息的前台轮次累计数；中期记忆按它数「管 10 轮」。 */
+  /** 有主人消息的前台轮次累计数；不决定记忆有效期。 */
   rounds?: number
 }
 /** Reusable content is separate from the delivery report and belongs to one Bot. */
@@ -55,10 +55,15 @@ export interface RuntimeExperience {
 /** 主人的偏好或规矩。按渠道（groupId）和对话角色（senderId）分开存。 */
 export type MemoryTier = 'mid' | 'long'
 export type MemoryStatus = 'active' | 'superseded' | 'suppressed' | 'revoked' | 'expired'
+export interface MemoryScope { project?: string; caseId?: string; taskId?: string }
 export interface RuntimeMemory {
   id: string; botId: string
   channel: string; senderId: string
   tier: MemoryTier; status: MemoryStatus
+  format?: 2; version?: number; topic?: string; kind?: 'preference' | 'fact' | 'agreement'
+  core?: boolean; scope?: MemoryScope; startsAt?: number
+  end?: { kind: 'task' | 'case'; id: string }
+  overrides?: string[]; recalls?: number; uses?: number; lastUsedAt?: number
   /** 规矩本身，一句话。 */
   prompt: string
   /** 什么时候适用；不写表示对每轮都适用。 */
@@ -67,7 +72,7 @@ export interface RuntimeMemory {
   source: { inboxId: string; quote: string; context: string; sentAt: number }
   extraSources?: Array<{ inboxId: string; quote: string }>
   triggers: { count: number; lastTriggeredAt?: number }
-  /** 中期：从第几轮算起、何时到期（10 轮或 7 天，先到为准）。 */
+  /** 仅按 expiresAt / end 到期；bornRound、promotedAt 是旧版历史字段。 */
   bornRound?: number; expiresAt?: number
   promotedAt?: number
   supersedes?: string; supersededBy?: string; suppressedBy?: string; revokedReason?: string
@@ -75,21 +80,16 @@ export interface RuntimeMemory {
   needsReview?: boolean
   createdAt: number; updatedAt: number
 }
-export type MemoryLogAction = 'create' | 'duplicate' | 'supersede' | 'promote' | 'expire' | 'suppress' | 'unsuppress' | 'revoke' | 'review'
+export type MemoryLogAction = 'create' | 'duplicate' | 'supersede' | 'promote' | 'expire' | 'suppress' | 'unsuppress' | 'revoke' | 'review' | 'update' | 'override' | 'purge'
 /** 记忆的变更流水，只增不改。 */
 export interface RuntimeMemoryLog {
   id: string; botId: string; memoryId: string; action: MemoryLogAction
-  actor: 'memory' | 'owner' | 'host'
+  actor: 'memory' | 'router' | 'owner' | 'host'
   before?: Partial<RuntimeMemory>; after?: Partial<RuntimeMemory>; note?: string; at: number
 }
 export interface MemoryJob { state: 'queued' | 'running' | 'done' | 'failed'; scheduledAt: number; finishedAt?: number; error?: string }
-export interface MemoryProposal {
-  intent: 'none' | 'preference'; tier?: MemoryTier; prompt?: string; appliesTo?: string
-  sourceInboxId?: string; quote?: string
-  conflicts?: Array<{ memoryId: string; relation: 'duplicate' | 'supersedes' | 'related' }>
-}
 /** 主人对一条记忆或经验的管理动作；只有 owner 能用。 */
-export interface RuntimeMemoryControl { requestId: string; action: 'suppress' | 'unsuppress' | 'revoke'; id: string; note?: string; target?: 'memory' | 'experience' }
+export interface RuntimeMemoryControl { requestId: string; action: 'suppress' | 'unsuppress' | 'revoke' | 'purge'; id: string; note?: string; target?: 'memory' | 'experience' }
 /** 身份、目录与权限均由 ChatHub 生成，不接受模型或手机声称的 owner。 */
 export interface RuntimeBot {
   botId: string

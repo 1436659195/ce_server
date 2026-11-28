@@ -21,6 +21,20 @@ function fixture() {
   return { store, receive, start }
 }
 
+test.each([undefined, 'files'] as const)('Router 披露任务交付方式 %s，保留具体格式且不猜测旧任务', delivery => {
+  const { store, receive } = fixture()
+  const task = store.acceptWork({ inputId: receive('整理为 TXT').id,
+    newCase: { title: '排障指南', object: '示例服务', goal: '整理排障步骤' }, goal: '整理为 TXT',
+    mandate, delivery, acceptance: ['交付 TXT 文件'], replies: [] })
+  const context = JSON.parse(routerContext({
+    bot, profile: '', messages: [], cases: store.cases('b'), tasks: store.tasks('b'),
+    relatedTaskIds: [task.id], experienceSummaries: [],
+  }))
+  const disclosed = context.tasks.find((t: { id: string }) => t.id === task.id)
+  expect(disclosed.delivery).toBe(delivery)
+  expect(disclosed.acceptance).toEqual(['交付 TXT 文件'])
+})
+
 test('总结、对比、修改另存沿用卷宗，累计范围与旧名持久保存且不改变 Session', () => {
   const { store, receive, start } = fixture()
   const first = start()

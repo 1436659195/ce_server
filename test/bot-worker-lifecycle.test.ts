@@ -34,6 +34,7 @@ interface FixtureOptions {
   tickMs?: number
   followupQuietMs?: number
   resumeFailure?: string
+  startFailure?: string
   directoryApproval?: boolean
 }
 function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: FixtureOptions | number = {}) {
@@ -75,7 +76,7 @@ function fixture(decisions: Array<Record<string, unknown>>, optionsOrDelay: Fixt
       let clientDone: ((v: CodexTurn) => void) | undefined
       const threadId = `thread-${role}`
       return {
-        initialize: async () => {}, startThread: async options => { if (role === 'worker') workerThreads.push({ method: 'start', ...options }); return threadId }, resumeThread: async (_id, threadOptions) => { if (role === 'worker') { workerThreads.push({ method: 'resume', ...threadOptions }); if (options.resumeFailure) throw new Error(options.resumeFailure) } return threadId },
+        initialize: async () => {}, startThread: async threadOptions => { if (role === 'worker') { workerThreads.push({ method: 'start', ...threadOptions }); if (options.startFailure) throw new Error(options.startFailure) } return threadId }, resumeThread: async (_id, threadOptions) => { if (role === 'worker') { workerThreads.push({ method: 'resume', ...threadOptions }); if (options.resumeFailure) throw new Error(options.resumeFailure) } return threadId },
         startTurn: async (_threadId, text) => {
           if (role === 'router') {
             const context = JSON.parse(text)
@@ -135,6 +136,20 @@ test('CLI 升级后原 Session 恢复失败，保留卷宗且不自动新开重�
   expect(f.store.cases(f.bot.botId)).toHaveLength(1)
   expect(f.store.case(first.caseId)!.threadId).toBe(originalThread)
   expect(f.store.tasks(f.bot.botId)[1].sessionOrigin).toBeUndefined()
+  await waitFor(() => f.sent.some(text => text.includes('任务未完成')))
+  const failures = f.store.replies(f.bot.botId).filter(r => r.author === 'router' && r.purpose === 'unable')
+  expect(failures).toHaveLength(1)
+  expect(failures[0]).toMatchObject({ taskId: f.store.tasks(f.bot.botId)[1].id, runId: f.store.tasks(f.bot.botId)[1].latestRunId, state: 'sent' })
+})
+
+test('Worker 启动失败经前台通知，不把原始诊断中的凭据发进聊天', async () => {
+  const f = fixture([start], { startFailure: 'network failed api_key=private-test-key' })
+  f.send(1, '写报告')
+  await waitFor(() => f.sent.some(text => text.includes('任务未完成')))
+  expect(f.store.tasks()[0].state).toBe('failed')
+  expect(f.started()).toBe(0)
+  expect(f.sent.join('\n')).not.toContain('private-test-key')
+  expect(f.store.replies(f.bot.botId).filter(r => r.author === 'router' && r.purpose === 'unable')).toHaveLength(1)
 })
 
 for (const fullAccess of [false, true]) test(`工具参数升级后在原卷宗新开会话并完成文件交付，契约未变时继续复用（${fullAccess ? '全权限' : '受控'}）`, async () => {

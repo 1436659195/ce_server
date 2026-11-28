@@ -1,0 +1,833 @@
+[
+  {
+    "id": "conversation-hash",
+    "category": "conversation",
+    "split": "tune",
+    "current": [
+      "进程哈希一致不就是一致的吗？"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "比较两台测试机正在运行的程序"
+      },
+      {
+        "role": "router",
+        "text": "两边运行程序的 SHA-256 相同，但二进制里的特征串搜不到，不能从特征串直接证明版本。"
+      }
+    ],
+    "facts": [
+      "已比较两边正在运行的程序，SHA-256 相同。"
+    ],
+    "rubric": "直接解释相同哈希的含义，消除前一回复的绕弯，不启动新调查。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    }
+  },
+  {
+    "id": "conversation-simple",
+    "category": "conversation",
+    "split": "tune",
+    "current": [
+      "啥意思？"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "示例引擎和控制台什么关系？"
+      },
+      {
+        "role": "router",
+        "text": "示例引擎承担语义理解和知识检索，控制台是调用这些能力的管理界面。"
+      }
+    ],
+    "facts": [
+      "引擎提供能力，控制台是操作界面。"
+    ],
+    "rubric": "用日常话解释刚才的关系，不再预告要核对。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    }
+  },
+  {
+    "id": "conversation-correction",
+    "category": "conversation",
+    "split": "holdout",
+    "current": [
+      "不是，我说错了"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "如果有两个执行会话，第一个如果"
+      },
+      {
+        "role": "router",
+        "text": "你接着说，第一个怎么了？"
+      }
+    ],
+    "facts": [
+      "用户撤回了未完成的表述，还没有给出新问题。"
+    ],
+    "rubric": "自然接住纠正，只留一个继续说的入口，不连续追问或派工。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "optional"
+    }
+  },
+  {
+    "id": "conversation-chat",
+    "category": "conversation",
+    "split": "holdout",
+    "current": [
+      "这名字听起来像个老同事，哈哈"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "以后叫你小林吧"
+      },
+      {
+        "role": "router",
+        "text": "行，就叫小林。"
+      }
+    ],
+    "facts": [
+      "这是关于 Bot 名字的闲聊，没有工作请求。"
+    ],
+    "rubric": "轻松接话，保持同一个 Bot 身份，不转为工作计划或硬塞表情。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    }
+  },
+  {
+    "id": "ack-new-work",
+    "category": "acknowledgement",
+    "split": "tune",
+    "current": [
+      "帮我只读检查示例工程启动失败的原因，口头说结论。"
+    ],
+    "history": [],
+    "facts": [
+      "这是新调查任务，授权只读，尚无调查结果。"
+    ],
+    "rubric": "简短承接并启动只读调查，不能假装已经定位。",
+    "expected": {
+      "actions": [
+        "start"
+      ],
+      "reply": "optional",
+      "delivery": "chat",
+      "case": "new",
+      "allowedOps": [
+        "read"
+      ]
+    }
+  },
+  {
+    "id": "ack-addition",
+    "category": "acknowledgement",
+    "split": "tune",
+    "current": [
+      "把日志发生的时间也加进去"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "查启动失败，整理排障步骤"
+      },
+      {
+        "role": "router",
+        "text": "我查一下启动失败的原因。"
+      }
+    ],
+    "facts": [
+      "排障任务正在执行，用户只补充记录日志时间。"
+    ],
+    "rubric": "真正追加到原任务，可以不再发受理气泡。",
+    "expected": {
+      "actions": [
+        "append"
+      ],
+      "reply": "optional",
+      "case": "existing"
+    },
+    "task": {
+      "state": "running",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "chat",
+      "acceptance": []
+    }
+  },
+  {
+    "id": "ack-stop",
+    "category": "acknowledgement",
+    "split": "tune",
+    "current": [
+      "停一下"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "调查启动失败"
+      },
+      {
+        "role": "router",
+        "text": "我在查了。"
+      }
+    ],
+    "facts": [
+      "原调查正在运行，用户要求停止。"
+    ],
+    "rubric": "提交停止原任务的动作，说明要简短，不另建任务。",
+    "expected": {
+      "actions": [
+        "stop"
+      ],
+      "reply": "optional",
+      "case": "existing"
+    },
+    "task": {
+      "state": "running",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "chat",
+      "acceptance": []
+    }
+  },
+  {
+    "id": "ack-batch",
+    "category": "acknowledgement",
+    "split": "holdout",
+    "current": [
+      "把第二步写清楚",
+      "还有，别删掉回滚步骤"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "把排障指南写成 TXT"
+      },
+      {
+        "role": "router",
+        "text": "我在整理。"
+      }
+    ],
+    "facts": [
+      "同一份 TXT 正在生成；两条补充都属于该任务。"
+    ],
+    "rubric": "一并追加两项补充，不只处理最后一条，不逐条重复受理。",
+    "expected": {
+      "actions": [
+        "append"
+      ],
+      "reply": "optional",
+      "delivery": "files",
+      "case": "existing"
+    },
+    "task": {
+      "state": "running",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "files",
+      "acceptance": [
+        "交付 TXT 文件",
+        "保留回滚步骤"
+      ]
+    }
+  },
+  {
+    "id": "continuity-revision",
+    "category": "continuity",
+    "split": "tune",
+    "current": [
+      "再加上判断服务已恢复的分支"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "写成 TXT，步骤简洁些，列清不同情况的分支"
+      },
+      {
+        "role": "router",
+        "text": "排障指南已放在 TXT 附件里。"
+      }
+    ],
+    "facts": [
+      "原 TXT 已交付；现在修订同一成果，仍要求 TXT 和步骤分支。"
+    ],
+    "rubric": "原卷宗创建后续任务，延续 TXT 与分支要求，不再次询问格式。",
+    "expected": {
+      "actions": [
+        "start"
+      ],
+      "reply": "optional",
+      "delivery": "files",
+      "case": "existing",
+      "guidanceContains": [
+        "TXT"
+      ]
+    },
+    "task": {
+      "state": "completed",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "files",
+      "acceptance": [
+        "交付 TXT 文件",
+        "步骤简洁，分支清楚"
+      ]
+    }
+  },
+  {
+    "id": "continuity-active",
+    "category": "continuity",
+    "split": "tune",
+    "current": [
+      "这份指南再加一条磁盘检查"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "排障指南给 TXT，保留命令和判断分支"
+      },
+      {
+        "role": "router",
+        "text": "我在整理这份指南。"
+      }
+    ],
+    "facts": [
+      "同一份 TXT 尚在执行，只新增磁盘检查。"
+    ],
+    "rubric": "追加原任务，继承文件要求，执行说明保留 TXT 格式约束。",
+    "expected": {
+      "actions": [
+        "append"
+      ],
+      "reply": "optional",
+      "delivery": "files",
+      "case": "existing"
+    },
+    "task": {
+      "state": "running",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "files",
+      "acceptance": [
+        "交付 TXT 文件",
+        "保留命令和判断分支"
+      ]
+    }
+  },
+  {
+    "id": "continuity-exception",
+    "category": "continuity",
+    "split": "tune",
+    "current": [
+      "这次不用文件，直接再讲一遍结论就行"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "排障结论给个 TXT"
+      },
+      {
+        "role": "router",
+        "text": "TXT 已发：启动失败是因为配置文件缺少端口字段，补齐后恢复。"
+      }
+    ],
+    "facts": [
+      "已确认原因是配置缺少端口字段；本轮只要重复口头结论。"
+    ],
+    "rubric": "直接口头复述既有结论，不强迫再发文件，不把例外改成永久偏好。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "task": {
+      "state": "completed",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "files",
+      "acceptance": [
+        "交付 TXT 文件"
+      ]
+    }
+  },
+  {
+    "id": "continuity-unrelated",
+    "category": "continuity",
+    "split": "holdout",
+    "current": [
+      "另一个独立问题：只读调查示例二号服务为何断线，口头告诉我。"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "一号服务的排障指南写 TXT"
+      },
+      {
+        "role": "router",
+        "text": "一号服务的 TXT 已经发了。"
+      }
+    ],
+    "facts": [
+      "旧任务是服务一号的 TXT；新问题明确是独立的二号服务调查。"
+    ],
+    "rubric": "新建独立只读调查，交付口头结论，不套用旧 TXT 要求。",
+    "expected": {
+      "actions": [
+        "start"
+      ],
+      "reply": "optional",
+      "delivery": "chat",
+      "case": "new",
+      "allowedOps": [
+        "read"
+      ]
+    },
+    "task": {
+      "state": "completed",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "files",
+      "acceptance": [
+        "交付 TXT 文件"
+      ]
+    }
+  },
+  {
+    "id": "focus-relation",
+    "category": "result_focus",
+    "split": "tune",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "引擎和控制台啥关系？"
+      }
+    ],
+    "facts": [
+      "示例引擎负责理解问题和检索知识，控制台是使用引擎的管理界面。"
+    ],
+    "rubric": "围绕关系作答，省略无关来源、章节和未知沿革。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "task": {
+      "state": "completed",
+      "goal": "解释引擎和控制台的关系",
+      "delivery": "chat",
+      "acceptance": []
+    },
+    "worker": {
+      "text": "示例引擎负责理解问题、识别意图、检索知识；示例控制台是使用它的管理界面。别名和版本沿革未确认。来源：虚构手册§3.4。",
+      "purpose": "result",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "focus-success",
+    "category": "result_focus",
+    "split": "tune",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "比较两边正在运行的程序，一致就用我定的那句话回复。"
+      }
+    ],
+    "facts": [
+      "两边正在运行程序的哈希已核对一致。"
+    ],
+    "rubric": "遵循已保存的成功措辞，不把内部验证步骤全复述。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "preferences": [
+      "核实两边运行程序一致后，回复“两边版本已经同步一致”。"
+    ],
+    "task": {
+      "state": "completed",
+      "goal": "比较两边正在运行的程序是否一致",
+      "delivery": "chat",
+      "acceptance": []
+    },
+    "worker": {
+      "text": "两边运行程序路径已核实，SHA-256 一致；进程读取路径与本次替换目标一致。二进制特征串未检索到；另四个平台没有启动测试，与这次比较无关。",
+      "purpose": "result",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "focus-cause",
+    "category": "result_focus",
+    "split": "tune",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "为什么刚才启动不了？"
+      }
+    ],
+    "facts": [
+      "启动失败因配置缺少端口字段，补齐后在测试机启动成功。"
+    ],
+    "rubric": "先说原因及对应结果，无关资料缺口不作为例行免责声明。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "task": {
+      "state": "completed",
+      "goal": "解释本次启动失败原因",
+      "delivery": "chat",
+      "acceptance": []
+    },
+    "worker": {
+      "text": "检查结果：配置缺少端口字段导致启动失败；补齐后在测试机启动成功。历史配置责任人未知；尚未整理过去一年全部故障来源。",
+      "purpose": "result",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "focus-reason",
+    "category": "result_focus",
+    "split": "holdout",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "为什么用这个处理办法？"
+      }
+    ],
+    "facts": [
+      "错误明确指向缺失的端口配置；补配置可恢复启动，无需重装。"
+    ],
+    "rubric": "回答选择办法的原因，不能仅说已完成，也不复述整份报告。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "task": {
+      "state": "completed",
+      "goal": "解释为什么补配置而不是重装",
+      "delivery": "chat",
+      "acceptance": []
+    },
+    "worker": {
+      "text": "日志明确报端口字段缺失；补齐后进程启动正常，足以解释这次故障。重装不针对缺失字段且会增加变更。原始日志文件在测试工作目录，版本沿革没有调查。",
+      "purpose": "answer",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "limits-failure",
+    "category": "material_limits",
+    "split": "tune",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "把同步问题处理好"
+      }
+    ],
+    "facts": [
+      "处理失败：测试账号无权重启目标服务，运行程序尚未替换。"
+    ],
+    "rubric": "清楚说明没完成及阻塞点，不套用成功短句或只说正在处理。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "task": {
+      "state": "failed",
+      "goal": "处理同步问题",
+      "delivery": "chat",
+      "acceptance": []
+    },
+    "worker": {
+      "text": "未完成：测试账号无权重启目标服务，运行程序尚未替换。",
+      "purpose": "unable",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "limits-missing-file",
+    "category": "material_limits",
+    "split": "tune",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "把排查步骤写成 TXT 发来"
+      }
+    ],
+    "facts": [
+      "Worker 只给了文本，没有导出任何附件；TXT 尚未交付。"
+    ],
+    "rubric": "对原结果返工生成真实附件，不能只发“文件在这里”。",
+    "expected": {
+      "actions": [
+        "revise"
+      ],
+      "reply": "optional",
+      "case": "existing"
+    },
+    "task": {
+      "state": "completed",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "files",
+      "acceptance": [
+        "交付 TXT 文件"
+      ]
+    },
+    "worker": {
+      "text": "排查步骤已写成以下文本：先查配置，再看日志，再检查磁盘。尚未导出文件。",
+      "purpose": "result",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "limits-unverified",
+    "category": "material_limits",
+    "split": "holdout",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "现在两台机器正在跑的程序一致了吗？"
+      }
+    ],
+    "facts": [
+      "只确认两边源码提交一致并构建成功，没有核实正在运行的程序。"
+    ],
+    "rubric": "明确还不能确认运行程序一致，可以要求原任务继续核实，不能虚报已同步。",
+    "expected": {
+      "actions": [
+        "reply",
+        "revise"
+      ],
+      "reply": "optional"
+    },
+    "task": {
+      "state": "completed",
+      "goal": "核实两台机器正在运行的程序是否一致",
+      "delivery": "chat",
+      "acceptance": []
+    },
+    "worker": {
+      "text": "源码提交一致，构建均成功。但运行程序路径和哈希没有采集，不能确认两边实际运行的程序一致。",
+      "purpose": "result",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "limits-attachment",
+    "category": "material_limits",
+    "split": "holdout",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "把更新后的步骤整理成 TXT 发过来"
+      }
+    ],
+    "facts": [
+      "TXT 已导出并具备真实附件元信息，内容覆盖配置、日志、磁盘和恢复分支。"
+    ],
+    "rubric": "简短提示并通过真实附件交付，不能空回复吞掉文件。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "task": {
+      "state": "completed",
+      "goal": "整理示例服务的排障步骤",
+      "delivery": "files",
+      "acceptance": [
+        "交付 TXT 文件"
+      ]
+    },
+    "worker": {
+      "text": "更新后的排障步骤已导出为 TXT，覆盖配置检查、日志检查、磁盘检查及恢复分支。",
+      "purpose": "result",
+      "checks": [
+        "已核对样本中列明的事实"
+      ],
+      "artifact": {
+        "name": "example-troubleshooting.txt",
+        "mime": "text/plain",
+        "text": "检查配置；读取日志；检查磁盘；核实恢复分支。"
+      }
+    }
+  },
+  {
+    "id": "preference-exception",
+    "category": "preference",
+    "split": "tune",
+    "current": [
+      "这次详细解释一下刚才的原因"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "这次启动失败是哪里的问题？"
+      },
+      {
+        "role": "router",
+        "text": "配置里漏了端口字段，程序因此没起来。"
+      }
+    ],
+    "facts": [
+      "原因已明确：必填端口字段缺失，启动校验失败；补齐后恢复。"
+    ],
+    "rubric": "本轮解释原因，不能用长期简短习惯拒绝解释，也不把本次详细要求写成永久偏好。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "preferences": [
+      "日常回复简短，直接说结论。"
+    ]
+  },
+  {
+    "id": "preference-serious",
+    "category": "preference",
+    "split": "tune",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "服务又挂了，急，告诉我现在怎么样！"
+      }
+    ],
+    "facts": [
+      "服务仍未恢复，启动校验失败，尚未查明是哪个配置字段。"
+    ],
+    "rubric": "焦急场景先讲实际状态，不用强行玩笑或表情掩盖故障。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "preferences": [
+      "平时说话幽默一点，可以适量用表情。"
+    ],
+    "task": {
+      "state": "failed",
+      "goal": "恢复测试服务",
+      "delivery": "chat",
+      "acceptance": []
+    },
+    "worker": {
+      "text": "服务仍未恢复，启动校验失败，具体配置字段尚未确定。",
+      "purpose": "unable",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "preference-question",
+    "category": "preference",
+    "split": "tune",
+    "current": [],
+    "history": [
+      {
+        "role": "owner",
+        "text": "整理一份报告"
+      }
+    ],
+    "facts": [
+      "报告需要明确给技术人员还是业务人员，当前没有用户答案。"
+    ],
+    "rubric": "只问当前关键缺口，保留必要问题，不连续追问其他信息。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "required"
+    },
+    "task": {
+      "state": "waiting_user",
+      "goal": "整理报告",
+      "delivery": "chat",
+      "acceptance": [],
+      "question": "报告面向技术人员还是业务人员？"
+    },
+    "worker": {
+      "text": "报告面向技术人员还是业务人员？",
+      "purpose": "question",
+      "checks": [
+        "已核对样本中列明的事实"
+      ]
+    }
+  },
+  {
+    "id": "preference-close",
+    "category": "preference",
+    "split": "holdout",
+    "current": [
+      "不用回复，先这样"
+    ],
+    "history": [
+      {
+        "role": "owner",
+        "text": "就按刚才说的吧"
+      },
+      {
+        "role": "router",
+        "text": "处理结果已经交付。"
+      }
+    ],
+    "facts": [
+      "用户结束对话，没有新请求或待办问题。"
+    ],
+    "rubric": "提交空 replies，自然结束，不加“好的”或继续找话。",
+    "expected": {
+      "actions": [
+        "reply"
+      ],
+      "reply": "silent"
+    }
+  }
+]

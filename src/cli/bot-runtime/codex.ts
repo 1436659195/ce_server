@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import type { WorkerAccessMode } from './worker-policy'
-import { checkCodexProtocol, cliVersion, compatibilityKey, rememberCompatible, requireCliOptions, RuntimeCompatibilityError, runtimeFailure, wasCompatible } from './compatibility'
+import { checkCodexProtocol, cliVersion, compatibilityKey, compatibleCapabilities, rememberCompatible, requireCliOptions, RuntimeCompatibilityError, runtimeFailure } from './compatibility'
 
 /** The installed CLI must expose these protocol capabilities; its version is diagnostic only. */
 export interface CodexToolSpec { name: string; description: string; inputSchema: Record<string, unknown> }
@@ -54,6 +54,7 @@ export class CodexAppServer {
   private closing = false
   private failure?: Error
   private version = 'unknown'
+  private excludeTurns = false
   constructor(private readonly options: Options) {}
 
   get closed(): boolean { return this.exited }
@@ -121,18 +122,20 @@ export class CodexAppServer {
       this.version = cliVersion(await this.probe(executable, ['--version'], 5000), 'codex')
     } catch (error) { throw error instanceof RuntimeCompatibilityError ? error : new Error('无法启动 Codex CLI，请检查工作设备上的安装与可执行文件路径') }
     const key = compatibilityKey('codex', executable, this.version, this.options.accessMode ?? 'controlled')
-    if (!wasCompatible(key)) {
+    let capabilities = compatibleCapabilities(key)
+    if (!capabilities) {
       const help = await this.probe(executable, ['app-server', '--help'], 5000).catch(error => { throw runtimeFailure('Codex', error, '无法检查 Codex app-server 入口，请核对 CLI 安装') })
       requireCliOptions(help, ['--stdio'], `Codex ${this.version}`)
       const directory = mkdtempSync(join(tmpdir(), 'ce-codex-protocol-'))
       try {
         await this.probe(executable, ['app-server', 'generate-json-schema', '--experimental', '--out', directory], 15_000)
           .catch(error => { throw runtimeFailure('Codex', error, `无法读取 Codex ${this.version} 的协议能力，请核对 schema 生成接口与临时目录权限`) })
-        checkCodexProtocol(name => JSON.parse(readFileSync(join(directory, name), 'utf8')), this.options.accessMode === 'full-access', this.version)
+        capabilities = checkCodexProtocol(name => JSON.parse(readFileSync(join(directory, name), 'utf8')), this.options.accessMode === 'full-access', this.version)
         if (this.closing) throw new Error('Codex app-server 已关闭')
-        rememberCompatible(key)
+        rememberCompatible(key, capabilities)
       } finally { rmSync(directory, { recursive: true, force: true }) }
     }
+    this.excludeTurns = capabilities.excludeTurns === true
     if (this.options.accessMode === 'full-access') return [executable, 'app-server', '--stdio', '-c', 'sandbox_mode="danger-full-access"', '-c', 'approval_policy="never"', '-c', 'features.shell_tool=true']
     let servers: Array<{ name: string }>
     try {
@@ -160,7 +163,9 @@ export class CodexAppServer {
 
   async resumeThread(threadId: string, options: { instructions: string; tools?: CodexToolSpec[] }): Promise<string> {
     await this.initialize()
-    const response = await this.call<{ thread: { id: string }; sandbox?: { type?: string }; approvalPolicy?: unknown }>('thread/resume', { threadId, ...this.threadConfig(options.instructions) })
+    // CE only needs identity and policy here. Keep model history in Codex; avoid
+    // hydrating image/tool history into a potentially huge JSON-RPC response.
+    const response = await this.call<{ thread: { id: string }; sandbox?: { type?: string }; approvalPolicy?: unknown }>('thread/resume', { threadId, ...this.threadConfig(options.instructions), ...(this.excludeTurns ? { excludeTurns: true } : {}) })
     if (response.thread?.id !== threadId) throw new Error('Codex 恢复了不匹配的线程')
     this.checkThreadPolicy(response)
     if (options.tools) this.threadTools.set(threadId, new Set(options.tools.map(t => t.name)))

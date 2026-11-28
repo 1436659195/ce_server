@@ -12,7 +12,7 @@ import type { CodexTurn } from '../src/cli/bot-runtime/codex'
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
 async function until(check: () => boolean) { for (let i=0; i<300 && !check(); i++) await Bun.sleep(5); expect(check()).toBe(true) }
-function fixture(seed?: (path: string) => void, bubbleGapMs = 0) {
+function fixture(seed?: (path: string) => void, bubbleGapMs = 0, acceptance: string[] = []) {
   const dir = mkdtempSync(join(tmpdir(), 'ce-router-outlet-'))
   seed?.(join(dir, 'runtime.sqlite'))
   const store = new BotRuntimeStore(join(dir,'runtime.sqlite'))
@@ -43,7 +43,7 @@ function fixture(seed?: (path: string) => void, bubbleGapMs = 0) {
   let seq=0
   const send=(text:string)=>service.receive('b',{groupId:'dm',seq:++seq,text,senderId:'owner',memberId:'om',createdAt:Date.now()})
   const origin=store.receive({botId:'b',groupId:'dm',seq:++seq,text:'示例引擎是什么，和示例控制台什么关系',senderId:'owner',memberId:'om',createdAt:Date.now()})
-  const task=store.acceptWork({inputId:origin.id,newCase:{title:'产品关系',object:'示例引擎',goal:'理解产品'},goal:origin.text,acceptance:[],replies:[],mandate:{ownerPhoneId:'owner',policyRevision:1,directory:dir,allowedOps:['read'],exclusions:[],mode:'execute'}})
+  const task=store.acceptWork({inputId:origin.id,newCase:{title:'产品关系',object:'示例引擎',goal:'理解产品'},goal:origin.text,acceptance,replies:[],mandate:{ownerPhoneId:'owner',policyRevision:1,directory:dir,allowedOps:['read'],exclusions:[],mode:'execute'}})
   store.updateTask(task.id,{state:'running'})
   const output=(text='示例引擎是语义引擎，示例控制台是管理平台。来源：内部资料§3.4。',extra:Partial<RuntimeReply>={})=>{
     if(extra.purpose==='result') store.updateTask(task.id,{state:'completed',review:{state:'pending',rounds:store.task(task.id)?.review?.rounds??0}})
@@ -52,6 +52,17 @@ function fixture(seed?: (path: string) => void, bubbleGapMs = 0) {
   cleanups.push(async()=>{await service.close();store.close();rmSync(dir,{recursive:true,force:true})})
   return{store,bot,task,origin,service,sent,turns,workerContexts,send,output,setOffline:(v:boolean)=>{offline=v}}
 }
+
+test.each([undefined, 'files'] as const)('task_inspect 披露原交付要求 %s，旧任务保持未知',async delivery=>{
+  const f=fixture(undefined,0,['交付 TXT 文件'])
+  f.store.updateTask(f.task.id,{delivery})
+  f.send('核对一下原来的交付要求')
+  await until(()=>f.turns.length===1)
+  const detail=await f.turns[0].call('task_inspect',{taskId:f.task.id})
+  expect(detail.delivery).toBe(delivery)
+  expect(detail.acceptance).toEqual(['交付 TXT 文件'])
+  await f.turns[0].decide({replies:['原要求是交付 TXT 文件。']});f.turns[0].finish()
+})
 
 test('Worker内部原文不能直发，必须经同一个Router生成对外回复',async()=>{
   const f=fixture();const source=f.output()
@@ -80,6 +91,16 @@ test('文件引用由宿主绑定到前台输出，模型不能用空气泡吞�
   expect(f.sent.every(r=>r.author==='router'&&r.sourceReplyId===source.id)).toBe(true)
   expect(f.sent.every(r=>r.format==='plain')).toBe(true)
   expect(f.store.task(f.task.id)?.review?.state).toBe('approved')
+})
+
+test('执行失败必须由前台明确告知，不能静默丢弃',async()=>{
+  const f=fixture();f.store.updateTask(f.task.id,{state:'failed'})
+  const source=f.output('任务未完成：会话恢复失败。',{purpose:'unable'})
+  await f.service.flush('b');await until(()=>f.turns.length===1)
+  await expect(f.turns[0].decide({workerReplyId:source.id,replies:[],basis:'无需告知'})).rejects.toThrow(/失败/)
+  await f.turns[0].decide({workerReplyId:source.id,replies:['任务未完成，会话恢复失败。']});f.turns[0].finish()
+  await until(()=>f.sent.length===1)
+  expect(f.sent[0]).toMatchObject({purpose:'unable',taskId:f.task.id,sourceReplyId:source.id})
 })
 
 test('必要问题必须由前台提出并保留questionId，不能静默丢弃',async()=>{
@@ -153,6 +174,16 @@ test('合并处理新指令时，若会吞掉附件必须回滚工单与原输�
   await expect(f.turns[0].decide({workerReplyId:source.id,workerReplyIndexes:[],action:'start',delivery:'chat',newCase:{title:'新问题',object:'对象B',goal:'调查'},goal:'调查新问题',allowedOps:['read'],replies:[]})).rejects.toThrow(/附件|文件/)
   expect(f.store.tasks('b')).toHaveLength(1);expect(f.store.inbox(input.id)?.state).toBe('pending')
   expect(f.store.replies('b').find(r=>r.id===source.id)?.state).toBe('pending')
+})
+
+test('新话不能取消尚未送出的执行失败提示',async()=>{
+  const f=fixture();f.store.updateTask(f.task.id,{state:'failed'})
+  const source=f.output('任务未完成。',{purpose:'unable'})
+  f.store.presentWorkerReply('b',source.id,['任务未完成。'],'')
+  const delivery=f.store.pendingReplies('b')[0]
+  f.send('哈哈');await until(()=>f.turns.length===1)
+  await expect(f.turns[0].decide({replies:[],cancelReplyIds:[delivery.id]})).rejects.toThrow(/取消/)
+  expect(f.store.pendingReplies('b').some(r=>r.id===delivery.id)).toBe(true)
 })
 
 test('新话不能取消尚未送出的必要问题与文件气泡',async()=>{

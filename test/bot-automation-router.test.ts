@@ -20,6 +20,7 @@ function fixture(collectMetric?: (condition: any, signal?: AbortSignal) => Promi
   const sent: RuntimeReply[] = []
   const turns: Array<{ context: any; call: (tool: string, args: Record<string, unknown>) => Promise<any>; decide: (args: Record<string, unknown>) => Promise<any>; finish: () => void }> = []
   const workerCalls: Array<(tool: string, args: Record<string, unknown>) => Promise<any>> = []
+  const workerFailures: Array<() => void> = []
   const service = new BotRuntimeService({ store, rootDir: root, tickMs: 100_000, routerQuietMs: 0, bubbleGapMs: 0, automationNow: () => now, collectMetric, getBot: () => bot,
     sendReply: async r => { if (offline) throw new Error('offline'); sent.push(r) }, checkAccess: async () => ({ directory: root, permissions: bot.permissions, revision: 1 }), openTools: () => ({ call: async () => '', close: () => {} }),
     createClient: (role, options) => {
@@ -29,13 +30,13 @@ function fixture(collectMetric?: (condition: any, signal?: AbortSignal) => Promi
           const turnId = `${role}-${turns.length}-${workerStarts}`; const done = new Promise<CodexTurn>(r => { finish = r }); const resolve = finish!
           const call = (tool: string, args: Record<string, unknown>) => options.onToolCall({ threadId, turnId, callId: crypto.randomUUID(), tool, arguments: args })
           if (role === 'router') turns.push({ context: JSON.parse(text), call, decide: args => call('router_decide', routerCall({ action: 'reply', ...args })), finish: () => resolve({ id: turnId, status: 'completed' }) })
-          else if (role === 'worker') { workerStarts++; workerCalls.push(call) }
+          else if (role === 'worker') { workerStarts++; workerCalls.push(call); workerFailures.push(() => resolve({ id: turnId, status: 'failed', error: { message: 'network failed' } })) }
           else resolve({ id: turnId, status: 'completed' })
           return { threadId, turnId, done }
         }, steer: async () => '', interrupt: async () => { finish?.({ id: 'i', status: 'interrupted' }) }, close: async () => { finish?.({ id: 'c', status: 'interrupted' }) } }
     } })
   cleanup.push(async () => { await service.close(); store.close(); rmSync(root, { recursive: true, force: true }) })
-  return { service, store, bot, turns, sent, workerCalls, workers: () => workerStarts, setOffline: (v: boolean) => { offline = v }, advance: (ms: number) => { now += ms }, now: () => now,
+  return { service, store, bot, turns, sent, workerCalls, workerFailures, workers: () => workerStarts, setOffline: (v: boolean) => { offline = v }, advance: (ms: number) => { now += ms }, now: () => now,
     send: (text: string) => service.receive('b', { groupId: 'dm', seq: ++seq, senderId: 'o', memberId: 'm', text, createdAt: now }) }
 }
 async function create(f: ReturnType<typeof fixture>, payload = '提醒开会') {
@@ -99,6 +100,25 @@ test('投递失败只重试同一消息，不重跑Router或Worker', async () =>
   expect(f.store.automations.occurrences('b')[0].state).toBe('delivery_pending')
   f.setOffline(false); await f.service.flush('b'); await f.service.pollAutomations()
   expect(f.sent[1].id).toBe(pending.id); expect(f.turns).toHaveLength(2); expect(f.workers()).toBe(0)
+})
+
+for (const pause of [false, true]) test(`自动任务失败通知等待网络恢复，用户暂停仍可阻止发送（pause=${pause}）`, async () => {
+  const f=fixture();const {receipt}=await create(f,'查询天气后报告')
+  f.advance(60_000);await f.service.pollAutomations();await until(()=>f.turns.length===2)
+  await f.turns[1].decide({action:'start',replies:[],delivery:'chat',goal:'查询天气',newCase:{title:'天气',object:'上海天气',goal:'预报'},allowedOps:['read']});f.turns[1].finish()
+  await until(()=>f.workers()===1);f.setOffline(true);f.workerFailures[0]()
+  await until(()=>f.turns.length===3)
+  await f.service.pollAutomations()
+  expect(f.store.automations.occurrences('b')[0].state).toBe('delivery_pending')
+  await f.turns[2].decide({replies:['任务未完成：模型连接失败。']});f.turns[2].finish()
+  await until(()=>f.store.pendingReplies('b').some(r=>r.purpose==='unable'&&r.attemptedAt!==undefined))
+  const failure=f.store.pendingReplies('b').find(r=>r.author==='router'&&r.purpose==='unable')!
+  f.advance(11*60_000);await f.service.pollAutomations()
+  if(pause){const job=f.store.automations.get('b',receipt.job.id);f.store.automations.setStatus('b',job.id,job.revision,'paused',f.now())}
+  f.setOffline(false);await f.service.flush('b');await f.service.pollAutomations()
+  expect(f.sent.filter(r=>r.purpose==='unable').map(r=>r.id)).toEqual(pause?[]:[failure.id])
+  if(!pause)expect(f.store.automations.occurrences('b')[0].state).toBe('needs_attention')
+  expect(f.workers()).toBe(1)
 })
 
 test('权限变化和原话撤回阻止旧事件启动', async () => {

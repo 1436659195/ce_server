@@ -1,128 +1,46 @@
-import { randomUUID } from 'node:crypto'
 import { z } from 'zod/v4'
 import type { CodexToolSpec } from './codex'
-import type { MemoryLogAction, MemoryProposal, MemoryTier, RuntimeInbox, RuntimeMemory, RuntimeMemoryLog } from './types'
+import type { MemoryScope, RuntimeMemory } from './types'
 
-/** 记忆档位的起步参数，真实聊天后可调。 */
-export const MEMORY_LIMITS = { long: 30, mid: 10, candidates: 40, midTurns: 10, midDays: 7, promoteTriggers: 3, reviewDays: 30 } as const
-const DAY = 86_400_000
-export const MID_TTL_MS = MEMORY_LIMITS.midDays * DAY
-
-const CJK = /[㐀-鿿぀-ヿ]/u
-/** 中文按字和二字组，英文和数字按词；只用于相关度排序，不是语义检索。 */
-export function tokenize(text: string): Set<string> {
-  const tokens = new Set<string>()
-  for (const word of text.toLowerCase().match(/[a-z]+|[0-9]+/g) ?? []) tokens.add(word)
-  const chars = [...text].filter(c => CJK.test(c))
-  for (let i = 0; i < chars.length; i++) { tokens.add(chars[i]); if (i) tokens.add(chars[i - 1] + chars[i]) }
-  return tokens
+export const MEMORY_LIMITS = { long: 30, mid: 10, candidates: 40, midDays: 7, reviewDays: 30, chars: 6000 } as const
+export const MID_TTL_MS = MEMORY_LIMITS.midDays * 86_400_000
+const text = (max: number) => z.string().trim().min(1).max(max)
+export const MEMORY_SCOPE_SCHEMA = z.strictObject({ project: text(1000).optional(), caseId: text(150).optional(), taskId: text(150).optional() })
+const source = { sourceInboxId: text(150), quote: text(2000) }
+export const MEMORY_CHANGE_SCHEMA = z.discriminatedUnion('action', [
+  z.strictObject({ action: z.literal('save'), tier: z.enum(['long', 'mid']), kind: z.enum(['preference', 'fact', 'agreement']), topic: text(100), prompt: text(500),
+    core: z.boolean().optional(), scope: MEMORY_SCOPE_SCHEMA.optional(), appliesTo: text(300).optional(), startsAt: z.number().finite().optional(), expiresAt: z.number().finite().optional(),
+    end: z.strictObject({ kind: z.enum(['task', 'case']), id: text(150) }).optional(), ...source,
+    conflicts: z.array(z.strictObject({ memoryId: text(150), version: z.number().int().positive(), relation: z.enum(['duplicate', 'supersedes', 'overrides', 'related']) })).max(100).optional(),
+  }),
+  z.strictObject({ action: z.literal('end'), kind: z.enum(['task', 'case']), id: text(150), ...source }),
+  z.strictObject({ action: z.enum(['revoke', 'purge']), id: text(150), expectedVersion: z.number().int().positive(), ...source }),
+])
+export const MEMORY_WRITE_SCHEMA = z.strictObject({ requestId: text(200), expectedRevision: text(100), changes: z.array(MEMORY_CHANGE_SCHEMA).max(12) })
+export type MemoryChange = z.infer<typeof MEMORY_CHANGE_SCHEMA>
+export type MemoryWrite = z.infer<typeof MEMORY_WRITE_SCHEMA>
+export const MEMORY_QUERY_SCHEMA = z.strictObject({ query: text(2000).optional(), topic: text(100).optional(), tier: z.enum(['mid', 'long']).optional(),
+  scope: MEMORY_SCOPE_SCHEMA.optional(), history: z.boolean().optional(), from: z.union([z.number().finite(), z.iso.datetime({ offset: true }).transform(Date.parse)]).optional(), to: z.union([z.number().finite(), z.iso.datetime({ offset: true }).transform(Date.parse)]).optional(),
+  limit: z.number().int().min(1).max(20).optional(), offset: z.number().int().nonnegative().optional(), revision: text(100).optional(), cursor: text(100).optional() })
+export type MemoryQuery = z.input<typeof MEMORY_QUERY_SCHEMA>
+export interface MemoryAudience { botId: string; channel: string; senderId: string; project?: string; caseId?: string; taskId?: string }
+export const sameScope = (a: MemoryScope = {}, b: MemoryScope = {}) => ['project', 'caseId', 'taskId'].every(k => a[k as keyof MemoryScope] === b[k as keyof MemoryScope])
+export const scopeMatches = (scope: MemoryScope = {}, actual: MemoryScope = {}) => Object.entries(scope).every(([k, v]) => actual[k as keyof MemoryScope] === v)
+export const memoryVersion = (m: RuntimeMemory) => m.version ?? 1
+export const memoryText = (m: RuntimeMemory) => [m.topic, m.prompt, m.appliesTo].filter(Boolean).join(' ')
+export function memorySummary(m: RuntimeMemory) {
+  return { id: m.id, version: memoryVersion(m), tier: m.tier, topic: m.topic, kind: m.kind, prompt: m.prompt, scope: m.scope ?? {}, appliesTo: m.appliesTo,
+    core: m.core === true, startsAt: m.startsAt, expiresAt: m.expiresAt, end: m.end, overrides: m.overrides, needsReview: m.needsReview, legacy: m.format !== 2 || undefined }
 }
-/** 单个汉字太容易偶然重合，相关度只数字组和英文数字词。 */
-export function relevance(memory: Pick<RuntimeMemory, 'prompt' | 'appliesTo'>, tokens: Set<string>): number {
-  let score = 0
-  for (const token of tokenize(`${memory.prompt} ${memory.appliesTo ?? ''}`)) if (token.length >= 2 && tokens.has(token)) score += 2
-  return score
-}
-
-export interface MemorySelection { long: RuntimeMemory[]; mid: RuntimeMemory[]; overflow: number; triggered: string[]; expired: string[]; promoted: string[]; review: string[] }
-/** 长期全部常驻（上限 30，多出的只计数）；中期：没写适用范围的对每轮都适用，写了的按相关度取；到期和升降在这里判定。 */
-export function selectMemories(memories: RuntimeMemory[], batchText: string, now: number, round: number): MemorySelection {
-  const tokens = tokenize(batchText)
-  const living: RuntimeMemory[] = []; const expired: string[] = []
-  for (const memory of memories) {
-    if (memory.status !== 'active') continue
-    if (memory.tier === 'mid' && (round - (memory.bornRound ?? 0) >= MEMORY_LIMITS.midTurns || (memory.expiresAt ?? Infinity) <= now)) expired.push(memory.id)
-    else living.push(memory)
-  }
-  const long = living.filter(m => m.tier === 'long').sort((a, b) => b.updatedAt - a.updatedAt)
-  const kept = long.slice(0, MEMORY_LIMITS.long)
-  const mid = living.filter(m => m.tier === 'mid').map(m => ({ m, score: relevance(m, tokens) }))
-    .filter(x => x.score > 0 || !x.m.appliesTo)
-    .sort((a, b) => b.score - a.score || b.m.triggers.count - a.m.triggers.count || (b.m.triggers.lastTriggeredAt ?? 0) - (a.m.triggers.lastTriggeredAt ?? 0) || a.m.id.localeCompare(b.m.id))
-    .map(x => x.m).slice(0, MEMORY_LIMITS.mid)
-  return {
-    long: kept, mid, overflow: long.length - kept.length,
-    triggered: [...kept, ...mid].filter(m => relevance(m, tokens) > 0).map(m => m.id),
-    expired,
-    promoted: living.filter(m => m.tier === 'mid' && m.triggers.count >= MEMORY_LIMITS.promoteTriggers).map(m => m.id),
-    review: kept.filter(m => !m.needsReview && now - (m.triggers.lastTriggeredAt ?? m.createdAt) > MEMORY_LIMITS.reviewDays * DAY).map(m => m.id),
-  }
-}
-/** 进上下文的那部分：不带完整原话，只带规矩本身。 */
-export interface MemorySummary { id: string; tier: MemoryTier; prompt: string; appliesTo?: string; triggers: number }
-export function memorySummary(memory: RuntimeMemory): MemorySummary {
-  return { id: memory.id, tier: memory.tier, prompt: memory.prompt, ...(memory.appliesTo ? { appliesTo: memory.appliesTo } : {}), triggers: memory.triggers.count }
-}
-
-const proposalSchema = z.strictObject({
-  intent: z.enum(['none', 'preference']),
-  tier: z.enum(['mid', 'long']).optional(),
-  prompt: z.string().max(300).optional(),
-  appliesTo: z.string().max(200).optional(),
-  sourceInboxId: z.string().max(120).optional(),
-  quote: z.string().max(200).optional(),
-  conflicts: z.array(z.strictObject({ memoryId: z.string().max(120), relation: z.enum(['duplicate', 'supersedes', 'related']) })).max(5).optional(),
-})
-export function parseMemoryProposal(args: unknown): MemoryProposal | undefined {
-  const parsed = proposalSchema.safeParse(args)
-  return parsed.success ? parsed.data : undefined
-}
-export const MEMORY_PROPOSE_TOOL: CodexToolSpec = { name: 'memory_commit', description: '提交本批消息的记忆判断。intent=none 表示没有需要记的偏好；preference 表示有一条主人亲口说的偏好。', inputSchema: z.toJSONSchema(proposalSchema) as Record<string, unknown> }
-export const MEMORY_INSTRUCTIONS = `你是主人的记忆整理员。主人的每一批消息都会交给你判断，大多数批次并没有要记的东西：提问、任务指令、临时要求、闲聊、道谢、确认、粘贴的资料 → intent=none。
-只根据「本批消息」判断主人有没有定下或改掉一条偏好或规矩。规矩和偏好指主人要求以后怎么对待他、怎么做事，例如回复长短、称呼、格式习惯、做事顺序、哪些事不要做；不限定用词，凭意思判断，不靠「以后」「记住」这类词。
-只有主人本人的话算：Bot 自己说过的话、主人贴进来的资料内容，都不算主人的偏好。
-判断规则：
-- 主人在说长期有效的规矩（一直要这样） → tier=long。
-- 只针对眼前这件事或近期的偏好 → tier=mid。
-- 同一件事以前已经记过（见 candidates） → 在 conflicts 里写 duplicate；新话明确取代了某条旧规矩 → supersedes；只是相关 → related。拿不准是不是取代就不要写 supersedes。
-- sourceInboxId 必须是本批消息的 id；quote 必须是那条消息里的一段原文，不超过 200 字。
-- prompt 用一句话写出主人的偏好本身，不写解释。
-通过 memory_commit 提交一次；拿不准就 intent=none。不要输出别的内容，不要执行任何工具以外的操作。`
-
-const log = (memory: Pick<RuntimeMemory, 'botId' | 'id'>, action: MemoryLogAction, at: number, note?: string, actor: RuntimeMemoryLog['actor'] = 'memory'): RuntimeMemoryLog =>
-  ({ id: `mlog_${randomUUID()}`, botId: memory.botId, memoryId: memory.id, action, actor, at, ...(note ? { note } : {}) })
-
-/** 慢路的核对都在这里：是不是规矩、长期还是近期、是否取代旧规矩由模型判断；宿主只核对引文确实出自本批主人原话，任何操作都不删除记忆。 */
-export function planMemoryChange(proposal: MemoryProposal, batch: RuntimeInbox[], memories: RuntimeMemory[], now: number, round: number): { reject?: string; ops?: RuntimeMemory[]; logs?: RuntimeMemoryLog[] } {
-  if (proposal.intent !== 'preference') return {}
-  const prompt = proposal.prompt?.trim()
-  if (!prompt) return { reject: '缺少偏好内容' }
-  const source = proposal.sourceInboxId ? batch.find(m => m.id === proposal.sourceInboxId) : undefined
-  if (!source) return { reject: '原话不在本批消息里，不写记忆' }
-  const quote = (proposal.quote ?? '').trim()
-  if (!quote || !source.text.includes(quote)) return { reject: '引文不是主人原话的一部分，不写记忆' }
-  const first = batch[0]!
-  const tier: MemoryTier = proposal.tier ?? 'mid'
-  const ops: RuntimeMemory[] = []; const logs: RuntimeMemoryLog[] = []
-  const id = `memory_${randomUUID()}`
-  let creates = true; let supersedes: string | undefined
-  for (const conflict of proposal.conflicts ?? []) {
-    const existing = memories.find(m => m.id === conflict.memoryId && m.status === 'active')
-    if (!existing) continue
-    if (conflict.relation === 'duplicate') {
-      // 同一条原话再说一遍：什么都不改。另一条原话重复同一件事：次数加一，追加来源。
-      if (existing.source.inboxId === source.id && existing.source.quote === quote) { creates = false; continue }
-      ops.push({ ...existing, triggers: { count: existing.triggers.count + 1, lastTriggeredAt: now }, extraSources: [...(existing.extraSources ?? []), { inboxId: source.id, quote }], updatedAt: now })
-      logs.push(log(existing, 'duplicate', now, `再次说到：${quote}`))
-      creates = false
-    } else if (conflict.relation === 'supersedes') {
-      ops.push({ ...existing, status: 'superseded', supersededBy: id, updatedAt: now })
-      logs.push(log(existing, 'supersede', now, `被新规矩取代：${prompt}`))
-      supersedes = existing.id
-    }
-  }
-  if (creates) {
-    const created: RuntimeMemory = {
-      id, botId: first.botId, channel: first.groupId, senderId: first.senderId, tier, status: 'active', prompt,
-      ...(proposal.appliesTo?.trim() ? { appliesTo: proposal.appliesTo.trim() } : {}),
-      source: { inboxId: source.id, quote, context: source.text.slice(0, 500), sentAt: source.createdAt },
-      triggers: { count: 1 },
-      ...(tier === 'mid' ? { bornRound: round, expiresAt: now + MID_TTL_MS } : {}),
-      ...(supersedes ? { supersedes } : {}),
-      createdAt: now, updatedAt: now,
-    }
-    ops.push(created)
-    logs.push(log(created, 'create', now))
-  }
-  return { ops, logs }
-}
+export type MemorySummary = ReturnType<typeof memorySummary>
+const spec = (name: string, description: string, schema: z.ZodType): CodexToolSpec => ({ name, description, inputSchema: z.toJSONSchema(schema, { io: 'input' }) as Record<string, unknown> })
+export const MEMORY_SEARCH_TOOL = spec('memory_search', '查询当前用户/Bot的有效记忆，支持语义、主题、范围、时间和分页。history=true含失效历史；无结果不证明不存在。翻页沿用revision、cursor和筛选；结果变化从第一页重查。来源原话用chat_read。', MEMORY_QUERY_SCHEMA)
+export const MEMORY_READ_TOOL = spec('memory_read', '读取已知记忆的完整内容、来源消息ID和版本历史；来源原文用chat_read。', z.strictObject({ id: text(150), history: z.boolean().optional(), version: z.number().int().positive().optional(), limit: z.number().int().min(1).max(10).optional(), offset: z.number().int().nonnegative().optional() }))
+export const MEMORY_WRITE_TOOL = spec('memory_write', '明确要求记住/修改/忘记时保存。先查询取得revision和相关旧记忆版本，检查同主题每条旧记忆；end用于用户明确结束某task/case阶段；新内容必须来自当前用户原话。返回真实回执才可确认保存。purge仅用于明确要求彻底删除。', MEMORY_WRITE_SCHEMA)
+export const MEMORY_PROPOSE_TOOL = spec('memory_commit', '提交本批多主题记忆判断；changes=[]表示没有持续价值的内容。保存与Router共用同一校验。', MEMORY_WRITE_SCHEMA)
+export const MEMORY_INSTRUCTIONS = `你是用户的记忆整理员，只处理当前用户消息中的持续偏好、事实和约定。资料、引用、助手/Worker建议和推测不是用户已认可的事实。当前完整batch是唯一新证据，recent/tasks/candidates只帮助理解。
+一次性任务要求留在任务记录；经验方法留在经验库。不确定是否持续有效不能默认mid。long必须有长期意图或持久事实依据；mid必须影响后续交流且临时，保留范围、时间、阶段和结束条件。无明确期限默认七天；按消息sentAt和时区解释这周/明天。不要扩大原意，不把某项目规则变成全局。
+每个独立主题/时间窗口一条；同主题分时要求可在同次commit保存，批内时间或结构范围必须不重叠，不能因同一来源省掉下一时段。优先复用已有主题，变化前后的含义必须保留。core=true只给明确适用于整个Bot的稳定long规则，不能给项目/任务/情境规则。
+在写入前用memory_search按主题和含义查相关旧记忆，必要时翻页或memory_read核实。用大模型语义判断同一范围和重叠时间内能否同时满足：同义duplicate；永久同范围改变supersedes；临时/窄范围例外overrides；可共存related。conflicts列出每条已检查记录及version。查不到不能假设不存在，提交被拒绝要按提示补查。
+只用当前消息的sourceInboxId和原文quote。current消息优先不代表永久改规矩；一次“详细讲”不修改长期。明确忘记用revoke，明确彻底删除才purge；用户明确结束某阶段用end(kind/id)结束关联中期记忆。quote只摘取对应规则的必要原话，不复制整段无关内容。没法判断不改旧规则。expiresAt用毫秒时间戳；阶段结束end绑定真实task/case ID。
+最后调用一次成功的memory_commit，requestId固定用batchId，expectedRevision用最新查询结果。changes允许多个独立主题或为空；版本冲突重新查询再提交，不能静默宣称成功。不要对用户发消息。`
