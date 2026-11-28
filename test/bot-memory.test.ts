@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -19,7 +19,7 @@ function memory(p: Partial<RuntimeMemory> & Pick<RuntimeMemory, 'id' | 'prompt'>
   const now = Date.now()
   return { botId: 'b', channel: 'dm', senderId: 'owner', tier: 'long', status: 'active', source: { inboxId: `msg-${p.id}`, quote: p.prompt, context: '', sentAt: now }, triggers: { count: 0 }, createdAt: now, updatedAt: now, ...p }
 }
-function fixture(options: { tickMs?: number; memoryEmbedding?: MemoryEmbedding } = {}) {
+function fixture(options: { tickMs?: number; memoryEmbedding?: MemoryEmbedding; getBot?: (botId: string) => RuntimeBot } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ce-memory-'))
   const store = new BotRuntimeStore(join(dir, 'runtime.sqlite'))
   const bot: RuntimeBot = { botId: 'b', name: '小林', groupId: 'dm', ownerPhoneId: 'owner', sourceCwd: dir, directory: dir, platform: 'codex', policyRevision: 1, commandSandbox: false,
@@ -55,7 +55,7 @@ function fixture(options: { tickMs?: number; memoryEmbedding?: MemoryEmbedding }
         return { threadId, turnId, done }
       }, steer: async () => '', interrupt: async () => {}, close: async () => { resolve?.({ id: 'closed', status: 'interrupted' }) } }
   }
-  const serviceOptions = { memoryEmbedding: options.memoryEmbedding, store, rootDir: dir, routerQuietMs: 0, bubbleGapMs: 0, tickMs: options.tickMs ?? 3_600_000, getBot: () => bot, sendReply: async (reply: RuntimeReply) => { sent.push(reply) }, checkAccess: async () => { throw new Error('no worker') }, openTools: () => { throw new Error('no worker') }, createClient }
+  const serviceOptions = { memoryEmbedding: options.memoryEmbedding, store, rootDir: dir, routerQuietMs: 0, bubbleGapMs: 0, tickMs: options.tickMs ?? 3_600_000, getBot: options.getBot ?? (() => bot), sendReply: async (reply: RuntimeReply) => { sent.push(reply) }, checkAccess: async () => { throw new Error('no worker') }, openTools: () => { throw new Error('no worker') }, createClient }
   let service = new BotRuntimeService(serviceOptions)
   store.saveSettings({ ...store.settings('b'), mode: 'router-worker', revision: 1 })
   let seq = 0
@@ -81,6 +81,34 @@ test('background sees full messages, commits multiple topics through the shared 
   expect(f.store.memories('b')).toHaveLength(2)
   expect(f.store.memoryLog('b').map(l => l.actor)).toEqual(['memory', 'memory'])
   await f.restart(); await Bun.sleep(30); expect(f.state.memoryCalls).toBe(1)
+})
+
+test('a retired bot left enabled in the store must not break the background tick for the others', async () => {
+  // 2026-11-28 线上:已注销 Bot 仍在 enabledBots,sweepMemories → getBot 抛错逃出 setInterval 回调 → daemon 退出 → 手机掉线。
+  const f = fixture({ tickMs: 10, getBot: id => { if (id === 'gone') throw new Error('Bot 未配置 owner 权限或已注销'); return f.bot } })
+  f.store.saveSettings({ ...f.store.settings('gone'), mode: 'router-worker', revision: 1 })
+  expect(() => (f.service as any).sweepMemories('gone')).not.toThrow()
+  f.proposals.push(p => command(p, [change(p)]))
+  const msg = f.send('以后回复简短。')
+  await until(() => f.turns.length === 1); await f.turns[0].decide({ replies: ['好。'] }); f.turns[0].finish()
+  await until(() => f.store.inbox(msg.id)?.memoryJob?.state === 'done')
+})
+
+test('a synchronous tick step failure is logged once and later background work still completes', async () => {
+  const f = fixture({ tickMs: 10 })
+  const runtime = f.service as any
+  runtime.sweepMemories = () => { throw new Error('injected sweep failure') }
+  const log = spyOn(console, 'error').mockImplementation(() => {})
+  try {
+    f.proposals.push(p => command(p, [change(p)]))
+    const msg = f.send('以后回复简短。')
+    await until(() => f.turns.length === 1)
+    await f.turns[0].decide({ replies: ['好。'] }); f.turns[0].finish()
+    await until(() => f.store.inbox(msg.id)?.memoryJob?.state === 'done')
+    expect(f.store.memories('b')).toHaveLength(1)
+    runtime.tick(); runtime.tick()
+    expect(log.mock.calls.filter(([message]) => String(message).includes('injected sweep failure'))).toHaveLength(1)
+  } finally { log.mockRestore() }
 })
 
 test('a missing or rejected memory commit is failure, not a successful empty extraction', async () => {

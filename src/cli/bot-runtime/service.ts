@@ -442,7 +442,15 @@ export class BotRuntimeService {
     if (this.stopped) return
     void this.pollAutomations().catch(error => { for (const botId of this.store.enabledBots()) this.store.saveSettings({ ...this.store.settings(botId), error: `事件调度：${this.error(error)}` }) })
     for (const op of this.store.operations().filter(o => o.state === 'pending_approval' && (o.expiresAt ?? 0) <= Date.now())) this.store.saveOperation({ ...op, state: 'failed', error: '审批已过期，操作未执行' })
-    for (const botId of this.store.enabledBots()) { this.resumeAfterStop(botId); this.nudgeFollowups(botId); this.sweepMemories(botId); this.runMemoryJobs(botId); void this.route(botId); void this.pump(botId); void this.flush(botId) }
+    // 同步步骤逐 Bot 隔离:这里抛出去就是 setInterval 回调里的未捕获异常,daemon 兜底会直接退出(手机随之掉线)。
+    for (const botId of this.store.enabledBots()) {
+      for (const step of [() => this.resumeAfterStop(botId), () => this.nudgeFollowups(botId), () => this.sweepMemories(botId), () => this.runMemoryJobs(botId), () => { void this.route(botId) }, () => { void this.pump(botId) }, () => { void this.flush(botId) }]) this.isolated(botId, step)
+    }
+  }
+  private readonly tickErrors = new Set<string>()
+  /** tick 单步抛错只记一次日志(同一句话不刷屏),其他 Bot / 步骤照常跑。 */
+  private isolated(botId: string, step: () => void): void {
+    try { step() } catch (error) { const message = `${botId}: ${this.error(error)}`; if (this.tickErrors.has(message)) return; this.tickErrors.add(message); console.error(`[ce:bot-runtime] 后台巡检步骤异常(已兜底,不影响其他 Bot): ${message}`) }
   }
   /** 「继续」来时任务还在停止过程中：停下后自动恢复；等太久则作废并留下说明。 */
   private resumeAfterStop(botId: string): void {
@@ -1619,7 +1627,10 @@ export class BotRuntimeService {
   private sweepMemories(botId: string): void {
     if (this.stopped || this.quiescing.has(botId) || !this.enabled(botId)) return
     this.store.memoryLibrary.sweep(botId)
-    void this.memoryRetrieval.index(this.memoryAudience(this.opts.getBot(botId)))
+    // 已注销 / 未配 owner 的 Bot 可能仍留在 enabledBots(模式未清),getBot 会抛:只跳过索引,不能带崩 tick。
+    let bot: RuntimeBot
+    try { bot = this.opts.getBot(botId) } catch { return }
+    void this.memoryRetrieval.index(this.memoryAudience(bot))
   }
   private readonly memoryJobs = new Map<string, Promise<void>>()
   private runMemoryJobs(botId: string): void {
